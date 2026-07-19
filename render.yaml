@@ -9,7 +9,7 @@ services:
     startCommand: ./render-start.sh
     envVars:
       - key: NODE_VERSION
-        value: "22"
+        value: "24"
       - key: XTREAM_SERVER
         sync: false
       - key: XTREAM_USERNAME
