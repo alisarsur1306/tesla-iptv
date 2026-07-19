@@ -106,6 +106,22 @@ async function serveStatic(req, res, pathname) {
 
 const { port, host } = parseArgs(process.argv.slice(2));
 
+// Crash visibility: the Render service dies mid-stream with nothing in the logs.
+// Print the reason (and memory) before going down so the logs say why.
+function memLine() {
+  const m = process.memoryUsage();
+  return `rss=${(m.rss / 1e6).toFixed(0)}MB heap=${(m.heapUsed / 1e6).toFixed(0)}MB ext=${(m.external / 1e6).toFixed(0)}MB`;
+}
+process.on('uncaughtException', (err) => {
+  console.error(`UNCAUGHT (${memLine()})`, err);
+  process.exit(1);
+});
+process.on('unhandledRejection', (err) => {
+  console.error(`UNHANDLED REJECTION (${memLine()})`, err);
+  process.exit(1);
+});
+process.on('exit', (code) => console.error(`process exit code=${code} (${memLine()})`));
+
 function sendJson(res, status, obj) {
   const body = JSON.stringify(obj);
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -138,6 +154,7 @@ const server = http.createServer((req, res) => {
   res.setHeader('X-Node', process.version);
   const url = new URL(req.url || '/', 'http://localhost');
   if (url.pathname === '/api/proxy') {
+    res.on('close', () => console.log(`proxy done status=${res.statusCode} ${memLine()}`));
     void handleProxy(req, res);
     return;
   }
