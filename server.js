@@ -154,6 +154,7 @@ function handleConfig(req, res, url) {
 
 const server = http.createServer((req, res) => {
   res.setHeader('X-Node', process.version);
+  res.setHeader('X-Rev', (process.env.RENDER_GIT_COMMIT || 'local').slice(0, 7));
   const url = new URL(req.url || '/', 'http://localhost');
   if (url.pathname === '/api/proxy') {
     res.on('close', () => console.log(`proxy done status=${res.statusCode} ${memLine()}`));
