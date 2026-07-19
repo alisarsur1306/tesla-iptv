@@ -16,6 +16,8 @@
 //   cloud deployment can borrow a residential IP for the few requests Cloudflare
 //   blocks. Video segments always go direct. See DEPLOY.md.
 
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { fetch, ProxyAgent } from 'undici';
 
 const TIMEOUT_MS = 25_000;
@@ -152,6 +154,9 @@ function rewritePlaylist(text, baseUrl, key) {
 }
 
 export async function handleProxy(req, res) {
+  // A client abort / edge RST emits 'error' on res; with no listener that is an
+  // uncaughtException and kills the whole process mid-stream.
+  res.on('error', () => {});
   setCors(res);
 
   if (req.method === 'OPTIONS') {
@@ -253,11 +258,13 @@ export async function handleProxy(req, res) {
       res.end();
       return;
     }
-    const { Readable } = await import('node:stream');
-    const stream = Readable.fromWeb(upstream.body);
-    stream.on('error', () => res.destroy());
-    res.on('close', () => stream.destroy());
-    stream.pipe(res);
+    // pipeline (unlike pipe) propagates errors in BOTH directions and rejects
+    // instead of leaving an unhandled 'error' event to crash the process.
+    try {
+      await pipeline(Readable.fromWeb(upstream.body), res);
+    } catch {
+      res.destroy();
+    }
   } catch (err) {
     sendError(res, 502, `Proxy error: ${String(err && err.message ? err.message : err)}`);
   }

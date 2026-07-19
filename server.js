@@ -116,9 +116,11 @@ process.on('uncaughtException', (err) => {
   console.error(`UNCAUGHT (${memLine()})`, err);
   process.exit(1);
 });
+// Log but keep serving: rejections here are per-request (a dropped stream must
+// not take down every other viewer). uncaughtException still exits — state is
+// unknown after those.
 process.on('unhandledRejection', (err) => {
   console.error(`UNHANDLED REJECTION (${memLine()})`, err);
-  process.exit(1);
 });
 process.on('exit', (code) => console.error(`process exit code=${code} (${memLine()})`));
 

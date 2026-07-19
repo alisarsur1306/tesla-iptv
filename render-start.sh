@@ -14,10 +14,11 @@ if [ -n "${TS_AUTHKEY:-}" ]; then
   # (non-root) — tailscaled dies instantly with "bind: no such file or directory".
   TS_SOCKET=/tmp/tailscaled.sock
 
+  # No --socks5-server: only the HTTP proxy is used, and Render's port scanner
+  # probes any extra open port every 10s ("incompatible SOCKS version" log spam).
   ./tailscaled --tun=userspace-networking \
     --socket="${TS_SOCKET}" \
     --outbound-http-proxy-listen="127.0.0.1:${PROXY_PORT}" \
-    --socks5-server="127.0.0.1:$((PROXY_PORT + 1))" \
     --state=mem: &
 
   # Wait for the daemon's control socket instead of racing `up` against startup.
