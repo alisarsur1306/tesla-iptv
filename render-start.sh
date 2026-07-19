@@ -10,21 +10,33 @@ set -euo pipefail
 
 if [ -n "${TS_AUTHKEY:-}" ]; then
   PROXY_PORT="${TS_PROXY_PORT:-1055}"
+  # Default socket path is /var/run/tailscale/, which is not writable on Render
+  # (non-root) — tailscaled dies instantly with "bind: no such file or directory".
+  TS_SOCKET=/tmp/tailscaled.sock
 
   ./tailscaled --tun=userspace-networking \
+    --socket="${TS_SOCKET}" \
     --outbound-http-proxy-listen="127.0.0.1:${PROXY_PORT}" \
     --socks5-server="127.0.0.1:$((PROXY_PORT + 1))" \
     --state=mem: &
 
+  # Wait for the daemon's control socket instead of racing `up` against startup.
+  for i in $(seq 1 30); do
+    [ -S "${TS_SOCKET}" ] && break
+    sleep 0.5
+  done
+  [ -S "${TS_SOCKET}" ] || { echo "tailscaled never created its socket" >&2; exit 1; }
+
   # --exit-node-allow-lan-access is not set: we want ALL proxied traffic to egress
   # at the exit node, never leak back out of Render.
-  ./tailscale up \
+  ./tailscale --socket="${TS_SOCKET}" up \
     --authkey="${TS_AUTHKEY}" \
     --exit-node="${TS_EXIT_NODE:?TS_EXIT_NODE must be set when TS_AUTHKEY is}" \
     --hostname="${TS_HOSTNAME:-tesla-iptv-render}" \
     --accept-routes=false
 
-  ./tailscale status --json > /dev/null || { echo "tailscale failed to come up" >&2; exit 1; }
+  ./tailscale --socket="${TS_SOCKET}" status --json > /dev/null \
+    || { echo "tailscale failed to come up" >&2; exit 1; }
   export UPSTREAM_PROXY="127.0.0.1:${PROXY_PORT}"
   echo "Tailscale up; routing Xtream host via exit node ${TS_EXIT_NODE}"
 else
