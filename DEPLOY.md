@@ -18,6 +18,38 @@ credentials and the access key are environment variables.
      strangers can't use your deployment (or your 1-connection account).
 5. Deploy. Render runs `npm install && npm run build`, then `node server.js`.
 
+## Required: a Tailscale exit node
+
+The Xtream provider sits behind Cloudflare, which **blocks Render's datacenter
+IPs**. Without an exit node the app boots and serves the UI, then fails at login
+with a Cloudflare "you have been blocked" page. No code change can fix this — the
+requests have to leave from a residential IP.
+
+Only the Xtream API host is routed this way. Segments redirect to a CDN that does
+*not* block datacenter IPs, and its tokens are not IP-bound, so video streams
+direct from Render. Measured: ~3 KB per playlist refresh over the tunnel versus
+~2 MB per segment direct — the exit node carries metadata, never the video.
+
+1. Install Tailscale on a device that is always on at home (an Android TV, Pi, or
+   NAS all work — it only handles a few KB per refresh).
+2. Advertise it as an exit node, and approve it in the Tailscale admin console
+   under **Machines → … → Edit route settings → Use as exit node**.
+3. Generate a **reusable, ephemeral** auth key (Settings → Keys). Ephemeral means
+   the Render node removes itself when the free tier sleeps, instead of piling up
+   stale machines.
+4. Add two more environment variables in Render:
+   - `TS_AUTHKEY` — the auth key from step 3
+   - `TS_EXIT_NODE` — the exit node's tailnet name or IP, e.g. `android-tv`
+
+Auth keys expire after at most 90 days. When yours does, the service will start
+but log `tailscale failed to come up` and upstream requests will be blocked again
+— generate a new key and update `TS_AUTHKEY`. Use an OAuth client with a tag if
+you want something that doesn't expire.
+
+Leaving `TS_AUTHKEY` unset skips the whole mechanism: no Tailscale download at
+build time, and the app talks to upstream directly. That's the right setting for
+local use, where `car-tv-on.bat` already runs from a residential IP.
+
 ## Using it in the Tesla
 
 - Open `https://<your-app>.onrender.com/?key=<ACCESS_KEY>` **once** in the

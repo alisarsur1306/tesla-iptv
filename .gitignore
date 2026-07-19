@@ -21,6 +21,10 @@ car-tv-on.bat
 # Local tooling binaries
 tools/
 
+# Tailscale binaries downloaded at build time (see fetch-tailscale.sh)
+/tailscale
+/tailscaled
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

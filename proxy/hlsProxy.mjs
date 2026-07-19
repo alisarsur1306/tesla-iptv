@@ -1,4 +1,5 @@
-// Dependency-free HLS / IPTV proxy for Node http servers.
+// HLS / IPTV proxy for Node http servers. Uses undici (the same HTTP stack Node's
+// global fetch is built on) for its ProxyAgent — see UPSTREAM_PROXY below.
 // Usage: handleProxy(req, res) for GET /api/proxy?u=<urlencoded absolute URL>[&key=...]
 //
 // Security model (so a public deployment is not an open proxy):
@@ -11,10 +12,51 @@
 //   playback the moment that changes. Keep ACCESS_KEY long and random.
 // - Playlist rewriting propagates the incoming `key` param into every rewritten
 //   /api/proxy?u=... URL (segments, sub-playlists, EXT-X-KEY URIs).
+// - UPSTREAM_PROXY (optional): HTTP proxy used ONLY for the Xtream API host, so a
+//   cloud deployment can borrow a residential IP for the few requests Cloudflare
+//   blocks. Video segments always go direct. See DEPLOY.md.
+
+import { fetch, ProxyAgent } from 'undici';
 
 const TIMEOUT_MS = 25_000;
 const USER_AGENT =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+
+// Hosts reached through UPSTREAM_PROXY when it is set. Only the Xtream API host
+// belongs here: it sits behind Cloudflare, which blocks datacenter IPs, so on a
+// cloud deployment those requests must exit via a residential IP (see DEPLOY.md).
+// Segments redirect to a CDN that does NOT block datacenter IPs and whose tokens
+// are not IP-bound, so they go direct — keeping the video off the tunnel.
+const PROXY_HOST_SUFFIXES = ['snapmediatoghater.site'];
+
+/** HTTP proxy for Cloudflare-blocked hosts, e.g. '127.0.0.1:1055'. Unset = direct. */
+function getUpstreamProxy() {
+  return process.env.UPSTREAM_PROXY || '';
+}
+
+function shouldProxy(hostname) {
+  if (!getUpstreamProxy()) return false;
+  const h = hostname.toLowerCase();
+  return PROXY_HOST_SUFFIXES.some((s) => h === s || h.endsWith('.' + s));
+}
+
+let cachedAgent = null;
+let cachedAgentFor = '';
+function proxyAgent() {
+  const spec = getUpstreamProxy();
+  if (cachedAgentFor !== spec) {
+    cachedAgent = new ProxyAgent(spec.includes('://') ? spec : `http://${spec}`);
+    cachedAgentFor = spec;
+  }
+  return cachedAgent;
+}
+
+/** fetch(), routed through the upstream proxy only for Cloudflare-blocked hosts. */
+function upstreamFetch(target, options) {
+  return shouldProxy(target.hostname)
+    ? fetch(target.toString(), { ...options, dispatcher: proxyAgent() })
+    : fetch(target.toString(), options);
+}
 
 /** The access key required by this deployment ('' = open local-dev mode). */
 export function getRequiredKey() {
@@ -162,7 +204,7 @@ export async function handleProxy(req, res) {
 
   let upstream;
   try {
-    upstream = await fetch(target.toString(), {
+    upstream = await upstreamFetch(target, {
       redirect: 'follow',
       headers,
       signal: AbortSignal.timeout(TIMEOUT_MS),

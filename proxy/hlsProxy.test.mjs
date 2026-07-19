@@ -34,5 +34,29 @@ for (const u of ['http://45.139.122.205:5566/hlsr/abc.ts', 'http://some-new-cdn.
   assert.notEqual(status, 403, `${u} should not be gate-blocked (got ${body})`);
 }
 
+// UPSTREAM_PROXY must route ONLY the Xtream API host. Video segments redirect to a
+// CDN that does not block datacenter IPs, so they must stay direct — otherwise the
+// whole stream would run over the exit node's home uplink.
+const seenByProxy = [];
+const stubProxy = http.createServer((req, res) => {
+  seenByProxy.push(req.url);
+  res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl' });
+  res.end('#EXTM3U\n');
+});
+await new Promise((r) => stubProxy.listen(0, '127.0.0.1', r));
+process.env.UPSTREAM_PROXY = `127.0.0.1:${stubProxy.address().port}`;
+
+await call('http://mhd.snapmediatoghater.site:8080/player_api.php', 'test-key-123');
+assert.equal(seenByProxy.length, 1, 'Xtream API host must go through UPSTREAM_PROXY');
+assert.match(seenByProxy[0], /snapmediatoghater\.site/);
+
+// A CDN host must bypass the proxy entirely (this one fails to resolve, which is
+// fine — the assertion is that the proxy never saw it).
+await call('http://45.139.122.205:5566/hlsr/x.ts', 'test-key-123');
+assert.equal(seenByProxy.length, 1, `CDN traffic must bypass the proxy, saw: ${seenByProxy[1]}`);
+
+stubProxy.close();
+delete process.env.UPSTREAM_PROXY;
+
 server.close();
-console.log('hlsProxy gate checks passed');
+console.log('hlsProxy gate + routing checks passed');

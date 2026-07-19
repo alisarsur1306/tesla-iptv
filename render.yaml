@@ -3,8 +3,10 @@ services:
     name: tesla-iptv
     runtime: node
     plan: free
-    buildCommand: npm install && npm run build
-    startCommand: node server.js
+    # Tailscale static binaries are fetched at build time so the start command can
+    # bring up an exit node — the Xtream host blocks Render's datacenter IPs.
+    buildCommand: npm install && npm run build && ./fetch-tailscale.sh
+    startCommand: ./render-start.sh
     envVars:
       - key: NODE_VERSION
         value: "22"
@@ -15,4 +17,10 @@ services:
       - key: XTREAM_PASSWORD
         sync: false
       - key: ACCESS_KEY
+        sync: false
+      # Leave TS_* unset to run without an exit node (upstream will be blocked by
+      # Cloudflare, but the app still boots and serves the UI).
+      - key: TS_AUTHKEY
+        sync: false
+      - key: TS_EXIT_NODE
         sync: false
