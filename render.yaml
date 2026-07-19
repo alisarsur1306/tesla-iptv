@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: tesla-iptv
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: node server.js
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: XTREAM_SERVER
+        sync: false
+      - key: XTREAM_USERNAME
+        sync: false
+      - key: XTREAM_PASSWORD
+        sync: false
+      - key: ACCESS_KEY
+        sync: false
