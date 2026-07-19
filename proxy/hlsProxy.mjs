@@ -18,7 +18,11 @@
 
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import { fetch, ProxyAgent } from 'undici';
+// undici's fetch is used ONLY for requests routed through the Tailscale proxy
+// (plain HTTP to the Xtream host). Direct traffic uses Node's built-in fetch:
+// undici 8.7's standalone agent crashes the process with an uncaught TypeError
+// in closeClientIfUnused when an HTTP/2 CDN connection closes after streaming.
+import { fetch as undiciFetch, ProxyAgent } from 'undici';
 
 const TIMEOUT_MS = 25_000;
 const USER_AGENT =
@@ -56,8 +60,8 @@ function proxyAgent() {
 /** fetch(), routed through the upstream proxy only for Cloudflare-blocked hosts. */
 function upstreamFetch(target, options) {
   return shouldProxy(target.hostname)
-    ? fetch(target.toString(), { ...options, dispatcher: proxyAgent() })
-    : fetch(target.toString(), options);
+    ? undiciFetch(target.toString(), { ...options, dispatcher: proxyAgent() })
+    : globalThis.fetch(target.toString(), options);
 }
 
 /** The access key required by this deployment ('' = open local-dev mode). */
