@@ -57,11 +57,31 @@ function proxyAgent() {
   return cachedAgent;
 }
 
-/** fetch(), routed through the upstream proxy only for Cloudflare-blocked hosts. */
-function upstreamFetch(target, options) {
-  return shouldProxy(target.hostname)
-    ? undiciFetch(target.toString(), { ...options, dispatcher: proxyAgent() })
-    : globalThis.fetch(target.toString(), options);
+/**
+ * fetch() with per-hop client selection. Redirects are followed manually:
+ * Xtream playlist URLs 302 to an HTTPS CDN, and letting undici follow that
+ * redirect itself lands the CDN connection on undici's H2 client — whose idle
+ * close crashes the process (agent.js closeClientIfUnused TypeError). Each hop
+ * therefore re-picks: undici+proxy for the Xtream host, built-in fetch for
+ * everything else. Also re-checks the SSRF guard on every hop.
+ */
+async function upstreamFetch(target, options) {
+  let url = target;
+  for (let hop = 0; hop < 5; hop++) {
+    if (isForbiddenHostname(url.hostname)) throw new Error('Redirect to forbidden host');
+    const resp = shouldProxy(url.hostname)
+      ? await undiciFetch(url.toString(), { ...options, dispatcher: proxyAgent(), redirect: 'manual' })
+      : await globalThis.fetch(url.toString(), { ...options, redirect: 'manual' });
+    const location = resp.status >= 300 && resp.status < 400 && resp.headers.get('location');
+    if (!location) return resp;
+    try {
+      await resp.body?.cancel();
+    } catch {
+      /* ignore */
+    }
+    url = new URL(location, url);
+  }
+  throw new Error('Too many redirects');
 }
 
 /** The access key required by this deployment ('' = open local-dev mode). */
