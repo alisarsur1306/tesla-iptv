@@ -16,6 +16,10 @@ dist-ssr
 public/config.json
 .env
 .env.*
+car-tv-on.bat
+
+# Local tooling binaries
+tools/
 
 # Editor directories and files
 .vscode/*
