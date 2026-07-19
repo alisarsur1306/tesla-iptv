@@ -6,27 +6,15 @@
 // - ACCESS_KEY env var (read at request time):
 //     * set   → every request must carry a matching `key` query param, else 403 JSON.
 //     * unset → open local-dev mode: everything (public, non-private) is allowed.
-// - Host allowlist (applies when ACCESS_KEY is set):
-//     * the Xtream entry host (snapmediatoghater.site + subdomains) is allowed.
-//     * known CDN segment hosts (getaj.net + subdomains) are allowed only with a
-//       valid key — rewritten segment/sub-playlist URLs carry the key, so playback
-//       works, but strangers cannot proxy arbitrary hosts.
+// - No host allowlist: the key is the gate. Providers redirect segments to
+//   whatever CDN or bare IP they choose, so pinning hostnames silently breaks
+//   playback the moment that changes. Keep ACCESS_KEY long and random.
 // - Playlist rewriting propagates the incoming `key` param into every rewritten
 //   /api/proxy?u=... URL (segments, sub-playlists, EXT-X-KEY URIs).
 
 const TIMEOUT_MS = 25_000;
 const USER_AGENT =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
-
-// Xtream entry/API host: apex + any subdomain (server_info advertises e.g. mhde.*).
-const XTREAM_HOST_SUFFIXES = ['snapmediatoghater.site'];
-// CDN hosts that segments/sub-playlists redirect to. Add more here if some
-// channels 302 to a different CDN — they only pass with a valid key.
-const KEYED_CDN_SUFFIXES = ['getaj.net'];
-
-function hostMatches(hostname, suffix) {
-  return hostname === suffix || hostname.endsWith('.' + suffix);
-}
 
 /** The access key required by this deployment ('' = open local-dev mode). */
 export function getRequiredKey() {
@@ -55,15 +43,6 @@ function isForbiddenHostname(hostname) {
     if (a === 169 && b === 254) return true; // 169.254.0.0/16
     if (a === 0) return true; // 0.0.0.0/8
   }
-  return false;
-}
-
-/** Host allowlist. Open mode (no ACCESS_KEY) allows any public host. */
-function isAllowedHost(hostname, keyValid) {
-  const h = hostname.toLowerCase();
-  if (XTREAM_HOST_SUFFIXES.some((s) => hostMatches(h, s))) return true;
-  if (!getRequiredKey()) return true; // open local-dev mode
-  if (keyValid && KEYED_CDN_SUFFIXES.some((s) => hostMatches(h, s))) return true;
   return false;
 }
 
@@ -175,12 +154,6 @@ export async function handleProxy(req, res) {
   const keyValid = isKeyValid(keyParam);
   if (getRequiredKey() && !keyValid) {
     sendError(res, 403, 'Invalid or missing access key');
-    return;
-  }
-
-  // Host allowlist so this never becomes an open proxy for strangers.
-  if (!isAllowedHost(target.hostname, keyValid)) {
-    sendError(res, 403, 'Target host is not allowed');
     return;
   }
 
