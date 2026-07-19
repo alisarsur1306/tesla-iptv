@@ -135,6 +135,7 @@ function handleConfig(req, res, url) {
 }
 
 const server = http.createServer((req, res) => {
+  res.setHeader('X-Node', process.version);
   const url = new URL(req.url || '/', 'http://localhost');
   if (url.pathname === '/api/proxy') {
     void handleProxy(req, res);
