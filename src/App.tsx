@@ -10,6 +10,9 @@ type View = 'login' | 'browse' | 'play';
 export default function App() {
   const [creds, setCreds] = useState<XtreamCreds | null>(() => loadStoredCreds());
   const [channel, setChannel] = useState<XtreamLiveStream | null>(null);
+  // The list the user was browsing when they hit play, so Next/Prev in the
+  // player follows the same order (and the same search/category filter).
+  const [playlist, setPlaylist] = useState<XtreamLiveStream[]>([]);
   const [keyPromptOpen, setKeyPromptOpen] = useState(false);
   const [retryToken, setRetryToken] = useState(0);
 
@@ -42,13 +45,22 @@ export default function App() {
         <>
           <ChannelBrowser
             creds={creds}
-            onPlay={setChannel}
+            onPlay={(ch, list) => {
+              setPlaylist(list);
+              setChannel(ch);
+            }}
             onLogout={handleLogout}
             onNeedKey={requestKey}
             retryToken={retryToken}
           />
           {view === 'play' && channel && (
-            <PlayerOverlay creds={creds} channel={channel} onBack={() => setChannel(null)} />
+            <PlayerOverlay
+              creds={creds}
+              channel={channel}
+              playlist={playlist}
+              onSelect={setChannel}
+              onBack={() => setChannel(null)}
+            />
           )}
         </>
       )}

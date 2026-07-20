@@ -3,17 +3,23 @@ import { Button } from '@/components/ui/button';
 import { liveStreamUrl, proxied, type XtreamCreds, type XtreamLiveStream } from '@/lib/xtream';
 import { CanvasPlayer } from '@/player/playerClient';
 import { AudioEngine } from '@/player/audioEngine';
-import { ArrowLeft, TriangleAlert, Volume2, VolumeX } from 'lucide-react';
+import { ArrowLeft, TriangleAlert, Volume2, VolumeX, Volume1, Play, Pause, SkipBack, SkipForward } from 'lucide-react';
 
 const MAX_NETWORK_RETRIES = 3;
 
 interface PlayerOverlayProps {
   creds: XtreamCreds;
   channel: XtreamLiveStream;
+  /** Channels in the order the user was browsing, for Next/Prev. */
+  playlist?: XtreamLiveStream[];
+  onSelect?: (channel: XtreamLiveStream) => void;
   onBack: () => void;
 }
 
-export default function PlayerOverlay({ creds, channel, onBack }: PlayerOverlayProps) {
+/** Volume step per press — 10 presses covers silent..full. */
+const VOLUME_STEP = 0.1;
+
+export default function PlayerOverlay({ creds, channel, playlist = [], onSelect, onBack }: PlayerOverlayProps) {
   // The canvas is created imperatively per effect run and appended here. A
   // transferred OffscreenCanvas can't be reused, so we never reuse the element
   // (survives React StrictMode double-mount and channel changes).
@@ -24,6 +30,10 @@ export default function PlayerOverlay({ creds, channel, onBack }: PlayerOverlayP
   const [needsAudioTap, setNeedsAudioTap] = useState(false);
   const [audioUnsupported, setAudioUnsupported] = useState<string | null>(null);
   const [videoUnsupported, setVideoUnsupported] = useState(false);
+  const [paused, setPaused] = useState(false);
+  const [volume, setVolume] = useState(1);
+  const playerRef = useRef<CanvasPlayer | null>(null);
+  const sourceRef = useRef<string>('');
 
   useEffect(() => {
     const container = containerRef.current;
@@ -85,6 +95,10 @@ export default function PlayerOverlay({ creds, channel, onBack }: PlayerOverlayP
       if (!destroyed) setNeedsAudioTap(!ok);
     });
 
+    playerRef.current = player;
+    sourceRef.current = source;
+    audio.setVolume(volume);
+    setPaused(false);
     player.play(source);
 
     return () => {
@@ -92,9 +106,48 @@ export default function PlayerOverlay({ creds, channel, onBack }: PlayerOverlayP
       player.destroy();
       audio.destroy();
       audioRef.current = null;
+      playerRef.current = null;
       canvas.remove();
     };
   }, [creds, channel]);
+
+  const index = playlist.findIndex((c) => c.stream_id === channel.stream_id);
+
+  function step(delta: number) {
+    if (!playlist.length || index < 0 || !onSelect) return;
+    // Wrap around so Next never dead-ends at the last channel.
+    const next = playlist[(index + delta + playlist.length) % playlist.length];
+    if (next) onSelect(next);
+  }
+
+  /**
+   * Live TV has nothing to resume into, so "pause" stops the stream and "play"
+   * rejoins at the live edge — which is what a viewer expects from live.
+   */
+  function togglePause() {
+    const player = playerRef.current;
+    if (!player) return;
+    if (paused) {
+      audioRef.current?.reset();
+      player.play(sourceRef.current);
+      setStatus('Loading…');
+      setPaused(false);
+    } else {
+      player.stop();
+      audioRef.current?.reset();
+      setPaused(true);
+    }
+  }
+
+  function nudgeVolume(delta: number) {
+    // Read the CURRENT value from the engine rather than React state: several
+    // taps in one tick all see the same stale state, so three presses would
+    // move the volume by one step instead of three.
+    const engine = audioRef.current;
+    const current = engine?.getVolume() ?? volume;
+    const v = engine?.setVolume(current + delta) ?? Math.max(0, Math.min(1, current + delta));
+    setVolume(v);
+  }
 
   async function enableSound() {
     const ok = await audioRef.current?.unlock();
@@ -123,6 +176,61 @@ export default function PlayerOverlay({ creds, channel, onBack }: PlayerOverlayP
         )}
       </div>
 
+
+      {/* Controls — large hit targets for a car touchscreen (min 64px) */}
+      {!fatalError && !videoUnsupported && (
+        <div className="absolute bottom-0 left-0 right-0 flex items-center justify-center gap-3 bg-gradient-to-t from-black/85 to-transparent p-4 sm:gap-5 sm:p-6">
+          <Button
+            onClick={() => step(-1)}
+            disabled={playlist.length < 2}
+            aria-label="Previous channel"
+            className="h-16 w-16 rounded-full bg-zinc-900/85 text-white hover:bg-zinc-800 disabled:opacity-40"
+          >
+            <SkipBack className="h-7 w-7" />
+          </Button>
+
+          <Button
+            onClick={togglePause}
+            aria-label={paused ? 'Play' : 'Pause'}
+            className="h-20 w-20 rounded-full bg-red-600 text-white hover:bg-red-500"
+          >
+            {paused ? <Play className="ml-1 h-9 w-9 fill-white" /> : <Pause className="h-9 w-9 fill-white" />}
+          </Button>
+
+          <Button
+            onClick={() => step(1)}
+            disabled={playlist.length < 2}
+            aria-label="Next channel"
+            className="h-16 w-16 rounded-full bg-zinc-900/85 text-white hover:bg-zinc-800 disabled:opacity-40"
+          >
+            <SkipForward className="h-7 w-7" />
+          </Button>
+
+          <div className="ml-2 flex items-center gap-2 rounded-full bg-zinc-900/85 px-3 py-2 sm:ml-6">
+            <Button
+              onClick={() => nudgeVolume(-VOLUME_STEP)}
+              aria-label="Volume down"
+              className="h-14 w-14 rounded-full bg-transparent text-white hover:bg-zinc-800"
+            >
+              <Volume1 className="h-6 w-6" />
+            </Button>
+            <span
+              aria-live="polite"
+              className="w-14 text-center text-lg font-semibold tabular-nums text-zinc-200"
+            >
+              {volume === 0 ? 'Mute' : `${Math.round(volume * 100)}%`}
+            </span>
+            <Button
+              onClick={() => nudgeVolume(VOLUME_STEP)}
+              aria-label="Volume up"
+              className="h-14 w-14 rounded-full bg-transparent text-white hover:bg-zinc-800"
+            >
+              <Volume2 className="h-6 w-6" />
+            </Button>
+          </div>
+        </div>
+      )}
+
       {/* Video codec we can't decode (HEVC) — better than a permanent black screen */}
       {videoUnsupported && !fatalError && (
         <div className="absolute inset-0 flex flex-col items-center justify-center gap-6 bg-black/90 p-8">
@@ -138,7 +246,7 @@ export default function PlayerOverlay({ creds, channel, onBack }: PlayerOverlayP
 
       {/* Audio codec we can't decode yet (AC-3 / MPEG Layer II) */}
       {audioUnsupported && !fatalError && !videoUnsupported && (
-        <div className="pointer-events-none absolute bottom-6 left-1/2 flex -translate-x-1/2 items-center gap-2 rounded-full bg-zinc-900/85 px-5 py-3 text-base text-zinc-300">
+        <div className="pointer-events-none absolute bottom-32 left-1/2 flex -translate-x-1/2 items-center gap-2 rounded-full bg-zinc-900/85 px-5 py-3 text-base text-zinc-300">
           <VolumeX className="h-5 w-5" /> Audio not supported on this channel ({audioUnsupported})
         </div>
       )}
@@ -147,7 +255,7 @@ export default function PlayerOverlay({ creds, channel, onBack }: PlayerOverlayP
       {needsAudioTap && !fatalError && !audioUnsupported && (
         <button
           onClick={enableSound}
-          className="absolute bottom-6 left-1/2 flex -translate-x-1/2 items-center gap-3 rounded-full bg-red-600/90 px-7 py-4 text-xl font-semibold text-white shadow-2xl"
+          className="absolute bottom-32 left-1/2 z-10 flex -translate-x-1/2 items-center gap-3 rounded-full bg-red-600/90 px-7 py-4 text-xl font-semibold text-white shadow-2xl"
         >
           <Volume2 className="h-7 w-7" /> Tap for sound
         </button>

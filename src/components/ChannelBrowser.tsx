@@ -30,7 +30,8 @@ function loadFavorites(): Set<number> {
 
 interface ChannelBrowserProps {
   creds: XtreamCreds;
-  onPlay: (channel: XtreamLiveStream) => void;
+  /** `list` is the currently filtered set, so the player can offer Next/Prev. */
+  onPlay: (channel: XtreamLiveStream, list: XtreamLiveStream[]) => void;
   onLogout: () => void;
   onNeedKey: () => void;
   retryToken: number;
@@ -200,7 +201,7 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
                     className="group relative flex min-h-28 items-center gap-4 rounded-2xl border border-zinc-800 bg-zinc-900 p-4 transition-colors hover:border-red-600/60 hover:bg-zinc-800"
                   >
                     <button
-                      onClick={() => onPlay(ch)}
+                      onClick={() => onPlay(ch, filtered)}
                       className="flex min-w-0 flex-1 items-center gap-4 text-left"
                     >
                       {icon ? (
