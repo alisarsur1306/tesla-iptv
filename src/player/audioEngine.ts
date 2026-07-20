@@ -34,7 +34,7 @@ const LATE_TOLERANCE_SEC = 0.25;
 /** Re-anchor if the scheduling clock drifts beyond this. */
 const RESYNC_THRESHOLD_SEC = 1.0;
 /** How far past the start lead audio may legitimately be scheduled ahead. */
-const MAX_LOOKAHEAD_SEC = 4.0;
+const MAX_LOOKAHEAD_SEC = 30.0;
 
 export interface AudioEngineCallbacks {
   /** Fired once when the media timeline is established, so video can sync to it. */
@@ -315,18 +315,25 @@ export class AudioEngine {
 
     let when = this.ctxAnchor + (mediaMs - this.mediaAnchorMs) / 1000;
 
-    // Scheduling AHEAD is normal and desirable (that is the buffer), so the
-    // future side must tolerate the start lead plus a healthy queue; only the
-    // past side is tight. A symmetric check here would re-anchor forever.
     const ahead = when - ctx.currentTime;
-    if (ahead > START_LEAD_SEC + MAX_LOOKAHEAD_SEC || -ahead > RESYNC_THRESHOLD_SEC) {
-      // Everything already queued belongs to the OLD timeline. Leaving it running
-      // means it plays underneath the re-anchored stream — audible as two
-      // overlapping sounds until the backlog drains.
+
+    // BEHIND by more than the threshold means the timeline really is wrong
+    // (discontinuity / stall). Only then is a re-anchor justified, and only then
+    // must the queue be dropped — what is queued belongs to the old timeline and
+    // would otherwise play underneath the new one as two overlapping sounds.
+    if (-ahead > RESYNC_THRESHOLD_SEC) {
       this.stopScheduled();
       this.anchored = false; // re-anchor next buffer
       return;
     }
+
+    // AHEAD is not an error — it is the buffer. The continuous stream front-loads
+    // a backlog, so audio legitimately schedules seconds ahead and those buffers
+    // are correctly timed. Treating that as desync (stopping the queue and
+    // re-anchoring) silenced ~33% of all buffers: sound cut out and came back
+    // every few seconds. Past the bound we simply stop adding more and let
+    // playback drain — never cancel what is already correctly scheduled.
+    if (ahead > START_LEAD_SEC + MAX_LOOKAHEAD_SEC) return;
     if (when < ctx.currentTime - LATE_TOLERANCE_SEC) return; // too late to matter
     if (when < ctx.currentTime) when = ctx.currentTime;
 
