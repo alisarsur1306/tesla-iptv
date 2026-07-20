@@ -10,6 +10,7 @@
 // can share this clock.
 
 import { TsDemuxer } from '../lib/tsDemux';
+import { parsePlaylist, parseMediaPlaylist, diffNewSegments, type MediaPlaylist } from '../lib/hlsPlaylist';
 import { splitNALs, toAVCC, nalType, avccDescription, codecString, isValidSps, NAL_SPS, NAL_PPS, NAL_IDR, NAL_NON_IDR } from '../lib/h264';
 
 type InMsg =
@@ -22,12 +23,21 @@ type InMsg =
 
 /** Video PES to inspect before declaring the codec unsupported. */
 const UNSUPPORTED_PES_THRESHOLD = 120;
+/** Segments back from the live edge when falling back to HLS segment mode. */
+const HLS_EDGE_SEGMENTS = 3;
 /** Reconnect attempts before giving up on a dropped continuous stream. */
 const MAX_RECONNECTS = 5;
 /** Pause before reconnecting a dropped stream. */
 const RECONNECT_DELAY_MS = 800;
-/** A head frame further ahead than this means the clock is wrong, not early. */
-const MAX_FUTURE_MS = 1000;
+/**
+ * How long presentation may go without drawing a frame before we conclude the
+ * clock itself is wrong (rather than the head frame simply being early).
+ * Being AHEAD is normal buffering; being unable to draw anything is not.
+ * Must clear normal startup comfortably: playback waits out the audio start
+ * lead before the first draw, and at 2500ms that legitimate wait tripped the
+ * guard and fast-forwarded away the cushion built from the stream's backlog.
+ */
+const PRESENT_STALL_MS = 5000;
 /** Hard cap on buffered decoded frames (~2.5s at 25fps). Frames hold GPU memory,
  *  so this is the ceiling the car has to live with. */
 const MAX_QUEUE_FRAMES = 60;
@@ -80,6 +90,9 @@ let audioAnchorMediaMs: number | null = null;
 let audioAnchorEpochMs = 0;
 let presentPending = false;
 let presentTimer: ReturnType<typeof setTimeout> | null = null;
+/** Epoch ms of the last drawn frame — 0 until playback starts. Wedge detection
+ *  keys off this: frames being early is fine, drawing nothing is not. */
+let lastPresentAt = 0;
 
 function post(m: unknown, transfer?: Transferable[]) {
   (self as unknown as Worker).postMessage(m, transfer || []);
@@ -136,6 +149,7 @@ function reset() {
   clockCalibrated = false;
   audioAnchorMediaMs = null;
   audioAnchorEpochMs = 0;
+  lastPresentAt = 0;
   demux = new TsDemuxer(onPes);
 }
 
@@ -143,6 +157,11 @@ async function play(streamUrl: string) {
   stop();
   reset();
   playing = true;
+  // Start the stall clock now: if the very first frames are already misaligned,
+  // "nothing presented yet" must still be able to trigger a re-anchor rather
+  // than waiting forever. PRESENT_STALL_MS is comfortably above the audio
+  // start lead, so normal startup buffering never trips it.
+  lastPresentAt = nowEpochMs();
   abort = new AbortController();
   post({ t: 'audioReset' });
   schedulePresent();
@@ -214,6 +233,101 @@ async function runStream(url: string) {
   }
 }
 
+/** Is this response an HLS playlist rather than raw MPEG-TS? */
+function looksLikePlaylist(contentType: string | null, first: Uint8Array): boolean {
+  if (contentType && /mpegurl/i.test(contentType)) return true;
+  // Real TS starts with the 0x47 sync byte; a playlist starts with #EXTM3U.
+  if (first[0] === 0x47) return false;
+  const head = new TextDecoder().decode(first.subarray(0, 16));
+  return head.startsWith('#EXTM3U');
+}
+
+/**
+ * Segment mode: poll the media playlist and stream each new segment. Only used
+ * for channels whose upstream is an external HLS source (they return a playlist
+ * even from the .ts URL). Continuous TS remains the default because it buffers
+ * far better; this exists so those channels work at all.
+ */
+async function runHlsSegments(playlistUrl: string) {
+  let mediaUrl = playlistUrl;
+  const parsed = parsePlaylist(await fetchText(playlistUrl));
+  if (parsed.kind === 'master') {
+    if (!parsed.variants.length) throw new Error('empty master playlist');
+    mediaUrl = parsed.variants[0].url;
+  }
+  let media: MediaPlaylist =
+    parsed.kind === 'media' ? parsed : parseMediaPlaylist(await fetchText(mediaUrl));
+
+  // Join a little back from the live edge so there is something to buffer.
+  let lastSeq = -1;
+  if (media.segments.length > HLS_EDGE_SEGMENTS) {
+    lastSeq = media.segments[media.segments.length - 1 - HLS_EDGE_SEGMENTS].seq;
+  }
+  let emptyPolls = 0;
+
+  while (playing) {
+    for (const seg of diffNewSegments(media, lastSeq)) {
+      if (!playing) return;
+      try {
+        await streamSegmentInto(seg.url);
+      } catch (e) {
+        if ((e as Error)?.name === 'AbortError') return;
+        log(`segment failed: ${(e as Error).message}`, 'warn');
+      }
+      lastSeq = seg.seq;
+    }
+    if (!media.live) return;
+    await sleep(Math.min(2000, Math.max(500, (media.targetDuration || 4) * 500)));
+    if (!playing) return;
+    try {
+      const next = parseMediaPlaylist(await fetchText(mediaUrl));
+      // An encoder restart rewinds media-sequence; rejoin instead of stalling.
+      if (next.segments.length && next.mediaSequence < media.mediaSequence) lastSeq = -1;
+      emptyPolls = diffNewSegments(next, lastSeq).length ? 0 : emptyPolls + 1;
+      if (emptyPolls >= 10) throw new Error('playlist stopped updating');
+      media = next;
+    } catch (e) {
+      if ((e as Error)?.message === 'playlist stopped updating') throw e;
+      /* transient playlist error — retry next poll */
+    }
+  }
+}
+
+async function fetchText(url: string): Promise<string> {
+  const r = await fetch(url, { signal: abort!.signal });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.text();
+}
+
+/** Read one segment fully into the demuxer, with the same backpressure rules. */
+async function streamSegmentInto(url: string) {
+  const r = await fetch(url, { signal: abort!.signal });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  const reader = r.body!.getReader();
+  const CH = 48 * 1024;
+  while (playing) {
+    const { value, done } = await reader.read();
+    if (done) return;
+    if (value.length > CH) {
+      for (let p = 0; p < value.length && playing; p += CH) {
+        demux!.push(value.subarray(p, Math.min(value.length, p + CH)));
+        await sleep(0);
+      }
+    } else {
+      demux!.push(value);
+    }
+    let waited = 0;
+    while (
+      playing &&
+      (queue.length >= BACKPRESSURE_FRAMES || (dec && dec.decodeQueueSize > 12)) &&
+      waited < MAX_BACKPRESSURE_MS
+    ) {
+      await sleep(15);
+      waited += 15;
+    }
+  }
+}
+
 async function streamOnce(url: string) {
   const r = await fetch(url, { signal: abort!.signal });
   if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -222,10 +336,29 @@ async function streamOnce(url: string) {
 
   const reader = r.body.getReader();
   const CH = 48 * 1024;
+  let sniffed = false;
   try {
     while (playing) {
       const { value, done } = await reader.read();
       if (done) return; // upstream closed → caller reconnects
+
+      // Some channels ignore the .ts extension and serve an HLS PLAYLIST anyway
+      // (their upstream is an external HLS CDN that the panel just relays).
+      // Feeding playlist text to the TS demuxer yields nothing, so detect it on
+      // the first bytes and switch to segment mode for this channel.
+      if (!sniffed) {
+        sniffed = true;
+        if (looksLikePlaylist(r.headers.get('content-type'), value)) {
+          log('server returned an HLS playlist — switching to segment mode', 'warn');
+          try {
+            await reader.cancel();
+          } catch {
+            /* ignore */
+          }
+          await runHlsSegments(url);
+          return;
+        }
+      }
       if (value.length > CH) {
         // Chunk + yield so a large read never blocks the presentation loop.
         for (let p = 0; p < value.length && playing; p += CH) {
@@ -488,13 +621,19 @@ function tryPresentOne(): boolean {
   if (!queue.length) return false;
   const f = queue[0];
   const diff = f.pts - now;
-  // A frame a little ahead just needs to wait for its moment.
-  // But a frame FAR ahead means the clock itself is wrong — typically because
-  // audio and video PTS have different bases, so the audio-master clock reads
-  // permanently behind the video. Previously such a frame was never presented
-  // AND never dropped: the queue filled, fetch backpressure wedged, and video
-  // froze for good while audio kept playing. Re-anchor onto this frame instead.
-  if (diff > MAX_FUTURE_MS) {
+  // A frame ahead of the clock just needs to wait for its moment — that IS the
+  // buffer, and being ahead is not evidence of anything wrong. Using "how far
+  // ahead" as the trigger fast-forwarded the clock onto the head frame during
+  // normal pre-buffering, collapsing the cushion to ~6 frames every time it
+  // fired. The real symptom of a broken clock is that NOTHING gets presented,
+  // so wedge detection is based on how long we have gone without drawing.
+  if (diff > 60) {
+    const stalledMs = nowEpochMs() - lastPresentAt;
+    if (stalledMs < PRESENT_STALL_MS) {
+      return false; // healthy: still presenting, this frame is simply early
+    }
+    // Nothing drawn for PRESENT_STALL_MS while frames sit in the future → the
+    // clock is wrong (audio/video PTS bases differ). Re-anchor onto this frame.
     if (audioAnchorMediaMs !== null) {
       audioAnchorEpochMs = nowEpochMs();
       audioAnchorMediaMs = f.pts;
@@ -503,9 +642,7 @@ function tryPresentOne(): boolean {
       wallStart = performance.now();
       ptsStart = f.pts;
     }
-    log(`presentation clock re-anchored (frame ${Math.round(diff)}ms in the future)`, 'warn');
-  } else if (diff > 60) {
-    return false; // future frame → wait
+    log(`presentation stalled ${Math.round(stalledMs)}ms — clock re-anchored`, 'warn');
   }
   if (diff < -250) {
     try {
@@ -517,6 +654,7 @@ function tryPresentOne(): boolean {
   }
   calibrate(f.pts);
   queue.shift();
+  lastPresentAt = nowEpochMs();
   draw(f.frame);
   try {
     f.frame.close();
