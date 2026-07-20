@@ -7,16 +7,22 @@
 // ponytail: MPEG audio only. If an AC-3 channel ever shows up, the sniffer
 // already reports it as unsupported — add a decoder here at that point.
 
-/** Raw PCM ready for Web Audio: one Float32Array per channel. */
+/** Raw PCM ready for Web Audio: one Float32Array per channel.
+ *  Declared over plain ArrayBuffer (not ArrayBufferLike) because
+ *  AudioBuffer.copyToChannel requires it — mpg123 never uses SharedArrayBuffer. */
 export interface DecodedPcm {
-  channelData: Float32Array[];
+  channelData: Float32Array<ArrayBuffer>[];
   sampleRate: number;
   samplesDecoded: number;
 }
 
 interface Mpeg123Decoder {
   ready: Promise<unknown>;
-  decode(data: Uint8Array): { channelData: Float32Array[]; samplesDecoded: number; sampleRate: number };
+  decode(data: Uint8Array): {
+    channelData: Float32Array<ArrayBuffer>[];
+    samplesDecoded: number;
+    sampleRate: number;
+  };
   free(): void;
 }
 
