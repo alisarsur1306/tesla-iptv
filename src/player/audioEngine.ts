@@ -29,10 +29,6 @@ import { MpegAudioDecoder } from './wasmAudio';
  * froze the picture (this panel delivers only slightly faster than realtime).
  */
 const START_LEAD_SEC = 1.5;
-/** Drop audio scheduled more than this far in the past. */
-const LATE_TOLERANCE_SEC = 0.25;
-/** Re-anchor if the scheduling clock drifts beyond this. */
-const RESYNC_THRESHOLD_SEC = 1.0;
 /** How far past the start lead audio may legitimately be scheduled ahead. */
 const MAX_LOOKAHEAD_SEC = 30.0;
 
@@ -64,8 +60,6 @@ export class AudioEngine {
   private scheduled = new Set<AudioBufferSourceNode>();
   /** WASM decoder for MPEG audio (created only for MP2/MP3 channels). */
   private mpeg: MpegAudioDecoder | null = null;
-  /** Monotonic media clock (ms) for MP2, advanced by decoded sample duration. */
-  private mpegClockMs: number | null = null;
 
   /** AudioContext time that `mediaAnchorMs` corresponds to. */
   private ctxAnchor = 0;
@@ -144,7 +138,6 @@ export class AudioEngine {
     this.mediaAnchorMs = 0;
     this.nextTime = 0;
     this.residual = null;
-    this.mpegClockMs = null;
     try {
       this.mpeg?.destroy();
     } catch {
@@ -288,21 +281,14 @@ export class AudioEngine {
     const out = this.mpeg.decode(bytes);
     if (!out || !out.samplesDecoded) return;
 
-    // Anchor the MP2 clock to the stream PTS once, then advance it by the exact
-    // decoded duration. Re-sync if the incoming PTS diverges (discontinuity):
-    // the WASM decoder gives us no per-frame timestamps, so we keep our own.
-    if (this.mpegClockMs === null || Math.abs(ptsMs - this.mpegClockMs) > 700) {
-      this.mpegClockMs = ptsMs;
-      this.anchored = false; // rebuild the ctx-time mapping from here
-    }
-
-    const ctx2 = ctx;
-    const buf = ctx2.createBuffer(out.channelData.length, out.samplesDecoded, out.sampleRate);
+    // Gapless scheduling paces MP2 by buffer duration, so the old monotonic
+    // clock + 700ms re-sync (which cut audio ~29% of the time) is gone. Pass the
+    // PES PTS straight through — it only seeds the video-sync anchor now.
+    const buf = ctx.createBuffer(out.channelData.length, out.samplesDecoded, out.sampleRate);
     for (let ch = 0; ch < out.channelData.length; ch++) {
       buf.copyToChannel(out.channelData[ch], ch);
     }
-    this.scheduleBuffer(buf, this.mpegClockMs);
-    this.mpegClockMs += (out.samplesDecoded / out.sampleRate) * 1000;
+    this.scheduleBuffer(buf, ptsMs);
   }
 
   private onDecoded(data: AudioData): void {
@@ -329,45 +315,54 @@ export class AudioEngine {
   }
 
   /**
-   * Schedule a decoded PCM buffer on the shared media timeline. Both the AAC
-   * (WebCodecs) and MP2 (WASM) paths funnel through here so anchoring, drift
-   * re-anchoring and the master-clock hand-off to the worker stay in one place.
+   * Schedule a decoded PCM buffer GAPLESSLY. Both the AAC (WebCodecs) and MP2
+   * (WASM) paths funnel through here.
+   *
+   * Buffers are placed back-to-back on a running playhead (`nextTime`) rather
+   * than mapped from each frame's PTS. Live audio is contiguous, so this plays
+   * it continuously; PTS is used only to establish the initial video-sync anchor
+   * and to detect a real discontinuity. Crucially, routine drift NEVER stops
+   * audio that is already scheduled — the previous PTS-mapped version re-anchored
+   * on every small drift and called stopScheduled(), which cut ~29% of buffers
+   * on the MP2 path (audible as sound cutting in and out). Only reset() (channel
+   * change / worker-signalled discontinuity) clears the queue now.
    */
   private scheduleBuffer(buf: AudioBuffer, mediaMs: number): void {
     const ctx = this.ensureContext();
 
-    if (!this.anchored) {
-      this.ctxAnchor = ctx.currentTime + START_LEAD_SEC;
+    // (Re)establish the playhead + the media→ctx-time anchor that video follows.
+    const anchor = (whenSec: number) => {
+      this.nextTime = whenSec;
+      this.ctxAnchor = whenSec;
       this.mediaAnchorMs = mediaMs;
       this.anchored = true;
-      this.nextTime = this.ctxAnchor;
-      const epochMs = nowEpochMs() + (this.ctxAnchor - ctx.currentTime) * 1000;
+      const epochMs = nowEpochMs() + (whenSec - ctx.currentTime) * 1000;
       this.cb.onAnchor?.(this.mediaAnchorMs, epochMs);
+    };
+
+    if (!this.anchored) anchor(ctx.currentTime + START_LEAD_SEC);
+
+    let when = this.nextTime;
+
+    // Underrun: the playhead fell behind real time because data arrived late.
+    // Nudge it forward (a brief gap) and re-anchor so video re-syncs — but do
+    // NOT cut what is already playing.
+    if (when < ctx.currentTime + 0.01) {
+      anchor(ctx.currentTime + 0.05);
+      when = this.nextTime;
     }
 
-    let when = this.ctxAnchor + (mediaMs - this.mediaAnchorMs) / 1000;
-
-    const ahead = when - ctx.currentTime;
-
-    // BEHIND by more than the threshold means the timeline really is wrong
-    // (discontinuity / stall). Only then is a re-anchor justified, and only then
-    // must the queue be dropped — what is queued belongs to the old timeline and
-    // would otherwise play underneath the new one as two overlapping sounds.
-    if (-ahead > RESYNC_THRESHOLD_SEC) {
-      this.stopScheduled();
-      this.anchored = false; // re-anchor next buffer
-      return;
+    // A large forward jump in media time is a real discontinuity — re-anchor so
+    // latency doesn't creep, again without cutting existing audio.
+    if (mediaMs - this.mediaAnchorMs - (when - this.ctxAnchor) * 1000 > 1500) {
+      anchor(ctx.currentTime + START_LEAD_SEC);
+      when = this.nextTime;
     }
 
-    // AHEAD is not an error — it is the buffer. The continuous stream front-loads
-    // a backlog, so audio legitimately schedules seconds ahead and those buffers
-    // are correctly timed. Treating that as desync (stopping the queue and
-    // re-anchoring) silenced ~33% of all buffers: sound cut out and came back
-    // every few seconds. Past the bound we simply stop adding more and let
-    // playback drain — never cancel what is already correctly scheduled.
-    if (ahead > START_LEAD_SEC + MAX_LOOKAHEAD_SEC) return;
-    if (when < ctx.currentTime - LATE_TOLERANCE_SEC) return; // too late to matter
-    if (when < ctx.currentTime) when = ctx.currentTime;
+    // Runaway lookahead (a big decoded burst) — hold off adding more; the queued
+    // buffers keep playing and realtime catches up. nextTime is unchanged so the
+    // next call retries at the same slot.
+    if (when - ctx.currentTime > START_LEAD_SEC + MAX_LOOKAHEAD_SEC) return;
 
     const src = ctx.createBufferSource();
     src.buffer = buf;
@@ -375,6 +370,6 @@ export class AudioEngine {
     src.onended = () => this.scheduled.delete(src);
     src.start(when);
     this.scheduled.add(src);
-    this.nextTime = Math.max(this.nextTime, when + buf.duration);
+    this.nextTime = when + buf.duration;
   }
 }
