@@ -26,8 +26,15 @@ const UNSUPPORTED_PES_THRESHOLD = 120;
 const MAX_RECONNECTS = 5;
 /** Pause before reconnecting a dropped stream. */
 const RECONNECT_DELAY_MS = 800;
-/** A head frame further ahead than this means the clock is wrong, not early. */
-const MAX_FUTURE_MS = 1000;
+/**
+ * How long presentation may go without drawing a frame before we conclude the
+ * clock itself is wrong (rather than the head frame simply being early).
+ * Being AHEAD is normal buffering; being unable to draw anything is not.
+ * Must clear normal startup comfortably: playback waits out the audio start
+ * lead before the first draw, and at 2500ms that legitimate wait tripped the
+ * guard and fast-forwarded away the cushion built from the stream's backlog.
+ */
+const PRESENT_STALL_MS = 5000;
 /** Hard cap on buffered decoded frames (~2.5s at 25fps). Frames hold GPU memory,
  *  so this is the ceiling the car has to live with. */
 const MAX_QUEUE_FRAMES = 60;
@@ -80,6 +87,9 @@ let audioAnchorMediaMs: number | null = null;
 let audioAnchorEpochMs = 0;
 let presentPending = false;
 let presentTimer: ReturnType<typeof setTimeout> | null = null;
+/** Epoch ms of the last drawn frame — 0 until playback starts. Wedge detection
+ *  keys off this: frames being early is fine, drawing nothing is not. */
+let lastPresentAt = 0;
 
 function post(m: unknown, transfer?: Transferable[]) {
   (self as unknown as Worker).postMessage(m, transfer || []);
@@ -136,6 +146,7 @@ function reset() {
   clockCalibrated = false;
   audioAnchorMediaMs = null;
   audioAnchorEpochMs = 0;
+  lastPresentAt = 0;
   demux = new TsDemuxer(onPes);
 }
 
@@ -143,6 +154,11 @@ async function play(streamUrl: string) {
   stop();
   reset();
   playing = true;
+  // Start the stall clock now: if the very first frames are already misaligned,
+  // "nothing presented yet" must still be able to trigger a re-anchor rather
+  // than waiting forever. PRESENT_STALL_MS is comfortably above the audio
+  // start lead, so normal startup buffering never trips it.
+  lastPresentAt = nowEpochMs();
   abort = new AbortController();
   post({ t: 'audioReset' });
   schedulePresent();
@@ -488,13 +504,19 @@ function tryPresentOne(): boolean {
   if (!queue.length) return false;
   const f = queue[0];
   const diff = f.pts - now;
-  // A frame a little ahead just needs to wait for its moment.
-  // But a frame FAR ahead means the clock itself is wrong — typically because
-  // audio and video PTS have different bases, so the audio-master clock reads
-  // permanently behind the video. Previously such a frame was never presented
-  // AND never dropped: the queue filled, fetch backpressure wedged, and video
-  // froze for good while audio kept playing. Re-anchor onto this frame instead.
-  if (diff > MAX_FUTURE_MS) {
+  // A frame ahead of the clock just needs to wait for its moment — that IS the
+  // buffer, and being ahead is not evidence of anything wrong. Using "how far
+  // ahead" as the trigger fast-forwarded the clock onto the head frame during
+  // normal pre-buffering, collapsing the cushion to ~6 frames every time it
+  // fired. The real symptom of a broken clock is that NOTHING gets presented,
+  // so wedge detection is based on how long we have gone without drawing.
+  if (diff > 60) {
+    const stalledMs = nowEpochMs() - lastPresentAt;
+    if (stalledMs < PRESENT_STALL_MS) {
+      return false; // healthy: still presenting, this frame is simply early
+    }
+    // Nothing drawn for PRESENT_STALL_MS while frames sit in the future → the
+    // clock is wrong (audio/video PTS bases differ). Re-anchor onto this frame.
     if (audioAnchorMediaMs !== null) {
       audioAnchorEpochMs = nowEpochMs();
       audioAnchorMediaMs = f.pts;
@@ -503,9 +525,7 @@ function tryPresentOne(): boolean {
       wallStart = performance.now();
       ptsStart = f.pts;
     }
-    log(`presentation clock re-anchored (frame ${Math.round(diff)}ms in the future)`, 'warn');
-  } else if (diff > 60) {
-    return false; // future frame → wait
+    log(`presentation stalled ${Math.round(stalledMs)}ms — clock re-anchored`, 'warn');
   }
   if (diff < -250) {
     try {
@@ -517,6 +537,7 @@ function tryPresentOne(): boolean {
   }
   calibrate(f.pts);
   queue.shift();
+  lastPresentAt = nowEpochMs();
   draw(f.frame);
   try {
     f.frame.close();
