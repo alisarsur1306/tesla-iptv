@@ -61,6 +61,10 @@ const REBUFFER_STEP_FRAMES = FPS_EST;
 const MAX_REBUFFER_FRAMES = 48;
 /** Resume anyway after this long buffering, so a pause can never last forever. */
 const MAX_BUFFERING_MS = 4000;
+/** Below this many encoded bytes the reserve is effectively empty (network
+ *  starvation). Above it, an empty frame queue means the DECODER is the
+ *  bottleneck, not the network — which rebuffering must not treat as a stall. */
+const NETWORK_STARVE_BYTES = 128 * 1024;
 /** Smooth playback for this long resets the adaptive cushion back toward near-live. */
 const REBUFFER_DECAY_MS = 20_000;
 /**
@@ -756,8 +760,15 @@ function presentTick() {
 
   const presented = tryPresentOne();
 
-  // Underrun after we had been playing → rebuffer (unless we're already there).
-  if (!presented && queue.length === 0 && lastPresentAt !== 0 && !buffering) {
+  // Underrun after we had been playing → rebuffer, but ONLY for true NETWORK
+  // starvation: the decoded queue is empty AND there are no encoded bytes left
+  // to decode. If the reserve still has data, the queue emptied because the
+  // DECODER can't keep up (a slow phone on a heavy stream) — rebuffering can't
+  // help that (the decoder is the bottleneck, not the network) and would just
+  // get stuck showing a spinner while the adaptive cushion grows out of reach.
+  // Decode-bound is left to present-newest: frames are shown as they arrive.
+  const networkStarved = encodedBytes < NETWORK_STARVE_BYTES;
+  if (!presented && queue.length === 0 && lastPresentAt !== 0 && !buffering && networkStarved) {
     // Smooth for a while → forget past rebuffers, resume near-live next time.
     if (nowEpochMs() - lastRebufferAt > REBUFFER_DECAY_MS) rebufferCount = 0;
     rebufferCount++;
