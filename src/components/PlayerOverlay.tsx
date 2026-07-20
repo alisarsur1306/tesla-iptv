@@ -13,22 +13,46 @@ interface PlayerOverlayProps {
 }
 
 export default function PlayerOverlay({ creds, channel, onBack }: PlayerOverlayProps) {
-  const videoRef = useRef<HTMLVideoElement>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
   const hlsRef = useRef<Hls | null>(null);
+  const watchdogRef = useRef<number | null>(null);
   const retriesRef = useRef(0);
   const [needsTap, setNeedsTap] = useState(true);
   const [fatalError, setFatalError] = useState<string | null>(null);
   const [status, setStatus] = useState('Loading…');
 
   useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
+    // No <video> in the DOM at all: hls.js needs an HTMLMediaElement to decode
+    // into, but a detached one works — it keeps decoding and playing audio.
+    // The canvas is the only visible (and only mounted) surface.
+    const video = document.createElement('video');
+    video.playsInline = true;
+    videoRef.current = video;
 
     const source = proxied(liveStreamUrl(creds, channel.stream_id));
     retriesRef.current = 0;
     setFatalError(null);
     setNeedsTap(true);
     setStatus('Loading…');
+
+    // Canvas rendering: the <video> is a hidden decode/audio source; every frame
+    // is copied onto the visible <canvas>. rAF (not rVFC) so it also runs with
+    // the native-HLS fallback and keeps painting the last frame after a stall.
+    const canvas = canvasRef.current;
+    const ctx = canvas?.getContext('2d');
+    let rafId = 0;
+    const draw = () => {
+      if (canvas && ctx && video!.readyState >= 2 && video!.videoWidth) {
+        if (canvas.width !== video!.videoWidth || canvas.height !== video!.videoHeight) {
+          canvas.width = video!.videoWidth;
+          canvas.height = video!.videoHeight;
+        }
+        ctx.drawImage(video!, 0, 0, canvas.width, canvas.height);
+      }
+      rafId = requestAnimationFrame(draw);
+    };
+    rafId = requestAnimationFrame(draw);
 
     function tryPlay() {
       video!
@@ -53,6 +77,42 @@ export default function PlayerOverlay({ creds, channel, onBack }: PlayerOverlayP
         setStatus('Ready');
         tryPlay();
       });
+
+      // Freeze watchdog: the hardware video decoder can stall on a bad frame
+      // while audio keeps playing — currentTime advances, no fatal error fires,
+      // so nothing else here recovers it. Detect "clock moving but no new video
+      // frame presented" and force a decoder reset.
+      // ponytail: recoverMediaError only; if it stops helping, escalate to reload source.
+      // Needs requestVideoFrameCallback (Chromium 83+) to know when a frame is
+      // actually presented — without it we can't tell a freeze from normal play,
+      // so skip the watchdog rather than false-recover.
+      if ('requestVideoFrameCallback' in video) {
+        let lastFrameAt = 0;
+        let stallRecoveries = 0;
+        const bumpFrame = () => {
+          lastFrameAt = video!.currentTime;
+          (video as HTMLVideoElement).requestVideoFrameCallback(bumpFrame);
+        };
+        bumpFrame();
+
+        watchdogRef.current = window.setInterval(() => {
+          if (video!.paused || video!.ended || video!.readyState < 2) return;
+          // Audio advances currentTime; if no new frame arrived for ~2s, video froze.
+          if (video!.currentTime - lastFrameAt > 2) {
+            stallRecoveries += 1;
+            if (stallRecoveries <= MAX_NETWORK_RETRIES) {
+              setStatus('Video froze — recovering…');
+              hls.recoverMediaError();
+            } else {
+              setStatus('Reloading stream…');
+              hls.stopLoad();
+              hls.startLoad();
+              stallRecoveries = 0;
+            }
+            lastFrameAt = video!.currentTime; // give recovery time before re-firing
+          }
+        }, 1000);
+      }
 
       hls.on(Hls.Events.ERROR, (_event, data) => {
         if (!data.fatal) return;
@@ -84,10 +144,17 @@ export default function PlayerOverlay({ creds, channel, onBack }: PlayerOverlayP
     }
 
     return () => {
+      cancelAnimationFrame(rafId);
+      if (watchdogRef.current !== null) {
+        clearInterval(watchdogRef.current);
+        watchdogRef.current = null;
+      }
       hlsRef.current?.destroy();
       hlsRef.current = null;
+      video.pause();
       video.removeAttribute('src');
       video.load();
+      videoRef.current = null;
     };
   }, [creds, channel]);
 
@@ -100,11 +167,9 @@ export default function PlayerOverlay({ creds, channel, onBack }: PlayerOverlayP
 
   return (
     <div className="fixed inset-0 z-50 bg-black">
-      <video
-        ref={videoRef}
-        playsInline
-        controls
-        className="h-full w-full"
+      <canvas
+        ref={canvasRef}
+        className="h-full w-full object-contain"
         onClick={needsTap ? handleTapToPlay : undefined}
       />
 
