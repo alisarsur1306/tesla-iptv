@@ -279,9 +279,14 @@ export async function handleProxy(req, res) {
     }
 
     // Binary passthrough (.ts segments, icons, ...) — stream it.
+    const responseType = upstreamType || (finalUrl.endsWith('.ts') ? 'video/mp2t' : 'application/octet-stream');
+    // Channel logos never change, so let the browser cache them — otherwise the
+    // grid re-downloads every icon on each visit and scroll (costly on the
+    // phone/car). Video and everything else stays uncacheable.
+    const isImage = /^image\//i.test(responseType);
     const responseHeaders = {
-      'Content-Type': upstreamType || (finalUrl.endsWith('.ts') ? 'video/mp2t' : 'application/octet-stream'),
-      'Cache-Control': 'no-store',
+      'Content-Type': responseType,
+      'Cache-Control': isImage ? 'public, max-age=604800, immutable' : 'no-store',
     };
     const contentLength = upstream.headers.get('content-length');
     if (contentLength) responseHeaders['Content-Length'] = contentLength;
