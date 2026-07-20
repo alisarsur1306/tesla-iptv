@@ -45,9 +45,12 @@ const MAX_QUEUE_FRAMES = 60;
 const LIVE_TRIM_MIN_FRAMES = 40;
 /** ...and only frames genuinely far behind the clock. */
 const LIVE_TRIM_MS = 2000;
-/** Pause intake once this many decoded frames are buffered. Must sit below
- *  MAX_QUEUE_FRAMES so backpressure (not frame-dropping) is what limits us. */
-const BACKPRESSURE_FRAMES = 45;
+/** Keep roughly this many frames DECODED. The rest of the reserve is held as
+ *  cheap encoded bytes, so this stays low to bound GPU memory in the car. */
+const DECODE_TARGET_FRAMES = 24;
+/** Reader pauses once the encoded reserve reaches this many bytes (~10-15s of
+ *  video). This is the real jitter cushion; bytes are cheap so it can be large. */
+const MAX_ENCODED_BYTES = 8 * 1024 * 1024;
 /**
  * Cap on how long intake may block on backpressure. Generous on purpose:
  * pausing the read IS the buffer — the rest of the segment stays unread and
@@ -62,6 +65,14 @@ let ctx: OffscreenCanvasRenderingContext2D | null = null;
 
 let playing = false;
 let abort: AbortController | null = null;
+
+// Encoded-byte reserve between the network and the decoder. The reader fills it
+// as fast as bytes arrive (capturing the stream's front-loaded backlog); the
+// feeder drains it into the demuxer only enough to keep a small decoded-frame
+// target. A network stall then drains this cheap byte reserve instead of
+// freezing the picture — decoded frames hold GPU memory, encoded bytes are ~free.
+let encodedChunks: Uint8Array[] = [];
+let encodedBytes = 0;
 
 // demux + decode state
 let demux: TsDemuxer | null = null;
@@ -150,6 +161,8 @@ function reset() {
   audioAnchorMediaMs = null;
   audioAnchorEpochMs = 0;
   lastPresentAt = 0;
+  encodedChunks = [];
+  encodedBytes = 0;
   demux = new TsDemuxer(onPes);
 }
 
@@ -165,6 +178,7 @@ async function play(streamUrl: string) {
   abort = new AbortController();
   post({ t: 'audioReset' });
   schedulePresent();
+  void feedLoop(); // drains the encoded reserve into the decoder for the session
   try {
     await runStream(streamUrl);
   } catch (e) {
@@ -304,24 +318,12 @@ async function streamSegmentInto(url: string) {
   const r = await fetch(url, { signal: abort!.signal });
   if (!r.ok) throw new Error('HTTP ' + r.status);
   const reader = r.body!.getReader();
-  const CH = 48 * 1024;
   while (playing) {
     const { value, done } = await reader.read();
     if (done) return;
-    if (value.length > CH) {
-      for (let p = 0; p < value.length && playing; p += CH) {
-        demux!.push(value.subarray(p, Math.min(value.length, p + CH)));
-        await sleep(0);
-      }
-    } else {
-      demux!.push(value);
-    }
+    pushEncoded(value);
     let waited = 0;
-    while (
-      playing &&
-      (queue.length >= BACKPRESSURE_FRAMES || (dec && dec.decodeQueueSize > 12)) &&
-      waited < MAX_BACKPRESSURE_MS
-    ) {
+    while (playing && encodedBytes >= MAX_ENCODED_BYTES && waited < MAX_BACKPRESSURE_MS) {
       await sleep(15);
       waited += 15;
     }
@@ -335,7 +337,6 @@ async function streamOnce(url: string) {
   post({ t: 'ready' });
 
   const reader = r.body.getReader();
-  const CH = 48 * 1024;
   let sniffed = false;
   try {
     while (playing) {
@@ -359,24 +360,13 @@ async function streamOnce(url: string) {
           return;
         }
       }
-      if (value.length > CH) {
-        // Chunk + yield so a large read never blocks the presentation loop.
-        for (let p = 0; p < value.length && playing; p += CH) {
-          demux!.push(value.subarray(p, Math.min(value.length, p + CH)));
-          await sleep(0);
-        }
-      } else {
-        demux!.push(value);
-      }
-      // Read-side backpressure: never drop encoded frames; pace intake instead.
-      // Pausing the read IS the buffer — the rest of the response stays unread
-      // and cheap. Bounded only so a stalled presentation can't wedge intake.
+      pushEncoded(value);
+      // Read-side backpressure keys off the ENCODED reserve now, not decoded
+      // frames: keep pulling bytes off the network (grabbing the front-loaded
+      // backlog) until the reserve is deep, then pause. The feeder decodes at
+      // its own pace, so a network stall drains the reserve rather than freezing.
       let waited = 0;
-      while (
-        playing &&
-        (queue.length >= BACKPRESSURE_FRAMES || (dec && dec.decodeQueueSize > 12)) &&
-        waited < MAX_BACKPRESSURE_MS
-      ) {
+      while (playing && encodedBytes >= MAX_ENCODED_BYTES && waited < MAX_BACKPRESSURE_MS) {
         await sleep(15);
         waited += 15;
       }
@@ -386,6 +376,40 @@ async function streamOnce(url: string) {
       await reader.cancel();
     } catch {
       /* ignore */
+    }
+  }
+}
+
+/** Append network bytes to the encoded reserve. */
+function pushEncoded(chunk: Uint8Array): void {
+  encodedChunks.push(chunk);
+  encodedBytes += chunk.length;
+}
+
+/**
+ * Feeder: drain the encoded reserve into the demuxer, but only enough to keep
+ * ~DECODE_TARGET_FRAMES decoded. Surplus stays as cheap encoded bytes. Runs for
+ * the whole session alongside the reader.
+ */
+async function feedLoop(): Promise<void> {
+  const CH = 48 * 1024;
+  while (playing) {
+    const wantMore = queue.length < DECODE_TARGET_FRAMES && (!dec || dec.decodeQueueSize < 16);
+    if (wantMore && encodedChunks.length) {
+      const chunk = encodedChunks.shift()!;
+      encodedBytes -= chunk.length;
+      // Split a large chunk so a single push never blocks the loop for long.
+      if (chunk.length > CH) {
+        for (let p = 0; p < chunk.length && playing; p += CH) {
+          demux!.push(chunk.subarray(p, Math.min(chunk.length, p + CH)));
+          await sleep(0);
+        }
+      } else {
+        demux!.push(chunk);
+      }
+    } else {
+      // Either the decoder is satisfied or the reserve is empty (network stall).
+      await sleep(wantMore ? 20 : 8);
     }
   }
 }
@@ -538,7 +562,8 @@ function initDecoder() {
         }
       }
       if (!presentPending) schedulePresent();
-      if ((frameCount & 15) === 0) post({ t: 'stats', frames: frameCount, buffer: queue.length });
+      if ((frameCount & 15) === 0)
+        post({ t: 'stats', frames: frameCount, buffer: queue.length, reserveKB: Math.round(encodedBytes / 1024) });
     },
     error: (e) => {
       log('VideoDecoder error: ' + e.message, 'error');
