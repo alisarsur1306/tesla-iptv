@@ -10,11 +10,16 @@ services:
     envVars:
       - key: NODE_VERSION
         value: "24"
+      # Channel source — set EITHER the three XTREAM_* vars OR M3U_URL. Xtream
+      # wins if both are set. Either way the account/URLs stay server-side.
       - key: XTREAM_SERVER
         sync: false
       - key: XTREAM_USERNAME
         sync: false
       - key: XTREAM_PASSWORD
+        sync: false
+      # Alternative to Xtream: a remote M3U/M3U8 channel-list URL.
+      - key: M3U_URL
         sync: false
       - key: ACCESS_KEY
         sync: false
