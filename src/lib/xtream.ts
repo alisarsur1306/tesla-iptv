@@ -150,10 +150,18 @@ export async function getLiveStreams(creds: XtreamCreds): Promise<XtreamLiveStre
   return Array.isArray(data) ? data : [];
 }
 
-/** Direct (pre-proxy) m3u8 URL for a live stream. Pass through proxied() before use. */
+/**
+ * Direct (pre-proxy) URL for a live stream. Pass through proxied() before use.
+ *
+ * `.ts` (one continuous MPEG-TS response), not `.m3u8`. HLS meant polling the
+ * playlist and fetching segments one at a time, which delivered data in bursts
+ * with multi-second gaps and left the decoder starved — the picture froze and
+ * flickered. A single long-lived response streams continuously and even
+ * front-loads a backlog, so the buffer fills immediately.
+ */
 export function liveStreamUrl(creds: XtreamCreds, streamId: number): string {
   const base = normalizeServer(creds.server);
-  return `${base}/live/${encodeURIComponent(creds.username)}/${encodeURIComponent(creds.password)}/${streamId}.m3u8`;
+  return `${base}/live/${encodeURIComponent(creds.username)}/${encodeURIComponent(creds.password)}/${streamId}.ts`;
 }
 
 /** Proxied URL for a channel icon (safe for <img src>). Empty when no icon. */

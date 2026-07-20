@@ -231,18 +231,31 @@ export async function handleProxy(req, res) {
   const headers = { 'User-Agent': USER_AGENT, Accept: '*/*' };
   if (req.headers.range) headers.Range = req.headers.range;
 
+  // The timeout must cover CONNECTING only, not the response body. A live
+  // channel is one continuous MPEG-TS response that never ends, so a whole-
+  // request timeout would tear playback down every TIMEOUT_MS. The timer is
+  // therefore cleared as soon as the headers arrive.
+  // The controller is also aborted when the client goes away, so an abandoned
+  // stream releases the upstream connection immediately — this matters on
+  // accounts limited to a single concurrent connection.
+  const controller = new AbortController();
+  const connectTimer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  res.on('close', () => controller.abort());
+
   let upstream;
   try {
     upstream = await upstreamFetch(target, {
       redirect: 'follow',
       headers,
-      signal: AbortSignal.timeout(TIMEOUT_MS),
+      signal: controller.signal,
     });
   } catch (err) {
+    clearTimeout(connectTimer);
     const isTimeout = err && (err.name === 'TimeoutError' || err.name === 'AbortError');
     sendError(res, isTimeout ? 504 : 502, `Upstream fetch failed: ${String(err && err.message ? err.message : err)}`);
     return;
   }
+  clearTimeout(connectTimer); // headers are in; the body may now stream forever
 
   const upstreamType = upstream.headers.get('content-type') || '';
   const finalUrl = upstream.url || target.toString();
