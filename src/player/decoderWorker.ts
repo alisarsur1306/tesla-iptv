@@ -52,6 +52,17 @@ const DECODE_TARGET_FRAMES = 24;
 /** Reader pauses once the encoded reserve reaches this many bytes (~10-15s of
  *  video). This is the real jitter cushion; bytes are cheap so it can be large. */
 const MAX_ENCODED_BYTES = 8 * 1024 * 1024;
+/** Rough fps estimate for sizing the rebuffer cushion in seconds. */
+const FPS_EST = 24;
+/** Frames added to the resume cushion per repeated rebuffer (~1s each). */
+const REBUFFER_STEP_FRAMES = FPS_EST;
+/** Hard cap on the decoded resume cushion (memory-bounded; ~2s of frames). The
+ *  encoded reserve extends effective smoothness behind this. */
+const MAX_REBUFFER_FRAMES = 48;
+/** Resume anyway after this long buffering, so a pause can never last forever. */
+const MAX_BUFFERING_MS = 4000;
+/** Smooth playback for this long resets the adaptive cushion back toward near-live. */
+const REBUFFER_DECAY_MS = 20_000;
 /**
  * Cap on how long intake may block on backpressure. Generous on purpose:
  * pausing the read IS the buffer — the rest of the segment stays unread and
@@ -111,6 +122,15 @@ let presentTimer: ReturnType<typeof setTimeout> | null = null;
 /** Epoch ms of the last drawn frame — 0 until playback starts. Wedge detection
  *  keys off this: frames being early is fine, drawing nothing is not. */
 let lastPresentAt = 0;
+// Adaptive rebuffering: when the decoded queue starves after playing, pause and
+// let a cushion rebuild rather than stuttering frame-by-frame. The cushion grows
+// with repeated rebuffers on the same channel and decays after smooth playback,
+// so a healthy channel resumes near-instantly and a struggling one gets a bigger
+// runway (0 up to ~2s decoded, plus the encoded reserve behind it).
+let buffering = false;
+let bufferingStartAt = 0;
+let rebufferCount = 0;
+let lastRebufferAt = 0;
 
 function post(m: unknown, transfer?: Transferable[]) {
   (self as unknown as Worker).postMessage(m, transfer || []);
@@ -172,6 +192,9 @@ function reset() {
   audioAnchorMediaMs = null;
   audioAnchorEpochMs = 0;
   lastPresentAt = 0;
+  buffering = false;
+  rebufferCount = 0;
+  lastRebufferAt = 0;
   encodedChunks = [];
   encodedBytes = 0;
   demux = new TsDemuxer(onPes);
@@ -701,12 +724,50 @@ function schedulePresent() {
   presentPending = true;
   presentTick();
 }
+/** Frames we want buffered before resuming — grows with repeated rebuffers. */
+function resumeTargetFrames(): number {
+  return Math.min(MAX_REBUFFER_FRAMES, Math.max(0, (rebufferCount - 1) * REBUFFER_STEP_FRAMES));
+}
+
 function presentTick() {
   if (!playing) {
     presentPending = false;
     return;
   }
+
+  if (buffering) {
+    const enough = queue.length >= resumeTargetFrames();
+    const timedOut = nowEpochMs() - bufferingStartAt > MAX_BUFFERING_MS;
+    if ((enough && queue.length > 0) || (timedOut && queue.length > 0)) {
+      buffering = false;
+      lastRebufferAt = nowEpochMs();
+      // Wall time advanced during the pause. Drop the stale clocks so both video
+      // and audio re-anchor from where they actually resume — otherwise every
+      // buffered frame reads as hugely late and gets dropped. Audio re-anchors
+      // itself via its own underrun path and re-publishes the master anchor.
+      clockCalibrated = false;
+      audioAnchorMediaMs = null;
+      post({ t: 'buffering', active: false });
+    } else {
+      presentTimer = setTimeout(presentTick, 40); // keep waiting for the cushion
+      return;
+    }
+  }
+
   const presented = tryPresentOne();
+
+  // Underrun after we had been playing → rebuffer (unless we're already there).
+  if (!presented && queue.length === 0 && lastPresentAt !== 0 && !buffering) {
+    // Smooth for a while → forget past rebuffers, resume near-live next time.
+    if (nowEpochMs() - lastRebufferAt > REBUFFER_DECAY_MS) rebufferCount = 0;
+    rebufferCount++;
+    buffering = true;
+    bufferingStartAt = nowEpochMs();
+    post({ t: 'buffering', active: true });
+    presentTimer = setTimeout(presentTick, 40);
+    return;
+  }
+
   if (!presented && !queue.length) {
     presentPending = false;
     return;

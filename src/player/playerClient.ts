@@ -19,6 +19,8 @@ export interface PlayerCallbacks {
   onAudio?: (data: ArrayBuffer, ptsMs: number) => void;
   /** The stream's video is not H.264 (e.g. HEVC) and cannot be decoded. */
   onUnsupportedVideo?: () => void;
+  /** Playback paused to rebuffer (active=true) or resumed (active=false). */
+  onBuffering?: (active: boolean) => void;
   /**
    * The worker restarted the media timeline (stream start or PTS discontinuity).
    * The audio engine MUST drop everything it has scheduled, otherwise the old
@@ -73,6 +75,7 @@ export class CanvasPlayer {
     data?: ArrayBuffer;
     width?: number;
     height?: number;
+    active?: boolean;
   }) {
     switch (m.t) {
       case 'ready':
@@ -98,6 +101,9 @@ export class CanvasPlayer {
         break;
       case 'audioReset':
         this.cb.onAudioReset?.();
+        break;
+      case 'buffering':
+        this.cb.onBuffering?.(!!m.active);
         break;
       // 'canvasResize' is informational; the OffscreenCanvas already resized.
     }

@@ -3,7 +3,7 @@ import { Button } from '@/components/ui/button';
 import { liveStreamUrl, type XtreamCreds, type XtreamLiveStream } from '@/lib/xtream';
 import { CanvasPlayer } from '@/player/playerClient';
 import { AudioEngine } from '@/player/audioEngine';
-import { ArrowLeft, TriangleAlert, Volume2, VolumeX, Volume1, Play, Pause, SkipBack, SkipForward } from 'lucide-react';
+import { ArrowLeft, TriangleAlert, Volume2, VolumeX, Volume1, Play, Pause, SkipBack, SkipForward, Loader2 } from 'lucide-react';
 
 const MAX_NETWORK_RETRIES = 3;
 
@@ -31,6 +31,7 @@ export default function PlayerOverlay({ creds, channel, playlist = [], onSelect,
   const [audioUnsupported, setAudioUnsupported] = useState<string | null>(null);
   const [videoUnsupported, setVideoUnsupported] = useState(false);
   const [paused, setPaused] = useState(false);
+  const [buffering, setBuffering] = useState(false);
   const [volume, setVolume] = useState(1);
   const playerRef = useRef<CanvasPlayer | null>(null);
   const sourceRef = useRef<string>('');
@@ -51,6 +52,7 @@ export default function PlayerOverlay({ creds, channel, playlist = [], onSelect,
     setStatus('Loading…');
     setAudioUnsupported(null);
     setVideoUnsupported(false);
+    setBuffering(false);
 
     const canvas = document.createElement('canvas');
     canvas.className = 'h-full w-full object-contain';
@@ -74,6 +76,7 @@ export default function PlayerOverlay({ creds, channel, playlist = [], onSelect,
       onAudio: (data, pts) => audio.push(data, pts),
       onAudioReset: () => audio.reset(),
       onUnsupportedVideo: () => setVideoUnsupported(true),
+      onBuffering: (active) => setBuffering(active),
       onError: (msg) => {
         if (destroyed) return;
         // `retries` counts CONSECUTIVE failures (reset by onStats above), so a
@@ -228,6 +231,16 @@ export default function PlayerOverlay({ creds, channel, playlist = [], onSelect,
               <Volume2 className="h-6 w-6" />
             </Button>
           </div>
+        </div>
+      )}
+
+      {/* Rebuffering — the stream ran dry; we pause to rebuild a cushion */}
+      {buffering && !fatalError && !videoUnsupported && (
+        <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+          <span className="flex items-center gap-4 rounded-2xl bg-black/70 px-8 py-5">
+            <Loader2 className="size-9 animate-spin text-white" />
+            <span className="text-2xl font-medium text-white">Buffering…</span>
+          </span>
         </div>
       )}
 
