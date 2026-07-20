@@ -65,6 +65,9 @@ const MAX_BUFFERING_MS = 4000;
  *  starvation). Above it, an empty frame queue means the DECODER is the
  *  bottleneck, not the network — which rebuffering must not treat as a stall. */
 const NETWORK_STARVE_BYTES = 128 * 1024;
+/** No decoded frame within this long after the decoder configured → it's
+ *  silently failing (typical of iOS Safari WebCodecs). Report, don't hang. */
+const FIRST_FRAME_TIMEOUT_MS = 10_000;
 /** Smooth playback for this long resets the adaptive cushion back toward near-live. */
 const REBUFFER_DECAY_MS = 20_000;
 /**
@@ -103,6 +106,13 @@ let hevcPps: Uint8Array | null = null;
 let videoCodec: 'h264' | 'hevc' | null = null;
 let ready = false;
 let gotIDR = false;
+// First-frame watchdog: some platforms (notably iOS Safari WebCodecs) accept
+// the config and the chunks but never emit a decoded frame. Without this the UI
+// just says "Loading" forever. Track when decoding began and whether any frame
+// came out, so we can report a real reason instead of hanging.
+let decodeStartedAt = 0;
+let producedFrame = false;
+let videoStalledReported = false;
 let firstPTS: number | null = null;
 /** Last relative timestamp (ms) — carries PES that have no PTS of their own. */
 let lastRel = 0;
@@ -179,6 +189,9 @@ function reset() {
   videoCodec = null;
   ready = false;
   gotIDR = false;
+  decodeStartedAt = 0;
+  producedFrame = false;
+  videoStalledReported = false;
   firstPTS = null;
   lastRel = 0;
   videoPesSeen = 0;
@@ -654,6 +667,7 @@ function initHevcDecoder() {
     try {
       dec.configure({ codec, optimizeForLatency: true, hardwareAcceleration: 'no-preference' });
       ready = true;
+      decodeStartedAt = nowEpochMs(); // arm the first-frame watchdog
       log('HEVC decoder ready: ' + codec, 'success');
       return;
     } catch (e) {
@@ -685,6 +699,7 @@ function initDecoder() {
   try {
     dec.configure({ codec, description, optimizeForLatency: true, hardwareAcceleration: 'no-preference' });
     ready = true;
+    decodeStartedAt = nowEpochMs(); // arm the first-frame watchdog
     log('video decoder ready: ' + codec, 'success');
   } catch (e) {
     log('video configure failed: ' + (e as Error).message, 'error');
@@ -694,6 +709,7 @@ function initDecoder() {
 
 /** Shared decoder output: queue the frame, cap the queue, drive presentation. */
 function onDecodedFrame(frame: VideoFrame) {
+  producedFrame = true; // the decoder is alive — clears the first-frame watchdog
   frameCount++;
   queue.push({ frame, pts: frame.timestamp / 1000 });
   while (queue.length > MAX_QUEUE_FRAMES) {
@@ -737,6 +753,22 @@ function presentTick() {
   if (!playing) {
     presentPending = false;
     return;
+  }
+
+  // First-frame watchdog: the decoder was configured and fed chunks but has not
+  // emitted a single frame. On iOS Safari this happens even though configure()
+  // succeeded — report it so the UI can say "video didn't start" instead of
+  // showing "Loading" forever with only sound.
+  if (
+    ready &&
+    !producedFrame &&
+    !videoStalledReported &&
+    decodeStartedAt &&
+    nowEpochMs() - decodeStartedAt > FIRST_FRAME_TIMEOUT_MS
+  ) {
+    videoStalledReported = true;
+    log('decoder produced no frame within timeout — likely unsupported on this browser', 'error');
+    post({ t: 'videoStalled' });
   }
 
   if (buffering) {

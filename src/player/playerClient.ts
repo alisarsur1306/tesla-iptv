@@ -21,6 +21,8 @@ export interface PlayerCallbacks {
   onUnsupportedVideo?: () => void;
   /** Playback paused to rebuffer (active=true) or resumed (active=false). */
   onBuffering?: (active: boolean) => void;
+  /** Decoder configured but never emitted a frame (e.g. iOS Safari WebCodecs). */
+  onVideoStalled?: () => void;
   /**
    * The worker restarted the media timeline (stream start or PTS discontinuity).
    * The audio engine MUST drop everything it has scheduled, otherwise the old
@@ -104,6 +106,9 @@ export class CanvasPlayer {
         break;
       case 'buffering':
         this.cb.onBuffering?.(!!m.active);
+        break;
+      case 'videoStalled':
+        this.cb.onVideoStalled?.();
         break;
       // 'canvasResize' is informational; the OffscreenCanvas already resized.
     }
