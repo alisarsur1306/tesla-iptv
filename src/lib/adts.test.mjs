@@ -57,6 +57,33 @@ test('parseAdtsFrames ignores a trailing partial frame', () => {
   assert.equal(parseAdtsFrames(stream).length, 1);
 });
 
+test('parseAdtsFramesWithRemainder reports the unconsumed tail so callers lose no frame', async () => {
+  const { parseAdtsFramesWithRemainder } = await import('./adts.ts');
+  const a = buildAdtsFrame([0xaa, 0xbb]);
+  const b = buildAdtsFrame([0xcc, 0xdd]);
+  const whole = new Uint8Array(a.length + b.length);
+  whole.set(a);
+  whole.set(b, a.length);
+
+  // Split mid-way through the SECOND frame, as a PES boundary would.
+  const cut = a.length + 3;
+  const first = whole.subarray(0, cut);
+  const rest = whole.subarray(cut);
+
+  const r1 = parseAdtsFramesWithRemainder(first);
+  assert.equal(r1.frames.length, 1, 'only the complete frame is emitted');
+  const tail = first.slice(r1.consumed);
+  assert.ok(tail.length > 0, 'partial frame is left unconsumed');
+
+  // Carrying the tail forward must recover the straddling frame.
+  const joined = new Uint8Array(tail.length + rest.length);
+  joined.set(tail);
+  joined.set(rest, tail.length);
+  const r2 = parseAdtsFramesWithRemainder(joined);
+  assert.equal(r2.frames.length, 1, 'straddling frame recovered, not dropped');
+  assert.deepEqual([...r2.frames[0].data], [0xcc, 0xdd]);
+});
+
 test('audioSpecificConfig encodes AOT, rate index and channels', () => {
   // profile 1 (LC) => AOT 2; sfIndex 4; channels 2
   const asc = audioSpecificConfig(1, 4, 2);

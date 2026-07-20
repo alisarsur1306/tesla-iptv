@@ -13,7 +13,7 @@
 
 import {
   sniffAudioCodec,
-  parseAdtsFrames,
+  parseAdtsFramesWithRemainder,
   audioSpecificConfig,
   AAC_SAMPLES_PER_FRAME,
   type AudioCodec,
@@ -45,6 +45,10 @@ export class AudioEngine {
   private codec: AudioCodec | null = null;
   private configured = false;
   private unsupportedReported = false;
+  /** Tail of the previous PES holding a partial ADTS frame. */
+  private residual: Uint8Array | null = null;
+  /** Sources scheduled but not yet finished — needed to silence them on reset. */
+  private scheduled = new Set<AudioBufferSourceNode>();
 
   /** AudioContext time that `mediaAnchorMs` corresponds to. */
   private ctxAnchor = 0;
@@ -94,6 +98,17 @@ export class AudioEngine {
     this.ctxAnchor = 0;
     this.mediaAnchorMs = 0;
     this.nextTime = 0;
+    this.residual = null;
+    // Already-scheduled buffers keep playing otherwise — the old channel's audio
+    // would overlap the new one after a switch or a discontinuity.
+    for (const src of this.scheduled) {
+      try {
+        src.stop();
+      } catch {
+        /* already finished */
+      }
+    }
+    this.scheduled.clear();
   }
 
   destroy(): void {
@@ -125,7 +140,18 @@ export class AudioEngine {
     }
     if (this.codec !== 'aac') return;
 
-    const frames = parseAdtsFrames(bytes);
+    // An ADTS frame can straddle a PES boundary. Without carrying the remainder
+    // forward, one 1024-sample frame is destroyed at every boundary — an audible
+    // periodic click for the whole session.
+    let input = bytes;
+    if (this.residual && this.residual.length) {
+      input = new Uint8Array(this.residual.length + bytes.length);
+      input.set(this.residual);
+      input.set(bytes, this.residual.length);
+    }
+    const { frames, consumed } = parseAdtsFramesWithRemainder(input);
+    this.residual =
+      consumed < input.length ? input.slice(consumed, Math.min(input.length, consumed + 4096)) : null;
     if (!frames.length) return;
 
     const ctx = this.ensureContext();
@@ -146,7 +172,19 @@ export class AudioEngine {
         });
         this.configured = true;
       } catch (e) {
-        this.cb.onError?.('audio configure failed: ' + (e as Error).message);
+        // Don't leak a decoder per PES, and don't retry forever on a stream we
+        // simply cannot configure — report once and stay quiet.
+        try {
+          this.decoder?.close();
+        } catch {
+          /* ignore */
+        }
+        this.decoder = null;
+        if (!this.unsupportedReported) {
+          this.unsupportedReported = true;
+          this.cb.onError?.('audio configure failed: ' + (e as Error).message);
+        }
+        this.codec = 'unknown';
         return;
       }
     }
@@ -193,9 +231,11 @@ export class AudioEngine {
 
       let when = this.ctxAnchor + (mediaMs - this.mediaAnchorMs) / 1000;
 
-      // Large drift (stream discontinuity / long stall) → re-anchor rather than
-      // scheduling far in the past or piling up a huge future queue.
-      if (Math.abs(when - ctx.currentTime) > RESYNC_THRESHOLD_SEC && when < ctx.currentTime) {
+      // Re-anchor on large drift in EITHER direction. A forward PTS jump used to
+      // fall through this guard and schedule audio minutes into the future
+      // (silence forever); a backward jump used to sit in the dead band between
+      // "too late to play" and "far enough to resync" and drop every buffer.
+      if (Math.abs(when - ctx.currentTime) > RESYNC_THRESHOLD_SEC) {
         this.anchored = false;
         data.close();
         return;
@@ -209,7 +249,9 @@ export class AudioEngine {
       const src = ctx.createBufferSource();
       src.buffer = buf;
       src.connect(ctx.destination);
+      src.onended = () => this.scheduled.delete(src);
       src.start(when);
+      this.scheduled.add(src);
       this.nextTime = Math.max(this.nextTime, when + buf.duration);
     } catch (e) {
       this.cb.onError?.('audio render failed: ' + (e as Error).message);

@@ -23,15 +23,24 @@ export default function PlayerOverlay({ creds, channel, onBack }: PlayerOverlayP
   const [status, setStatus] = useState('Loading…');
   const [needsAudioTap, setNeedsAudioTap] = useState(false);
   const [audioUnsupported, setAudioUnsupported] = useState<string | null>(null);
+  const [videoUnsupported, setVideoUnsupported] = useState(false);
 
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
 
+    // Without WebCodecs there is no fallback path any more (hls.js is gone), so
+    // say so plainly instead of showing a black canvas forever.
+    if (typeof VideoDecoder === 'undefined' || !('transferControlToOffscreen' in HTMLCanvasElement.prototype)) {
+      setFatalError('This browser is too old for the player (needs WebCodecs).');
+      return;
+    }
+
     const source = proxied(liveStreamUrl(creds, channel.stream_id));
     setFatalError(null);
     setStatus('Loading…');
     setAudioUnsupported(null);
+    setVideoUnsupported(false);
 
     const canvas = document.createElement('canvas');
     canvas.className = 'h-full w-full object-contain';
@@ -48,10 +57,16 @@ export default function PlayerOverlay({ creds, channel, onBack }: PlayerOverlayP
 
     const player = new CanvasPlayer(canvas, {
       onReady: () => setStatus('Ready'),
-      onStats: () => setStatus('Ready'),
+      onStats: () => {
+        setStatus('Ready');
+        retries = 0; // frames are flowing again — a later blip starts a fresh budget
+      },
       onAudio: (data, pts) => audio.push(data, pts),
+      onUnsupportedVideo: () => setVideoUnsupported(true),
       onError: (msg) => {
         if (destroyed) return;
+        // `retries` counts CONSECUTIVE failures (reset by onStats above), so a
+        // long session isn't killed by three unrelated blips hours apart.
         if (retries < MAX_NETWORK_RETRIES) {
           retries += 1;
           setStatus(`Stream error — retrying (${retries}/${MAX_NETWORK_RETRIES})…`);
@@ -107,8 +122,21 @@ export default function PlayerOverlay({ creds, channel, onBack }: PlayerOverlayP
         )}
       </div>
 
+      {/* Video codec we can't decode (HEVC) — better than a permanent black screen */}
+      {videoUnsupported && !fatalError && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-6 bg-black/90 p-8">
+          <TriangleAlert className="h-16 w-16 text-amber-500" />
+          <p className="max-w-xl text-center text-2xl text-zinc-200">
+            This channel isn’t H.264 (likely HEVC) and can’t be played in the car browser.
+          </p>
+          <Button onClick={onBack} className="h-16 min-w-64 bg-red-600 text-2xl font-bold hover:bg-red-500">
+            <ArrowLeft className="mr-3 h-7 w-7" /> Back to channels
+          </Button>
+        </div>
+      )}
+
       {/* Audio codec we can't decode yet (AC-3 / MPEG Layer II) */}
-      {audioUnsupported && !fatalError && (
+      {audioUnsupported && !fatalError && !videoUnsupported && (
         <div className="pointer-events-none absolute bottom-6 left-1/2 flex -translate-x-1/2 items-center gap-2 rounded-full bg-zinc-900/85 px-5 py-3 text-base text-zinc-300">
           <VolumeX className="h-5 w-5" /> Audio not supported on this channel ({audioUnsupported})
         </div>

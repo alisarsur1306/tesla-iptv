@@ -11,10 +11,19 @@ export type EsType = 'video' | 'audio';
 
 export interface PesEvent {
   type: EsType;
-  /** Presentation timestamp in milliseconds (from the 33-bit PTS / 90). 0 if absent. */
+  /**
+   * Presentation timestamp in milliseconds on a CONTINUOUS timeline: the raw
+   * 33-bit PTS is unwrapped (it rolls over every ~26.5 h) so this keeps
+   * increasing. 0 when the PES carried no PTS — check `hasPts`.
+   */
   pts: number;
   /** Whether this PES carried an explicit PTS (vs. defaulted to 0). */
   hasPts: boolean;
+  /**
+   * True when the timeline jumped in a way that is not a clock wrap (encoder
+   * restart / ad splice). Downstream must rebase rather than trust the delta.
+   */
+  discontinuity: boolean;
   /** Elementary-stream payload (the ES bytes after the PES header). */
   data: Uint8Array;
   /** PES stream_id, e.g. 0xE0 video, 0xC0 audio — lets the caller sniff codec. */
@@ -23,12 +32,22 @@ export interface PesEvent {
 
 const TS_PACKET = 188;
 const SYNC = 0x47;
+/** The PTS field is 33 bits: it wraps every 2^33 / 90000 s ≈ 26.5 hours. */
+const PTS_MODULO = 8589934592; // 2 ** 33
+const PTS_HALF = PTS_MODULO / 2;
+/** A jump larger than this (ms) is an encoder restart / splice, not a wrap. */
+const DISCONTINUITY_MS = 10_000;
 
 export class TsDemuxer {
   private buffer = new Uint8Array(0);
   private videoPID: number | null = null;
   private audioPID: number | null = null;
   private pending: Partial<Record<EsType, Uint8Array[]>> = {};
+  private audioIsPrivate = false;
+  /** Last raw 33-bit tick value seen, for unwrapping. */
+  private lastTicks: number | null = null;
+  /** Accumulated wrap offset in ticks. */
+  private rollover = 0;
   private readonly onPes: (e: PesEvent) => void;
 
   constructor(onPes: (e: PesEvent) => void) {
@@ -71,6 +90,9 @@ export class TsDemuxer {
     this.buffer = new Uint8Array(0);
     this.videoPID = null;
     this.audioPID = null;
+    this.audioIsPrivate = false;
+    this.lastTicks = null;
+    this.rollover = 0;
     this.pending = {};
   }
 
@@ -89,10 +111,19 @@ export class TsDemuxer {
     if (!payload.length) return;
 
     // Discover PIDs from the PES start code + stream_id.
+    // 0xE0-0xEF video, 0xC0-0xDF MPEG audio, 0xBD private_stream_1 — AC-3/E-AC-3
+    // and DTS ride on 0xBD, so without it those channels look like they have no
+    // audio at all instead of reporting an unsupported codec.
     if (pusi && payload[0] === 0 && payload[1] === 0 && payload[2] === 1) {
       const sid = payload[3];
       if (sid >= 0xe0 && sid <= 0xef && this.videoPID === null) this.videoPID = pid;
-      else if (sid >= 0xc0 && sid <= 0xdf && this.audioPID === null) this.audioPID = pid;
+      else if ((sid >= 0xc0 && sid <= 0xdf) || sid === 0xbd) {
+        // Prefer a real MPEG-audio stream over private_stream_1 if both exist.
+        if (this.audioPID === null || (sid !== 0xbd && this.audioIsPrivate)) {
+          this.audioPID = pid;
+          this.audioIsPrivate = sid === 0xbd;
+        }
+      }
     }
 
     if (pid === this.videoPID) this.assemble(payload, pusi, 'video');
@@ -117,6 +148,7 @@ export class TsDemuxer {
     const headerLen = pes[8];
     let pts = 0;
     let hasPts = false;
+    let discontinuity = false;
     if (ptsDtsFlags && pes.length >= 14) {
       // 33-bit PTS spread across bytes 9-13 with marker bits. The top 3 bits
       // (PTS[32:30]) would overflow a 32-bit `<<30`, so multiply instead:
@@ -127,7 +159,9 @@ export class TsDemuxer {
         ((pes[11] & 0xfe) << 14) +
         (pes[12] << 7) +
         (pes[13] >> 1);
-      pts = ticks / 90; // 90 kHz → ms
+      const unwrapped = this.unwrap(ticks);
+      pts = unwrapped.ms;
+      discontinuity = unwrapped.discontinuity;
       hasPts = true;
     }
     // PES_packet_length (bytes 4-5) counts the bytes after byte 6. Video PES
@@ -139,7 +173,31 @@ export class TsDemuxer {
     const end = pesPacketLength > 0 ? Math.min(pes.length, 6 + pesPacketLength) : pes.length;
     const data = pes.subarray(start, end);
     if (!data.length) return;
-    this.onPes({ type, pts, hasPts, data, streamId });
+    this.onPes({ type, pts, hasPts, discontinuity, data, streamId });
+  }
+
+  /**
+   * Turn a raw 33-bit PTS into a continuous millisecond timeline.
+   * A backward step of nearly a full period is the clock wrapping; anything
+   * else large is a real discontinuity (encoder restart / splice) and is
+   * reported so downstream can rebase instead of trusting the jump.
+   */
+  private unwrap(ticks: number): { ms: number; discontinuity: boolean } {
+    if (this.lastTicks === null) {
+      this.lastTicks = ticks;
+      return { ms: ticks / 90, discontinuity: false };
+    }
+    const delta = ticks - this.lastTicks;
+    let discontinuity = false;
+    if (delta < -PTS_HALF) {
+      this.rollover += PTS_MODULO; // normal wrap: ...max -> 0
+    } else if (delta > PTS_HALF) {
+      this.rollover -= PTS_MODULO; // wrap seen out of order
+    } else if (Math.abs(delta) / 90 > DISCONTINUITY_MS) {
+      discontinuity = true; // genuine timeline break
+    }
+    this.lastTicks = ticks;
+    return { ms: (ticks + this.rollover) / 90, discontinuity };
   }
 }
 

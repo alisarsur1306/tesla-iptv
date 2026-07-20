@@ -17,6 +17,8 @@ export interface PlayerCallbacks {
   onFirstPts?: (ptsMs: number) => void;
   /** Raw audio PES payloads (later phase decodes these). */
   onAudio?: (data: ArrayBuffer, ptsMs: number) => void;
+  /** The stream's video is not H.264 (e.g. HEVC) and cannot be decoded. */
+  onUnsupportedVideo?: () => void;
 }
 
 export class CanvasPlayer {
@@ -84,6 +86,9 @@ export class CanvasPlayer {
         break;
       case 'audio':
         if (m.data) this.cb.onAudio?.(m.data, m.pts || 0);
+        break;
+      case 'unsupportedVideo':
+        this.cb.onUnsupportedVideo?.();
         break;
       // 'canvasResize' is informational; the OffscreenCanvas already resized.
     }

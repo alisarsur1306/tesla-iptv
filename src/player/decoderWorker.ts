@@ -21,6 +21,13 @@ type InMsg =
   // (absolute epoch — a Worker's performance.now() origin differs from the page's).
   | { t: 'anchor'; mediaMs: number; epochMs: number };
 
+/** How many segments back from the live edge to join (buffer vs. latency). */
+const LIVE_EDGE_SEGMENTS = 2;
+/** Consecutive segment fetch failures before giving up on the stream. */
+const MAX_SEGMENT_FAILURES = 3;
+/** Consecutive polls with no new segment before declaring the stream dead. */
+const MAX_EMPTY_POLLS = 10;
+
 let canvas: OffscreenCanvas | null = null;
 let ctx: OffscreenCanvasRenderingContext2D | null = null;
 
@@ -35,6 +42,11 @@ let pps: Uint8Array | null = null;
 let ready = false;
 let gotIDR = false;
 let firstPTS: number | null = null;
+/** Last relative timestamp (ms) — carries PES that have no PTS of their own. */
+let lastRel = 0;
+/** Video PES seen without ever finding an H.264 NAL — used to flag HEVC etc. */
+let videoPesSeen = 0;
+let unsupportedVideoReported = false;
 
 // presentation
 interface Q { frame: VideoFrame; pts: number }
@@ -90,6 +102,9 @@ function reset() {
   ready = false;
   gotIDR = false;
   firstPTS = null;
+  lastRel = 0;
+  videoPesSeen = 0;
+  unsupportedVideoReported = false;
   for (const q of queue) {
     try {
       q.frame.close();
@@ -159,25 +174,59 @@ async function runSegments(m3u8Url: string) {
   }
 
   post({ t: 'ready' });
-  let lastSeq = -1;
   let media: MediaPlaylist =
     parsed.kind === 'media' ? parsed : parseMediaPlaylist(await fetchText(mediaUrl));
+
+  // Join near the LIVE EDGE. Starting at the oldest segment in the window would
+  // put playback a whole window (often 30s+) behind live for the whole session.
+  let lastSeq = -1;
+  if (media.live && media.segments.length > LIVE_EDGE_SEGMENTS) {
+    lastSeq = media.segments[media.segments.length - 1 - LIVE_EDGE_SEGMENTS].seq;
+  }
+
+  let segmentFailures = 0;
+  let emptyPolls = 0;
 
   while (playing) {
     const fresh = diffNewSegments(media, lastSeq);
     for (const seg of fresh) {
       if (!playing) return;
-      await streamSegment(seg.url);
+      try {
+        await streamSegment(seg.url);
+        segmentFailures = 0;
+      } catch (e) {
+        if ((e as Error)?.name === 'AbortError') return;
+        // One bad segment must not kill a live stream — skip it and continue.
+        segmentFailures++;
+        log(`segment failed (${segmentFailures}/${MAX_SEGMENT_FAILURES}): ${(e as Error).message}`, 'warn');
+        if (segmentFailures >= MAX_SEGMENT_FAILURES) throw e;
+      }
       lastSeq = seg.seq;
     }
     if (!media.live) break; // VOD ended
-    // Poll again for new segments after ~half a target duration.
+
     const waitMs = Math.max(500, (media.targetDuration || 4) * 500);
     await sleep(waitMs);
     if (!playing) return;
+
     try {
-      media = parseMediaPlaylist(await fetchText(mediaUrl));
-    } catch {
+      const next = parseMediaPlaylist(await fetchText(mediaUrl));
+      // An encoder restart rewinds media-sequence; without this the stream
+      // stalls forever because every new segment looks "already seen".
+      if (next.segments.length && next.mediaSequence < media.mediaSequence) {
+        log('playlist media-sequence reset — rejoining live edge', 'warn');
+        lastSeq = next.segments.length > LIVE_EDGE_SEGMENTS
+          ? next.segments[next.segments.length - 1 - LIVE_EDGE_SEGMENTS].seq
+          : -1;
+      }
+      // Detect a playlist that has stopped advancing entirely.
+      emptyPolls = diffNewSegments(next, lastSeq).length ? 0 : emptyPolls + 1;
+      if (emptyPolls >= MAX_EMPTY_POLLS) {
+        throw new Error('playlist stopped updating');
+      }
+      media = next;
+    } catch (e) {
+      if ((e as Error)?.message === 'playlist stopped updating') throw e;
       /* transient playlist fetch error — retry next loop */
     }
   }
@@ -213,12 +262,32 @@ async function streamSegment(url: string) {
 }
 
 // --- demux callback: route PES to video decode / audio forward ---
-function onPes(e: { type: 'video' | 'audio'; pts: number; hasPts: boolean; data: Uint8Array }) {
-  if (firstPTS === null && e.hasPts) {
-    firstPTS = e.pts;
-    post({ t: 'firstPTS', pts: firstPTS });
+function onPes(e: {
+  type: 'video' | 'audio';
+  pts: number;
+  hasPts: boolean;
+  discontinuity: boolean;
+  data: Uint8Array;
+}) {
+  if (e.hasPts) {
+    if (firstPTS === null) {
+      firstPTS = e.pts;
+      post({ t: 'firstPTS', pts: firstPTS });
+    } else if (e.discontinuity) {
+      // Encoder restart / ad splice: rebase so the relative timeline continues
+      // from where we are instead of jumping (or going negative, which used to
+      // clamp to 0 and freeze video permanently). Audio must re-anchor too.
+      firstPTS = e.pts - lastRel;
+      post({ t: 'audioReset' });
+      clockCalibrated = false;
+      audioAnchorMediaMs = null;
+      log('PTS discontinuity — rebased timeline', 'warn');
+    }
+    lastRel = e.pts - firstPTS;
   }
-  const rel = firstPTS === null ? 0 : e.pts - firstPTS;
+  // A PES without a PTS continues at the last known time rather than pretending
+  // to be at -firstPTS (which is what `pts - firstPTS` would give with pts = 0).
+  const rel = lastRel;
   if (e.type === 'video') handleVideo(e.data, rel);
   else {
     const copy = e.data.slice();
@@ -229,6 +298,24 @@ function onPes(e: { type: 'video' | 'audio'; pts: number; hasPts: boolean; data:
 function handleVideo(data: Uint8Array, pts: number) {
   const nals = splitNALs(data);
   if (!nals.length) return;
+
+  // Codec check: H.264 access units always carry SPS(7)/PPS(8)/IDR(5)/slice(1)
+  // in the low 5 bits. HEVC uses a 6-bit type field (VPS/SPS/PPS = 32/33/34),
+  // so those bytes never look like H.264 slices. Without this the pipeline
+  // silently no-ops and the user stares at a permanently black canvas.
+  if (!gotIDR && !unsupportedVideoReported) {
+    videoPesSeen++;
+    const looksH264 = nals.some((n) => {
+      const t = nalType(n);
+      return t === NAL_SPS || t === NAL_PPS || t === NAL_IDR || t === NAL_NON_IDR;
+    });
+    if (!looksH264 && videoPesSeen > 60) {
+      unsupportedVideoReported = true;
+      post({ t: 'unsupportedVideo' });
+      log('no H.264 NAL units found — channel is probably HEVC', 'error');
+      return;
+    }
+  }
 
   for (const n of nals) {
     const t = nalType(n);
@@ -373,9 +460,12 @@ function presentTick() {
 }
 function nextDelay(): number {
   if (!queue.length) return 20;
-  if (queue.length >= 3) return 0; // live: drain toward the edge
   const diff = queue[0].pts - presentationClock();
-  return diff <= 0 ? 0 : Math.min(diff, 33);
+  // Never return 0: a setTimeout(0) loop spins the worker at max rate and
+  // starves the fetch/demux path (and burns battery in the car). 4ms still
+  // drains a backlog far faster than realtime when we are behind.
+  if (diff <= 0) return 4;
+  return Math.max(4, Math.min(diff, 33));
 }
 function tryPresentOne(): boolean {
   const now = presentationClock();

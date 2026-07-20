@@ -54,6 +54,18 @@ export function sniffAudioCodec(data: Uint8Array): AudioCodec {
  * carries it — live TS gives us complete frames per PES in practice).
  */
 export function parseAdtsFrames(data: Uint8Array): AdtsFrame[] {
+  return parseAdtsFramesWithRemainder(data).frames;
+}
+
+/**
+ * Like `parseAdtsFrames` but also reports how many bytes were consumed, so a
+ * caller streaming PES payloads can carry the unparsed tail into the next call
+ * instead of dropping a frame at every PES boundary.
+ */
+export function parseAdtsFramesWithRemainder(data: Uint8Array): {
+  frames: AdtsFrame[];
+  consumed: number;
+} {
   const frames: AdtsFrame[] = [];
   let i = 0;
   while (i + 7 <= data.length) {
@@ -69,7 +81,11 @@ export function parseAdtsFrames(data: Uint8Array): AdtsFrame[] {
     const frameLength =
       ((data[i + 3] & 0x03) << 11) | (data[i + 4] << 3) | ((data[i + 5] & 0xe0) >> 5);
 
-    if (frameLength < 7 || i + frameLength > data.length) break; // partial/invalid → stop
+    if (frameLength < 7) {
+      i++; // bogus length — treat as a false sync and keep scanning
+      continue;
+    }
+    if (i + frameLength > data.length) break; // partial frame → caller carries it forward
     const headerLen = protectionAbsent ? 7 : 9;
     if (frameLength > headerLen) {
       frames.push({
@@ -82,7 +98,7 @@ export function parseAdtsFrames(data: Uint8Array): AdtsFrame[] {
     }
     i += frameLength;
   }
-  return frames;
+  return { frames, consumed: i };
 }
 
 /**
