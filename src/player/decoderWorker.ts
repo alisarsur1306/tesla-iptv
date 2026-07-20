@@ -10,7 +10,6 @@
 // can share this clock.
 
 import { TsDemuxer } from '../lib/tsDemux';
-import { parsePlaylist, parseMediaPlaylist, diffNewSegments, type MediaPlaylist } from '../lib/hlsPlaylist';
 import { splitNALs, toAVCC, nalType, avccDescription, codecString, NAL_SPS, NAL_PPS, NAL_IDR, NAL_NON_IDR } from '../lib/h264';
 
 type InMsg =
@@ -21,20 +20,10 @@ type InMsg =
   // (absolute epoch — a Worker's performance.now() origin differs from the page's).
   | { t: 'anchor'; mediaMs: number; epochMs: number };
 
-/**
- * How many segments back from the live edge to join. This IS the buffer: the
- * intake pauses on backpressure with the rest of the segment still unread, so
- * cushion is held cheaply as encoded bytes. Too small (2) and the playlist
- * window drains, leaving the decoder starved between publishes — seen as the
- * picture freezing for seconds at a time.
- */
-const LIVE_EDGE_SEGMENTS = 4;
-/** Upper bound on the playlist poll interval, so new segments are picked up promptly. */
-const MAX_POLL_MS = 2000;
-/** Consecutive segment fetch failures before giving up on the stream. */
-const MAX_SEGMENT_FAILURES = 3;
-/** Consecutive polls with no new segment before declaring the stream dead. */
-const MAX_EMPTY_POLLS = 10;
+/** Reconnect attempts before giving up on a dropped continuous stream. */
+const MAX_RECONNECTS = 5;
+/** Pause before reconnecting a dropped stream. */
+const RECONNECT_DELAY_MS = 800;
 /** A head frame further ahead than this means the clock is wrong, not early. */
 const MAX_FUTURE_MS = 1000;
 /** Hard cap on buffered decoded frames (~2.5s at 25fps). Frames hold GPU memory,
@@ -148,7 +137,7 @@ function reset() {
   demux = new TsDemuxer(onPes);
 }
 
-async function play(m3u8Url: string) {
+async function play(streamUrl: string) {
   stop();
   reset();
   playing = true;
@@ -156,7 +145,7 @@ async function play(m3u8Url: string) {
   post({ t: 'audioReset' });
   schedulePresent();
   try {
-    await runSegments(m3u8Url);
+    await runStream(streamUrl);
   } catch (e) {
     if ((e as Error)?.name !== 'AbortError') post({ t: 'error', msg: (e as Error)?.message || 'stream error' });
   }
@@ -190,109 +179,78 @@ function stop() {
   queue = [];
 }
 
-// --- segment sourcing: poll the media playlist, stream each new segment ---
-async function runSegments(m3u8Url: string) {
-  // Resolve a master playlist to its first variant.
-  let mediaUrl = m3u8Url;
-  const first = await fetchText(m3u8Url);
-  const parsed = parsePlaylist(first);
-  if (parsed.kind === 'master') {
-    if (!parsed.variants.length) throw new Error('empty master playlist');
-    mediaUrl = parsed.variants[0].url;
-  }
-
-  post({ t: 'ready' });
-  let media: MediaPlaylist =
-    parsed.kind === 'media' ? parsed : parseMediaPlaylist(await fetchText(mediaUrl));
-
-  // Join near the LIVE EDGE. Starting at the oldest segment in the window would
-  // put playback a whole window (often 30s+) behind live for the whole session.
-  let lastSeq = -1;
-  if (media.live && media.segments.length > LIVE_EDGE_SEGMENTS) {
-    lastSeq = media.segments[media.segments.length - 1 - LIVE_EDGE_SEGMENTS].seq;
-  }
-
-  let segmentFailures = 0;
-  let emptyPolls = 0;
-
+/**
+ * Continuous MPEG-TS source: ONE long-lived response, read until it ends.
+ *
+ * This replaces HLS playlist polling. Fetching segment-by-segment delivered
+ * data in bursts separated by multi-second gaps, so the decoder starved and the
+ * picture froze/flickered. A single response streams steadily (and front-loads
+ * a backlog), which is also what a single-concurrent-connection account wants:
+ * one connection held open instead of a new request per segment.
+ *
+ * The connection can still drop (upstream restart, network blip), so a drop is
+ * treated as normal and reconnected. The demuxer resyncs on the next PES and a
+ * PTS discontinuity rebases the timeline, so a reconnect is not user-visible
+ * beyond a brief pause.
+ */
+async function runStream(url: string) {
+  let attempt = 0;
   while (playing) {
-    const fresh = diffNewSegments(media, lastSeq);
-    for (const seg of fresh) {
-      if (!playing) return;
-      try {
-        await streamSegment(seg.url);
-        segmentFailures = 0;
-      } catch (e) {
-        if ((e as Error)?.name === 'AbortError') return;
-        // One bad segment must not kill a live stream — skip it and continue.
-        segmentFailures++;
-        log(`segment failed (${segmentFailures}/${MAX_SEGMENT_FAILURES}): ${(e as Error).message}`, 'warn');
-        if (segmentFailures >= MAX_SEGMENT_FAILURES) throw e;
-      }
-      lastSeq = seg.seq;
-    }
-    if (!media.live) break; // VOD ended
-
-    const waitMs = Math.min(MAX_POLL_MS, Math.max(500, (media.targetDuration || 4) * 500));
-    await sleep(waitMs);
-    if (!playing) return;
-
     try {
-      const next = parseMediaPlaylist(await fetchText(mediaUrl));
-      // An encoder restart rewinds media-sequence; without this the stream
-      // stalls forever because every new segment looks "already seen".
-      if (next.segments.length && next.mediaSequence < media.mediaSequence) {
-        log('playlist media-sequence reset — rejoining live edge', 'warn');
-        lastSeq = next.segments.length > LIVE_EDGE_SEGMENTS
-          ? next.segments[next.segments.length - 1 - LIVE_EDGE_SEGMENTS].seq
-          : -1;
-      }
-      // Detect a playlist that has stopped advancing entirely.
-      emptyPolls = diffNewSegments(next, lastSeq).length ? 0 : emptyPolls + 1;
-      if (emptyPolls >= MAX_EMPTY_POLLS) {
-        throw new Error('playlist stopped updating');
-      }
-      media = next;
+      await streamOnce(url);
+      if (!playing) return;
+      // Ended cleanly but we still want to play → upstream closed the stream.
+      attempt++;
+      log(`stream ended — reconnecting (${attempt}/${MAX_RECONNECTS})`, 'warn');
     } catch (e) {
-      if ((e as Error)?.message === 'playlist stopped updating') throw e;
-      /* transient playlist fetch error — retry next loop */
+      if (!playing || (e as Error)?.name === 'AbortError') return;
+      attempt++;
+      log(`stream error: ${(e as Error).message} — reconnecting (${attempt}/${MAX_RECONNECTS})`, 'warn');
     }
+    if (attempt >= MAX_RECONNECTS) throw new Error('stream lost');
+    await sleep(RECONNECT_DELAY_MS);
   }
 }
 
-async function fetchText(url: string): Promise<string> {
+async function streamOnce(url: string) {
   const r = await fetch(url, { signal: abort!.signal });
   if (!r.ok) throw new Error('HTTP ' + r.status);
-  return r.text();
-}
+  if (!r.body) throw new Error('no response body');
+  post({ t: 'ready' });
 
-async function streamSegment(url: string) {
-  const r = await fetch(url, { signal: abort!.signal });
-  if (!r.ok) throw new Error('HTTP ' + r.status);
-  const reader = r.body!.getReader();
+  const reader = r.body.getReader();
   const CH = 48 * 1024;
-  while (playing) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    if (value.length > CH) {
-      for (let p = 0; p < value.length && playing; p += CH) {
-        demux!.push(value.subarray(p, Math.min(value.length, p + CH)));
-        await sleep(0);
+  try {
+    while (playing) {
+      const { value, done } = await reader.read();
+      if (done) return; // upstream closed → caller reconnects
+      if (value.length > CH) {
+        // Chunk + yield so a large read never blocks the presentation loop.
+        for (let p = 0; p < value.length && playing; p += CH) {
+          demux!.push(value.subarray(p, Math.min(value.length, p + CH)));
+          await sleep(0);
+        }
+      } else {
+        demux!.push(value);
       }
-    } else {
-      demux!.push(value);
+      // Read-side backpressure: never drop encoded frames; pace intake instead.
+      // Pausing the read IS the buffer — the rest of the response stays unread
+      // and cheap. Bounded only so a stalled presentation can't wedge intake.
+      let waited = 0;
+      while (
+        playing &&
+        (queue.length >= BACKPRESSURE_FRAMES || (dec && dec.decodeQueueSize > 12)) &&
+        waited < MAX_BACKPRESSURE_MS
+      ) {
+        await sleep(15);
+        waited += 15;
+      }
     }
-    // Read-side backpressure: never drop encoded frames; pace intake instead.
-    // Bounded, because if presentation stalls this loop would otherwise block
-    // forever and the stream would wedge with no way back.
-    let waited = 0;
-    while (
-      playing &&
-      (queue.length >= BACKPRESSURE_FRAMES || (dec && dec.decodeQueueSize > 12)) &&
-      waited < MAX_BACKPRESSURE_MS
-    ) {
-      await sleep(15);
-      waited += 15;
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      /* ignore */
     }
   }
 }
