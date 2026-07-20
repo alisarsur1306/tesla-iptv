@@ -37,6 +37,11 @@ export class CanvasPlayer {
     this.worker.postMessage({ t: 'play', url: m3u8Url });
   }
 
+  /** Tell the worker when `mediaMs` reaches the speakers, so video syncs to audio. */
+  setAudioAnchor(mediaMs: number, epochMs: number): void {
+    this.worker.postMessage({ t: 'anchor', mediaMs, epochMs });
+  }
+
   stop(): void {
     this.worker.postMessage({ t: 'stop' });
   }

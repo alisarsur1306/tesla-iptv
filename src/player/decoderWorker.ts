@@ -16,7 +16,10 @@ import { splitNALs, toAVCC, nalType, avccDescription, codecString, NAL_SPS, NAL_
 type InMsg =
   | { t: 'init'; canvas: OffscreenCanvas }
   | { t: 'play'; url: string }
-  | { t: 'stop' };
+  | { t: 'stop' }
+  // Audio is the master clock: `mediaMs` reaches the speakers at `epochMs`
+  // (absolute epoch — a Worker's performance.now() origin differs from the page's).
+  | { t: 'anchor'; mediaMs: number; epochMs: number };
 
 let canvas: OffscreenCanvas | null = null;
 let ctx: OffscreenCanvasRenderingContext2D | null = null;
@@ -40,6 +43,10 @@ let frameCount = 0;
 let clockCalibrated = false;
 let wallStart = 0;
 let ptsStart = 0;
+// Audio-master clock (set by the 'anchor' message). When present it wins over
+// the local wall clock, so video is presented against what the speakers play.
+let audioAnchorMediaMs: number | null = null;
+let audioAnchorEpochMs = 0;
 let presentPending = false;
 let presentTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -60,8 +67,16 @@ self.onmessage = (e: MessageEvent<InMsg>) => {
     void play(d.url);
   } else if (d.t === 'stop') {
     stop();
+  } else if (d.t === 'anchor') {
+    audioAnchorMediaMs = d.mediaMs;
+    audioAnchorEpochMs = d.epochMs;
   }
 };
+
+/** Absolute epoch ms — comparable with the main thread despite separate time origins. */
+function nowEpochMs(): number {
+  return performance.timeOrigin + performance.now();
+}
 
 function reset() {
   try {
@@ -85,6 +100,8 @@ function reset() {
   queue = [];
   frameCount = 0;
   clockCalibrated = false;
+  audioAnchorMediaMs = null;
+  audioAnchorEpochMs = 0;
   demux = new TsDemuxer(onPes);
 }
 
@@ -324,6 +341,10 @@ function initDecoder() {
 
 // --- presentation (wall clock anchored at first frame; setTimeout paced) ---
 function presentationClock(): number {
+  // Audio is the master clock when it is running.
+  if (audioAnchorMediaMs !== null) {
+    return nowEpochMs() - audioAnchorEpochMs + audioAnchorMediaMs;
+  }
   if (clockCalibrated) return performance.now() - wallStart + ptsStart;
   return queue.length ? queue[0].pts : 0;
 }

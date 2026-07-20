@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { liveStreamUrl, proxied, type XtreamCreds, type XtreamLiveStream } from '@/lib/xtream';
 import { CanvasPlayer } from '@/player/playerClient';
-import { ArrowLeft, TriangleAlert } from 'lucide-react';
+import { AudioEngine } from '@/player/audioEngine';
+import { ArrowLeft, TriangleAlert, Volume2, VolumeX } from 'lucide-react';
 
 const MAX_NETWORK_RETRIES = 3;
 
@@ -17,8 +18,11 @@ export default function PlayerOverlay({ creds, channel, onBack }: PlayerOverlayP
   // transferred OffscreenCanvas can't be reused, so we never reuse the element
   // (survives React StrictMode double-mount and channel changes).
   const containerRef = useRef<HTMLDivElement>(null);
+  const audioRef = useRef<AudioEngine | null>(null);
   const [fatalError, setFatalError] = useState<string | null>(null);
   const [status, setStatus] = useState('Loading…');
+  const [needsAudioTap, setNeedsAudioTap] = useState(false);
+  const [audioUnsupported, setAudioUnsupported] = useState<string | null>(null);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -27,6 +31,7 @@ export default function PlayerOverlay({ creds, channel, onBack }: PlayerOverlayP
     const source = proxied(liveStreamUrl(creds, channel.stream_id));
     setFatalError(null);
     setStatus('Loading…');
+    setAudioUnsupported(null);
 
     const canvas = document.createElement('canvas');
     canvas.className = 'h-full w-full object-contain';
@@ -35,14 +40,22 @@ export default function PlayerOverlay({ creds, channel, onBack }: PlayerOverlayP
     let retries = 0;
     let destroyed = false;
 
+    const audio = new AudioEngine({
+      onAnchor: (mediaMs, epochMs) => player.setAudioAnchor(mediaMs, epochMs),
+      onUnsupported: (codec) => setAudioUnsupported(codec),
+    });
+    audioRef.current = audio;
+
     const player = new CanvasPlayer(canvas, {
       onReady: () => setStatus('Ready'),
       onStats: () => setStatus('Ready'),
+      onAudio: (data, pts) => audio.push(data, pts),
       onError: (msg) => {
         if (destroyed) return;
         if (retries < MAX_NETWORK_RETRIES) {
           retries += 1;
           setStatus(`Stream error — retrying (${retries}/${MAX_NETWORK_RETRIES})…`);
+          audio.reset();
           player.play(source);
         } else {
           setFatalError(`Playback failed: ${msg}`);
@@ -50,14 +63,27 @@ export default function PlayerOverlay({ creds, channel, onBack }: PlayerOverlayP
       },
     });
 
+    // Sound needs a user gesture (autoplay policy); video does not, so it starts
+    // immediately and we only prompt for audio.
+    void audio.unlock().then((ok) => {
+      if (!destroyed) setNeedsAudioTap(!ok);
+    });
+
     player.play(source);
 
     return () => {
       destroyed = true;
       player.destroy();
+      audio.destroy();
+      audioRef.current = null;
       canvas.remove();
     };
   }, [creds, channel]);
+
+  async function enableSound() {
+    const ok = await audioRef.current?.unlock();
+    if (ok) setNeedsAudioTap(false);
+  }
 
   return (
     <div className="fixed inset-0 z-50 bg-black">
@@ -80,6 +106,23 @@ export default function PlayerOverlay({ creds, channel, onBack }: PlayerOverlayP
           </span>
         )}
       </div>
+
+      {/* Audio codec we can't decode yet (AC-3 / MPEG Layer II) */}
+      {audioUnsupported && !fatalError && (
+        <div className="pointer-events-none absolute bottom-6 left-1/2 flex -translate-x-1/2 items-center gap-2 rounded-full bg-zinc-900/85 px-5 py-3 text-base text-zinc-300">
+          <VolumeX className="h-5 w-5" /> Audio not supported on this channel ({audioUnsupported})
+        </div>
+      )}
+
+      {/* Tap to enable sound (browser autoplay policy) */}
+      {needsAudioTap && !fatalError && !audioUnsupported && (
+        <button
+          onClick={enableSound}
+          className="absolute bottom-6 left-1/2 flex -translate-x-1/2 items-center gap-3 rounded-full bg-red-600/90 px-7 py-4 text-xl font-semibold text-white shadow-2xl"
+        >
+          <Volume2 className="h-7 w-7" /> Tap for sound
+        </button>
+      )}
 
       {/* Fatal error */}
       {fatalError && (
