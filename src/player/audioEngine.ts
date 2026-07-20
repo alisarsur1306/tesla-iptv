@@ -20,12 +20,21 @@ import {
 } from '../lib/adts';
 import { MpegAudioDecoder } from './wasmAudio';
 
-/** How far ahead of `currentTime` the first buffer is scheduled, to absorb jitter. */
-const START_LEAD_SEC = 0.2;
+/**
+ * How far ahead of `currentTime` the first buffer is scheduled. This doubles as
+ * the player's PRE-BUFFER: audio is the master clock, so delaying the anchor
+ * delays video presentation by the same amount, and the frame queue fills during
+ * the lead — while A/V stay aligned because both hang off the same media
+ * timeline. With a short lead the queue sat at ~4 frames and any delivery jitter
+ * froze the picture (this panel delivers only slightly faster than realtime).
+ */
+const START_LEAD_SEC = 1.5;
 /** Drop audio scheduled more than this far in the past. */
 const LATE_TOLERANCE_SEC = 0.25;
 /** Re-anchor if the scheduling clock drifts beyond this. */
 const RESYNC_THRESHOLD_SEC = 1.0;
+/** How far past the start lead audio may legitimately be scheduled ahead. */
+const MAX_LOOKAHEAD_SEC = 4.0;
 
 export interface AudioEngineCallbacks {
   /** Fired once when the media timeline is established, so video can sync to it. */
@@ -111,8 +120,16 @@ export class AudioEngine {
       /* ignore */
     }
     this.mpeg = null;
-    // Already-scheduled buffers keep playing otherwise — the old channel's audio
-    // would overlap the new one after a switch or a discontinuity.
+    this.stopScheduled();
+  }
+
+  /**
+   * Silence everything already queued on the AudioContext. Scheduled buffers
+   * play regardless of decoder state, so any timeline change (channel switch,
+   * PTS discontinuity, re-anchor) must stop them or the old audio keeps
+   * playing under the new one.
+   */
+  private stopScheduled(): void {
     for (const src of this.scheduled) {
       try {
         src.stop();
@@ -298,7 +315,15 @@ export class AudioEngine {
 
     let when = this.ctxAnchor + (mediaMs - this.mediaAnchorMs) / 1000;
 
-    if (Math.abs(when - ctx.currentTime) > RESYNC_THRESHOLD_SEC) {
+    // Scheduling AHEAD is normal and desirable (that is the buffer), so the
+    // future side must tolerate the start lead plus a healthy queue; only the
+    // past side is tight. A symmetric check here would re-anchor forever.
+    const ahead = when - ctx.currentTime;
+    if (ahead > START_LEAD_SEC + MAX_LOOKAHEAD_SEC || -ahead > RESYNC_THRESHOLD_SEC) {
+      // Everything already queued belongs to the OLD timeline. Leaving it running
+      // means it plays underneath the re-anchored stream — audible as two
+      // overlapping sounds until the backlog drains.
+      this.stopScheduled();
       this.anchored = false; // re-anchor next buffer
       return;
     }

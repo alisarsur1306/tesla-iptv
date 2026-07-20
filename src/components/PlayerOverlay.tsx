@@ -62,6 +62,7 @@ export default function PlayerOverlay({ creds, channel, onBack }: PlayerOverlayP
         retries = 0; // frames are flowing again — a later blip starts a fresh budget
       },
       onAudio: (data, pts) => audio.push(data, pts),
+      onAudioReset: () => audio.reset(),
       onUnsupportedVideo: () => setVideoUnsupported(true),
       onError: (msg) => {
         if (destroyed) return;
