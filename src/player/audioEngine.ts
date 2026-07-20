@@ -50,6 +50,9 @@ function nowEpochMs(): number {
 
 export class AudioEngine {
   private ctx: AudioContext | null = null;
+  private gain: GainNode | null = null;
+  /** Output volume 0..1, kept across channel changes. */
+  private volume = 1;
   private decoder: AudioDecoder | null = null;
   private cb: AudioEngineCallbacks;
   private codec: AudioCodec | null = null;
@@ -97,6 +100,34 @@ export class AudioEngine {
     return this.ctx;
   }
 
+  /** Single output stage every buffer routes through, so volume is one knob. */
+  private ensureGain(): GainNode {
+    const ctx = this.ensureContext();
+    if (!this.gain) {
+      this.gain = ctx.createGain();
+      this.gain.gain.value = this.volume;
+      this.gain.connect(ctx.destination);
+    }
+    return this.gain;
+  }
+
+  /** Current output volume, 0..1. */
+  getVolume(): number {
+    return this.volume;
+  }
+
+  /**
+   * Set output volume (0..1). Ramped rather than stepped: assigning gain.value
+   * mid-playback produces an audible click.
+   */
+  setVolume(v: number): number {
+    this.volume = Math.max(0, Math.min(1, v));
+    if (this.gain && this.ctx) {
+      this.gain.gain.setTargetAtTime(this.volume, this.ctx.currentTime, 0.015);
+    }
+    return this.volume;
+  }
+
   /** Drop all timing state (channel change / stream restart). */
   reset(): void {
     try {
@@ -142,6 +173,7 @@ export class AudioEngine {
 
   destroy(): void {
     this.reset();
+    this.gain = null;
     try {
       void this.ctx?.close();
     } catch {
@@ -339,7 +371,7 @@ export class AudioEngine {
 
     const src = ctx.createBufferSource();
     src.buffer = buf;
-    src.connect(ctx.destination);
+    src.connect(this.ensureGain());
     src.onended = () => this.scheduled.delete(src);
     src.start(when);
     this.scheduled.add(src);
