@@ -336,7 +336,13 @@ export class AudioEngine {
       this.ctxAnchor = whenSec;
       this.mediaAnchorMs = mediaMs;
       this.anchored = true;
-      const epochMs = nowEpochMs() + (whenSec - ctx.currentTime) * 1000;
+      // The anchor tells the worker when this media time reaches the SPEAKERS —
+      // which is later than ctx.currentTime by the output pipeline latency
+      // (buffer + device). Ignoring it made video lead audio; on the car over
+      // Bluetooth that gap is 100-200ms of visible lip-sync error. Add it so
+      // video is presented to match when the sound is actually heard.
+      const outputLatencySec = (ctx.baseLatency || 0) + (ctx.outputLatency || 0);
+      const epochMs = nowEpochMs() + (whenSec - ctx.currentTime + outputLatencySec) * 1000;
       this.cb.onAnchor?.(this.mediaAnchorMs, epochMs);
     };
 
