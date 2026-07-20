@@ -18,6 +18,7 @@
 
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
+import { readFileSync } from 'node:fs';
 // undici's fetch is used ONLY for requests routed through the Tailscale proxy
 // (plain HTTP to the Xtream host). Direct traffic uses Node's built-in fetch:
 // undici 8.7's standalone agent crashes the process with an uncaught TypeError
@@ -175,6 +176,121 @@ function rewritePlaylist(text, baseUrl, key) {
     }
   }
   return out.join('\n');
+}
+
+// --- Server-side Xtream credentials ---------------------------------------
+// The account (server/username/password) is resolved ONLY here, on the server,
+// and never sent to the browser. The client asks for "the channel list" or
+// "stream channel N" via opaque same-origin endpoints; this module attaches the
+// credentials. A reverse-engineered client therefore reveals no usable account.
+//
+// Source order: XTREAM_* env vars (production), else public/config.json (dev).
+
+let cachedCreds;
+function getXtreamCreds() {
+  if (cachedCreds !== undefined) return cachedCreds;
+  const { XTREAM_SERVER, XTREAM_USERNAME, XTREAM_PASSWORD } = process.env;
+  if (XTREAM_SERVER && XTREAM_USERNAME && XTREAM_PASSWORD) {
+    cachedCreds = {
+      server: XTREAM_SERVER.replace(/\/+$/, ''),
+      username: XTREAM_USERNAME,
+      password: XTREAM_PASSWORD,
+    };
+    return cachedCreds;
+  }
+  try {
+    const cfg = JSON.parse(readFileSync(new URL('../public/config.json', import.meta.url), 'utf8'));
+    if (cfg.server && cfg.username && cfg.password) {
+      cachedCreds = {
+        server: String(cfg.server).replace(/\/+$/, ''),
+        username: cfg.username,
+        password: cfg.password,
+      };
+      return cachedCreds;
+    }
+  } catch {
+    /* no config file — managed mode unavailable */
+  }
+  cachedCreds = null;
+  return cachedCreds;
+}
+
+/** True when the server holds credentials, so the client can skip the login screen. */
+export function isManaged() {
+  return getXtreamCreds() !== null;
+}
+
+function keyGate(req, res, url) {
+  const keyParam = url.searchParams.get('key') || '';
+  if (getRequiredKey() && !isKeyValid(keyParam)) {
+    sendError(res, 403, 'Invalid or missing access key');
+    return false;
+  }
+  return true;
+}
+
+/** Fetch a player_api.php action server-side and return the parsed JSON. */
+async function xtreamApi(creds, action) {
+  const base = `${creds.server}/player_api.php?username=${encodeURIComponent(creds.username)}&password=${encodeURIComponent(creds.password)}`;
+  const url = new URL(action ? `${base}&action=${action}` : base);
+  const resp = await upstreamFetch(url, {
+    redirect: 'follow',
+    headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' },
+    signal: AbortSignal.timeout(TIMEOUT_MS),
+  });
+  if (!resp.ok) throw new Error(`upstream ${resp.status}`);
+  return resp.json();
+}
+
+/**
+ * GET /api/xt?action=get_live_streams|get_live_categories  (login = no action)
+ * Server-side player_api call; the response carries only channel metadata
+ * (id/name/icon/category) — never the account.
+ */
+export async function handleXtreamApi(req, res) {
+  res.on('error', () => {});
+  setCors(res);
+  const url = new URL(req.url || '/', 'http://localhost');
+  if (!keyGate(req, res, url)) return;
+  const creds = getXtreamCreds();
+  if (!creds) return sendError(res, 503, 'Server has no IPTV account configured');
+
+  const action = url.searchParams.get('action') || '';
+  const allowed = new Set(['', 'get_live_streams', 'get_live_categories']);
+  if (!allowed.has(action)) return sendError(res, 400, 'Unsupported action');
+
+  try {
+    const data = await xtreamApi(creds, action);
+    const body = Buffer.from(JSON.stringify(data), 'utf8');
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Length': body.length });
+    res.end(body);
+  } catch (err) {
+    sendError(res, 502, `Xtream API failed: ${String(err && err.message ? err.message : err)}`);
+  }
+}
+
+/**
+ * GET /api/stream?id=N  — stream live channel N. The credentialed upstream URL
+ * is built here and handed to the existing proxy pipeline, so the browser only
+ * ever sees the opaque channel id.
+ */
+export async function handleStream(req, res) {
+  const url = new URL(req.url || '/', 'http://localhost');
+  setCors(res);
+  if (!keyGate(req, res, url)) return;
+  const creds = getXtreamCreds();
+  if (!creds) return sendError(res, 503, 'Server has no IPTV account configured');
+
+  const id = url.searchParams.get('id') || '';
+  if (!/^\d+$/.test(id)) return sendError(res, 400, 'Invalid channel id');
+
+  const upstreamUrl = `${creds.server}/live/${encodeURIComponent(creds.username)}/${encodeURIComponent(creds.password)}/${id}.ts`;
+  // Delegate to the existing proxy by rewriting the request to its internal form.
+  // The credentials live only in this rewritten URL, on the server — the client's
+  // request was /api/stream?id=N and its response is the stream bytes.
+  const key = url.searchParams.get('key') || '';
+  req.url = `/api/proxy?u=${encodeURIComponent(upstreamUrl)}${key ? `&key=${encodeURIComponent(key)}` : ''}`;
+  return handleProxy(req, res);
 }
 
 export async function handleProxy(req, res) {

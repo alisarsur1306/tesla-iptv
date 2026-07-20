@@ -10,7 +10,7 @@ import http from 'node:http';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { handleProxy, getRequiredKey, isKeyValid } from './proxy/hlsProxy.mjs';
+import { handleProxy, handleXtreamApi, handleStream, isManaged, getRequiredKey, isKeyValid } from './proxy/hlsProxy.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DIST_DIR = path.join(__dirname, 'dist');
@@ -130,26 +130,17 @@ function sendJson(res, status, obj) {
   res.end(body);
 }
 
-// /config.json: when the XTREAM_* env vars are set (public deployment), serve
-// credentials from the environment so no secrets live in the repo. Requires a
-// valid key when ACCESS_KEY is set. Otherwise falls through to the static file
-// (local dev uses the untracked public/config.json).
+// /config.json: reports ONLY whether the server holds an IPTV account
+// ("managed" mode) — never the credentials themselves. The client uses this to
+// skip the login screen; the account stays server-side. Key-gated when set.
 function handleConfig(req, res, url) {
   const keyParam = url.searchParams.get('key') || '';
   if (getRequiredKey() && !isKeyValid(keyParam)) {
     sendJson(res, 403, { error: 'Invalid or missing access key', status: 403 });
     return true;
   }
-  const { XTREAM_SERVER, XTREAM_USERNAME, XTREAM_PASSWORD } = process.env;
-  if (XTREAM_SERVER && XTREAM_USERNAME && XTREAM_PASSWORD) {
-    sendJson(res, 200, {
-      server: XTREAM_SERVER,
-      username: XTREAM_USERNAME,
-      password: XTREAM_PASSWORD,
-    });
-    return true;
-  }
-  return false; // fall through to static
+  sendJson(res, 200, { managed: isManaged() });
+  return true;
 }
 
 const server = http.createServer((req, res) => {
@@ -159,6 +150,15 @@ const server = http.createServer((req, res) => {
   if (url.pathname === '/api/proxy') {
     res.on('close', () => console.log(`proxy done status=${res.statusCode} ${memLine()}`));
     void handleProxy(req, res);
+    return;
+  }
+  if (url.pathname === '/api/stream') {
+    res.on('close', () => console.log(`stream done status=${res.statusCode} ${memLine()}`));
+    void handleStream(req, res);
+    return;
+  }
+  if (url.pathname === '/api/xt') {
+    void handleXtreamApi(req, res);
     return;
   }
   if (url.pathname === '/config.json' && handleConfig(req, res, url)) {
