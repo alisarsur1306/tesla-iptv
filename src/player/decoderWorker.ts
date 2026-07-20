@@ -10,7 +10,7 @@
 // can share this clock.
 
 import { TsDemuxer } from '../lib/tsDemux';
-import { splitNALs, toAVCC, nalType, avccDescription, codecString, NAL_SPS, NAL_PPS, NAL_IDR, NAL_NON_IDR } from '../lib/h264';
+import { splitNALs, toAVCC, nalType, avccDescription, codecString, isValidSps, NAL_SPS, NAL_PPS, NAL_IDR, NAL_NON_IDR } from '../lib/h264';
 
 type InMsg =
   | { t: 'init'; canvas: OffscreenCanvas }
@@ -20,6 +20,8 @@ type InMsg =
   // (absolute epoch — a Worker's performance.now() origin differs from the page's).
   | { t: 'anchor'; mediaMs: number; epochMs: number };
 
+/** Video PES to inspect before declaring the codec unsupported. */
+const UNSUPPORTED_PES_THRESHOLD = 120;
 /** Reconnect attempts before giving up on a dropped continuous stream. */
 const MAX_RECONNECTS = 5;
 /** Pause before reconnecting a dropped stream. */
@@ -293,20 +295,17 @@ function handleVideo(data: Uint8Array, pts: number) {
   const nals = splitNALs(data);
   if (!nals.length) return;
 
-  // Codec check: H.264 access units always carry SPS(7)/PPS(8)/IDR(5)/slice(1)
-  // in the low 5 bits. HEVC uses a 6-bit type field (VPS/SPS/PPS = 32/33/34),
-  // so those bytes never look like H.264 slices. Without this the pipeline
-  // silently no-ops and the user stares at a permanently black canvas.
+  // Codec check. Testing "does any NAL have type 1/5/7/8" is NOT enough: when a
+  // non-H.264 stream (HEVC, or scrambled payload) is parsed with H.264 rules the
+  // types come out uniformly spread over 0-31, so those values appear by chance
+  // and the stream looks decodable while producing nothing but a black canvas.
+  // A *valid SPS* is the reliable signal, so require one.
   if (!gotIDR && !unsupportedVideoReported) {
     videoPesSeen++;
-    const looksH264 = nals.some((n) => {
-      const t = nalType(n);
-      return t === NAL_SPS || t === NAL_PPS || t === NAL_IDR || t === NAL_NON_IDR;
-    });
-    if (!looksH264 && videoPesSeen > 60) {
+    if (videoPesSeen > UNSUPPORTED_PES_THRESHOLD) {
       unsupportedVideoReported = true;
       post({ t: 'unsupportedVideo' });
-      log('no H.264 NAL units found — channel is probably HEVC', 'error');
+      log('no valid H.264 SPS found — channel is HEVC or scrambled', 'error');
       return;
     }
   }
@@ -314,6 +313,10 @@ function handleVideo(data: Uint8Array, pts: number) {
   for (const n of nals) {
     const t = nalType(n);
     if (t === NAL_SPS) {
+      // Ignore "type 7" NALs that are not real SPS — otherwise we configure the
+      // decoder with nonsense (observed: avc1.2b7caf, profile 43, 1030 bytes)
+      // and it decodes nothing.
+      if (!isValidSps(n)) continue;
       if (sps && ready) {
         const changed = sps.length !== n.length || !sps.every((v, i) => v === n[i]);
         if (changed) {
