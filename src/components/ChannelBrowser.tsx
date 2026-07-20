@@ -105,8 +105,8 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
 
   if (loading) {
     return (
-      <div className="flex min-h-screen flex-col items-center justify-center gap-6 bg-zinc-950 text-zinc-100">
-        <Loader2 className="h-16 w-16 animate-spin text-red-500" />
+      <div className="flex h-dvh flex-col items-center justify-center gap-6 bg-zinc-950 text-zinc-100">
+        <Loader2 className="size-16 animate-spin text-red-500" />
         <p className="text-2xl text-zinc-400">Loading channels…</p>
       </div>
     );
@@ -114,30 +114,27 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
 
   if (error) {
     return (
-      <div className="flex min-h-screen flex-col items-center justify-center gap-6 bg-zinc-950 p-8 text-zinc-100">
-        <p className="max-w-xl text-center text-2xl text-red-400">{error}</p>
-        <Button onClick={onLogout} className="h-14 min-w-56 bg-zinc-800 text-xl hover:bg-zinc-700">
-          <LogOut className="mr-2 h-6 w-6" /> Back to login
+      <div className="flex h-dvh flex-col items-center justify-center gap-6 bg-zinc-950 p-8 text-zinc-100">
+        <p className="max-w-xl text-pretty text-center text-2xl text-red-400">{error}</p>
+        <Button onClick={onLogout} className="h-16 min-w-56 bg-zinc-800 text-xl hover:bg-zinc-700">
+          <LogOut className="mr-2 size-6" /> Back to login
         </Button>
       </div>
     );
   }
 
   return (
-    <div className="flex min-h-screen flex-col bg-zinc-950 text-zinc-100">
+    <div className="flex h-dvh flex-col bg-zinc-950 text-zinc-100">
       {/* Header */}
-      <header className="flex items-center gap-4 border-b border-zinc-800 px-6 py-4">
-        <Tv className="h-9 w-9 shrink-0 text-red-500" />
-        <h1 className="text-2xl font-bold">Tesla IPTV</h1>
-        <span className="rounded-full bg-zinc-800 px-4 py-1 text-base text-zinc-300">
-          {filtered.length.toLocaleString()} / {streams.length.toLocaleString()} channels
-        </span>
-        <span className="hidden rounded-full bg-amber-900/50 px-4 py-1 text-base text-amber-300 md:inline">
-          1 connection max
+      <header className="flex items-center gap-4 border-b border-zinc-800 px-6 py-5">
+        <Tv className="size-10 shrink-0 text-red-500" />
+        <h1 className="text-3xl font-bold tracking-tight">Tesla IPTV</h1>
+        <span className="hidden rounded-full bg-zinc-800 px-4 py-1.5 text-base tabular-nums text-zinc-300 sm:inline">
+          {filtered.length.toLocaleString()} / {streams.length.toLocaleString()}
         </span>
         <div className="ml-auto flex items-center gap-3">
           <div className="relative">
-            <Search className="absolute left-4 top-1/2 h-5 w-5 -translate-y-1/2 text-zinc-500" />
+            <Search className="absolute left-4 top-1/2 size-6 -translate-y-1/2 text-zinc-500" />
             <Input
               value={search}
               onChange={(e) => {
@@ -145,16 +142,16 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
                 setVisibleCount(PAGE_SIZE);
               }}
               placeholder="Search channels…"
-              className="h-14 w-64 border-zinc-700 bg-zinc-900 pl-12 text-lg md:w-96"
+              className="h-16 w-56 border-zinc-700 bg-zinc-900 pl-14 text-xl md:w-[28rem]"
             />
           </div>
           <Button
             onClick={onLogout}
             variant="outline"
-            className="h-14 min-w-14 border-zinc-700 bg-transparent px-4 text-lg text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100"
-            title="Logout"
+            aria-label="Log out"
+            className="size-16 shrink-0 border-zinc-700 bg-transparent text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100"
           >
-            <LogOut className="h-6 w-6" />
+            <LogOut className="size-7" />
           </Button>
         </div>
       </header>
@@ -184,24 +181,35 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
       {/* Channel grid */}
       <main className="flex-1 overflow-y-auto p-6">
         {visible.length === 0 ? (
-          <p className="mt-24 text-center text-2xl text-zinc-500">
-            {activeCategory === FAVORITES_ID
-              ? 'No favorites yet — tap the star on any channel.'
-              : 'No channels found.'}
-          </p>
+          <div className="mt-24 flex flex-col items-center gap-6 text-center">
+            <p className="text-pretty text-2xl text-zinc-500">
+              {activeCategory === FAVORITES_ID
+                ? 'No favorites yet — star a channel to pin it here.'
+                : 'No channels found.'}
+            </p>
+            {activeCategory === FAVORITES_ID && (
+              <Button
+                onClick={() => selectCategory(ALL_ID)}
+                className="h-16 min-w-64 bg-red-600 text-xl font-semibold hover:bg-red-500"
+              >
+                Browse all channels
+              </Button>
+            )}
+          </div>
         ) : (
           <>
-            <div className="grid grid-cols-2 gap-4 md:grid-cols-3 xl:grid-cols-4">
+            <div className="grid grid-cols-2 gap-5 md:grid-cols-3 xl:grid-cols-4">
               {visible.map((ch) => {
                 const icon = brokenIcons.has(ch.stream_id) ? null : proxiedIcon(ch.stream_icon);
                 const isFav = favorites.has(ch.stream_id);
                 return (
                   <div
                     key={ch.stream_id}
-                    className="group relative flex min-h-28 items-center gap-4 rounded-2xl border border-zinc-800 bg-zinc-900 p-4 transition-colors hover:border-red-600/60 hover:bg-zinc-800"
+                    className="group relative flex min-h-32 items-center gap-4 rounded-2xl border border-zinc-800 bg-zinc-900 p-5 transition-colors hover:border-red-600/60 hover:bg-zinc-800 active:bg-zinc-800"
                   >
                     <button
                       onClick={() => onPlay(ch, filtered)}
+                      aria-label={`Play ${ch.name}`}
                       className="flex min-w-0 flex-1 items-center gap-4 text-left"
                     >
                       {icon ? (
@@ -212,24 +220,24 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
                           onError={() =>
                             setBrokenIcons((prev) => new Set(prev).add(ch.stream_id))
                           }
-                          className="h-16 w-16 shrink-0 rounded-xl bg-zinc-800 object-contain"
+                          className="size-20 shrink-0 rounded-xl bg-zinc-800 object-contain p-1"
                         />
                       ) : (
-                        <div className="flex h-16 w-16 shrink-0 items-center justify-center rounded-xl bg-zinc-800 text-2xl font-bold text-zinc-500">
+                        <div className="flex size-20 shrink-0 items-center justify-center rounded-xl bg-zinc-800 text-3xl font-bold text-zinc-500">
                           {(ch.name || '?').trim().charAt(0)}
                         </div>
                       )}
-                      <span dir="auto" className="line-clamp-2 text-lg font-medium leading-snug">
+                      <span dir="auto" className="line-clamp-2 text-pretty text-xl font-medium leading-snug">
                         {ch.name}
                       </span>
                     </button>
                     <button
                       onClick={() => toggleFavorite(ch.stream_id)}
                       aria-label={isFav ? 'Remove from favorites' : 'Add to favorites'}
-                      className="flex h-14 w-14 shrink-0 items-center justify-center rounded-full hover:bg-zinc-700"
+                      className="flex size-16 shrink-0 items-center justify-center rounded-full hover:bg-zinc-700 active:bg-zinc-700"
                     >
                       <Star
-                        className={`h-7 w-7 ${isFav ? 'fill-amber-400 text-amber-400' : 'text-zinc-600'}`}
+                        className={`size-8 ${isFav ? 'fill-amber-400 text-amber-400' : 'text-zinc-600'}`}
                       />
                     </button>
                   </div>
@@ -240,7 +248,7 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
               <div className="mt-8 flex justify-center pb-8">
                 <Button
                   onClick={() => setVisibleCount((n) => n + PAGE_SIZE)}
-                  className="h-16 min-w-72 bg-zinc-800 text-xl hover:bg-zinc-700"
+                  className="h-16 min-w-72 bg-zinc-800 text-xl tabular-nums hover:bg-zinc-700"
                 >
                   Show more ({(filtered.length - visibleCount).toLocaleString()} left)
                 </Button>
@@ -265,7 +273,7 @@ function CategoryChip({
   return (
     <button
       onClick={onClick}
-      className={`h-14 shrink-0 whitespace-nowrap rounded-full px-6 text-lg font-medium transition-colors ${
+      className={`h-16 shrink-0 whitespace-nowrap rounded-full px-7 text-xl font-medium transition-colors ${
         active
           ? 'bg-red-600 text-white'
           : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700 hover:text-white'
