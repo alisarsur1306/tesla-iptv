@@ -112,15 +112,19 @@ export function proxied(absoluteUrl: string): string {
   return withKey(`/api/proxy?u=${encodeURIComponent(absoluteUrl)}`);
 }
 
-function apiUrl(creds: XtreamCreds, action?: string): string {
-  const base = normalizeServer(creds.server);
-  let url = `${base}/player_api.php?username=${encodeURIComponent(creds.username)}&password=${encodeURIComponent(creds.password)}`;
-  if (action) url += `&action=${action}`;
-  return url;
+// The IPTV account lives ONLY on the server. The client talks to opaque
+// same-origin endpoints — /api/xt for metadata, /api/stream?id=N for playback —
+// so credentials never reach the browser (DevTools / reverse engineering). The
+// `creds` params below are vestigial (kept so the component tree is unchanged)
+// and are NOT used to build any URL.
+
+/** URL for a server-side player_api action (login = no action). */
+function xtApiUrl(action?: string): string {
+  return withKey(`/api/xt${action ? `?action=${action}` : ''}`);
 }
 
-async function fetchJsonThroughProxy<T>(absoluteUrl: string): Promise<T> {
-  const res = await fetch(proxied(absoluteUrl));
+async function fetchXtJson<T>(action?: string): Promise<T> {
+  const res = await fetch(xtApiUrl(action));
   if (res.status === 403) {
     throw new AccessKeyError();
   }
@@ -130,23 +134,23 @@ async function fetchJsonThroughProxy<T>(absoluteUrl: string): Promise<T> {
   return (await res.json()) as T;
 }
 
-/** Validate credentials against player_api.php. Throws on bad auth. */
-export async function login(creds: XtreamCreds): Promise<XtreamUserInfo> {
-  const data = await fetchJsonThroughProxy<XtreamLoginResponse>(apiUrl(creds));
+/** Validate against the server-side account. Throws on bad auth. */
+export async function login(_creds: XtreamCreds): Promise<XtreamUserInfo> {
+  const data = await fetchXtJson<XtreamLoginResponse>();
   const info = data?.user_info;
   if (!info || info.auth !== 1 || info.status !== 'Active') {
-    throw new Error('Login failed — check server, username and password.');
+    throw new Error('The server account is not active.');
   }
   return info;
 }
 
-export async function getLiveCategories(creds: XtreamCreds): Promise<XtreamCategory[]> {
-  const data = await fetchJsonThroughProxy<XtreamCategory[]>(apiUrl(creds, 'get_live_categories'));
+export async function getLiveCategories(_creds: XtreamCreds): Promise<XtreamCategory[]> {
+  const data = await fetchXtJson<XtreamCategory[]>('get_live_categories');
   return Array.isArray(data) ? data : [];
 }
 
-export async function getLiveStreams(creds: XtreamCreds): Promise<XtreamLiveStream[]> {
-  const data = await fetchJsonThroughProxy<XtreamLiveStream[]>(apiUrl(creds, 'get_live_streams'));
+export async function getLiveStreams(_creds: XtreamCreds): Promise<XtreamLiveStream[]> {
+  const data = await fetchXtJson<XtreamLiveStream[]>('get_live_streams');
   return Array.isArray(data) ? data : [];
 }
 
@@ -159,9 +163,8 @@ export async function getLiveStreams(creds: XtreamCreds): Promise<XtreamLiveStre
  * flickered. A single long-lived response streams continuously and even
  * front-loads a backlog, so the buffer fills immediately.
  */
-export function liveStreamUrl(creds: XtreamCreds, streamId: number): string {
-  const base = normalizeServer(creds.server);
-  return `${base}/live/${encodeURIComponent(creds.username)}/${encodeURIComponent(creds.password)}/${streamId}.ts`;
+export function liveStreamUrl(_creds: XtreamCreds, streamId: number): string {
+  return withKey(`/api/stream?id=${streamId}`);
 }
 
 /** Proxied URL for a channel icon (safe for <img src>). Empty when no icon. */

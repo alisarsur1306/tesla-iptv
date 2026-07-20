@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
-import { liveStreamUrl, proxied, type XtreamCreds, type XtreamLiveStream } from '@/lib/xtream';
+import { liveStreamUrl, type XtreamCreds, type XtreamLiveStream } from '@/lib/xtream';
 import { CanvasPlayer } from '@/player/playerClient';
 import { AudioEngine } from '@/player/audioEngine';
 import { ArrowLeft, TriangleAlert, Volume2, VolumeX, Volume1, Play, Pause, SkipBack, SkipForward } from 'lucide-react';
@@ -46,7 +46,7 @@ export default function PlayerOverlay({ creds, channel, playlist = [], onSelect,
       return;
     }
 
-    const source = proxied(liveStreamUrl(creds, channel.stream_id));
+    const source = liveStreamUrl(creds, channel.stream_id); // already same-origin /api/stream
     setFatalError(null);
     setStatus('Loading…');
     setAudioUnsupported(null);
