@@ -35,3 +35,4 @@ tools/
 *.njsproj
 *.sln
 *.sw?
+public/playlist.m3u

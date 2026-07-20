@@ -215,9 +215,88 @@ function getXtreamCreds() {
   return cachedCreds;
 }
 
-/** True when the server holds credentials, so the client can skip the login screen. */
+// --- Server-side M3U playlist source (alternative to Xtream) ---------------
+// A plain M3U/M3U8 CHANNEL LIST (#EXTINF lines + a stream URL per channel), as
+// many providers hand out instead of Xtream credentials. Parsed and cached
+// server-side; the client sees only opaque channel ids and metadata (name /
+// logo / group) — never the playlist URL or the stream URLs (which usually
+// embed the account). Source: M3U_URL env var, else public/playlist.m3u (dev).
+
+const M3U_TTL_MS = 30 * 60 * 1000; // re-fetch the playlist at most twice an hour
+let m3uCache = null;
+let m3uCacheAt = 0;
+
+function getM3uSource() {
+  if (process.env.M3U_URL) return { kind: 'url', value: process.env.M3U_URL };
+  try {
+    const p = new URL('../public/playlist.m3u', import.meta.url);
+    readFileSync(p); // throws if absent
+    return { kind: 'file', value: p };
+  } catch {
+    return null;
+  }
+}
+
+/** Parse an M3U channel list into { name, logo, group, url } entries. */
+export function parseM3u(text) {
+  const lines = text.split(/\r?\n/);
+  const channels = [];
+  let pending = null;
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (line.startsWith('#EXTINF')) {
+      const comma = line.lastIndexOf(',');
+      pending = {
+        name: (comma >= 0 ? line.slice(comma + 1) : line).trim(),
+        logo: (line.match(/tvg-logo="([^"]*)"/i) || [])[1] || '',
+        group: (line.match(/group-title="([^"]*)"/i) || [])[1] || 'Uncategorized',
+      };
+    } else if (line && !line.startsWith('#')) {
+      // The URL line closes the current entry (or stands alone if malformed).
+      channels.push({
+        name: pending?.name || line,
+        logo: pending?.logo || '',
+        group: pending?.group || 'Uncategorized',
+        url: line,
+      });
+      pending = null;
+    }
+  }
+  return channels;
+}
+
+/** Fetch + parse the configured M3U (cached). Null when no M3U source is set. */
+async function getM3uChannels() {
+  const src = getM3uSource();
+  if (!src) return null;
+  if (m3uCache && Date.now() - m3uCacheAt < M3U_TTL_MS) return m3uCache;
+  let text;
+  if (src.kind === 'file') {
+    text = readFileSync(src.value, 'utf8');
+  } else {
+    const resp = await upstreamFetch(new URL(src.value), {
+      redirect: 'follow',
+      headers: { 'User-Agent': USER_AGENT, Accept: '*/*' },
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+    if (!resp.ok) throw new Error(`M3U fetch failed (${resp.status})`);
+    text = await resp.text();
+  }
+  m3uCache = parseM3u(text);
+  m3uCacheAt = Date.now();
+  return m3uCache;
+}
+
+/** Which source is configured — Xtream takes priority when both are set. */
+function getSourceType() {
+  if (getXtreamCreds()) return 'xtream';
+  if (getM3uSource()) return 'm3u';
+  return null;
+}
+
+/** True when the server holds a source (Xtream or M3U), so the client can skip the login screen. */
 export function isManaged() {
-  return getXtreamCreds() !== null;
+  return getSourceType() !== null;
 }
 
 function keyGate(req, res, url) {
@@ -247,25 +326,60 @@ async function xtreamApi(creds, action) {
  * Server-side player_api call; the response carries only channel metadata
  * (id/name/icon/category) — never the account.
  */
+function sendJsonBody(res, data) {
+  const body = Buffer.from(JSON.stringify(data), 'utf8');
+  res.writeHead(200, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'Content-Length': body.length,
+  });
+  res.end(body);
+}
+
 export async function handleXtreamApi(req, res) {
   res.on('error', () => {});
   setCors(res);
   const url = new URL(req.url || '/', 'http://localhost');
   if (!keyGate(req, res, url)) return;
-  const creds = getXtreamCreds();
-  if (!creds) return sendError(res, 503, 'Server has no IPTV account configured');
 
   const action = url.searchParams.get('action') || '';
   const allowed = new Set(['', 'get_live_streams', 'get_live_categories']);
   if (!allowed.has(action)) return sendError(res, 400, 'Unsupported action');
 
+  const source = getSourceType();
+  if (!source) return sendError(res, 503, 'Server has no IPTV source configured');
+
   try {
-    const data = await xtreamApi(creds, action);
-    const body = Buffer.from(JSON.stringify(data), 'utf8');
-    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Length': body.length });
-    res.end(body);
+    if (source === 'm3u') {
+      // Present the M3U as the same shapes the client already expects from
+      // Xtream — the channel's array index is its opaque stream id.
+      const channels = await getM3uChannels();
+      let data;
+      if (action === 'get_live_categories') {
+        const seen = new Set();
+        data = [];
+        for (const c of channels) {
+          if (seen.has(c.group)) continue;
+          seen.add(c.group);
+          data.push({ category_id: c.group, category_name: c.group });
+        }
+      } else if (action === 'get_live_streams') {
+        data = channels.map((c, i) => ({
+          stream_id: i,
+          name: c.name,
+          stream_icon: c.logo,
+          category_id: c.group,
+        }));
+      } else {
+        data = { user_info: { auth: 1, status: 'Active' } }; // login: always active
+      }
+      return sendJsonBody(res, data);
+    }
+
+    // Xtream: server-side player_api call.
+    return sendJsonBody(res, await xtreamApi(getXtreamCreds(), action));
   } catch (err) {
-    sendError(res, 502, `Xtream API failed: ${String(err && err.message ? err.message : err)}`);
+    sendError(res, 502, `Channel list failed: ${String(err && err.message ? err.message : err)}`);
   }
 }
 
@@ -278,16 +392,33 @@ export async function handleStream(req, res) {
   const url = new URL(req.url || '/', 'http://localhost');
   setCors(res);
   if (!keyGate(req, res, url)) return;
-  const creds = getXtreamCreds();
-  if (!creds) return sendError(res, 503, 'Server has no IPTV account configured');
 
   const id = url.searchParams.get('id') || '';
   if (!/^\d+$/.test(id)) return sendError(res, 400, 'Invalid channel id');
 
-  const upstreamUrl = `${creds.server}/live/${encodeURIComponent(creds.username)}/${encodeURIComponent(creds.password)}/${id}.ts`;
+  const source = getSourceType();
+  if (!source) return sendError(res, 503, 'Server has no IPTV source configured');
+
+  let upstreamUrl;
+  if (source === 'm3u') {
+    // The id is the channel's index in the parsed M3U; look up its stream URL.
+    let channels;
+    try {
+      channels = await getM3uChannels();
+    } catch (err) {
+      return sendError(res, 502, `Playlist load failed: ${String(err && err.message ? err.message : err)}`);
+    }
+    const idx = Number(id);
+    if (!channels || idx < 0 || idx >= channels.length) return sendError(res, 404, 'Unknown channel');
+    upstreamUrl = channels[idx].url;
+  } else {
+    const creds = getXtreamCreds();
+    upstreamUrl = `${creds.server}/live/${encodeURIComponent(creds.username)}/${encodeURIComponent(creds.password)}/${id}.ts`;
+  }
+
   // Delegate to the existing proxy by rewriting the request to its internal form.
-  // The credentials live only in this rewritten URL, on the server — the client's
-  // request was /api/stream?id=N and its response is the stream bytes.
+  // The stream URL (which may embed the account) lives only here, on the server —
+  // the client's request was /api/stream?id=N and its response is the bytes.
   const key = url.searchParams.get('key') || '';
   req.url = `/api/proxy?u=${encodeURIComponent(upstreamUrl)}${key ? `&key=${encodeURIComponent(key)}` : ''}`;
   return handleProxy(req, res);
