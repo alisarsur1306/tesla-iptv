@@ -38,3 +38,14 @@ test('avccDescription layout: version, profile bytes, SPS then PPS', () => {
   const ppsLenOff = 8 + sps.length + 1; // after numOfPPS byte
   assert.equal((d[ppsLenOff] << 8) | d[ppsLenOff + 1], pps.length);
 });
+
+test('isValidSps accepts a real SPS and rejects garbage that merely scored type 7', async () => {
+  const { isValidSps } = await import('./h264.ts');
+  // Real SPS: NAL header 0x67, profile_idc 100 (High), short.
+  assert.equal(isValidSps(new Uint8Array([0x67, 100, 0x00, 0x28, 0x01, 0x02])), true);
+  assert.equal(isValidSps(new Uint8Array([0x67, 66, 0xc0, 0x1e])), true); // Baseline
+  // Observed on a scrambled/HEVC channel: profile 43, kilobyte-long "SPS".
+  assert.equal(isValidSps(new Uint8Array([0x67, 43, 0x7c, 0xaf])), false);
+  assert.equal(isValidSps(new Uint8Array(1030).fill(0x67)), false); // absurd length
+  assert.equal(isValidSps(new Uint8Array([0x67])), false); // too short
+});

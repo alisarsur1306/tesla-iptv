@@ -58,6 +58,23 @@ export function toAVCC(nals: Uint8Array[]): Uint8Array {
   return out;
 }
 
+/**
+ * profile_idc values defined by H.264. Anything else means the bytes we think
+ * are an SPS are not one — which is what happens when a non-H.264 stream (HEVC,
+ * or scrambled payload) is parsed with H.264 rules: NAL "types" come out
+ * uniformly spread over 0-31, so a type-7 NAL appears by chance and carries
+ * nonsense. Validating the profile is what separates that from real video.
+ */
+const VALID_PROFILES = new Set([66, 77, 88, 100, 110, 122, 244]);
+
+/** Does this NAL really look like an H.264 SPS (not garbage that scored type 7)? */
+export function isValidSps(nal: Uint8Array): boolean {
+  if (nal.length < 4) return false;
+  // A real SPS is small; kilobyte-long "SPS" means we mis-parsed the stream.
+  if (nal.length > 128) return false;
+  return VALID_PROFILES.has(nal[1]);
+}
+
 /** codec string, e.g. "avc1.42c01e", from SPS bytes [profile, constraints, level]. */
 export function codecString(sps: Uint8Array): string {
   return (
