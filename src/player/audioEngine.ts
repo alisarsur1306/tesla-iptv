@@ -18,6 +18,7 @@ import {
   AAC_SAMPLES_PER_FRAME,
   type AudioCodec,
 } from '../lib/adts';
+import { MpegAudioDecoder } from './wasmAudio';
 
 /** How far ahead of `currentTime` the first buffer is scheduled, to absorb jitter. */
 const START_LEAD_SEC = 0.2;
@@ -49,6 +50,10 @@ export class AudioEngine {
   private residual: Uint8Array | null = null;
   /** Sources scheduled but not yet finished — needed to silence them on reset. */
   private scheduled = new Set<AudioBufferSourceNode>();
+  /** WASM decoder for MPEG audio (created only for MP2/MP3 channels). */
+  private mpeg: MpegAudioDecoder | null = null;
+  /** Monotonic media clock (ms) for MP2, advanced by decoded sample duration. */
+  private mpegClockMs: number | null = null;
 
   /** AudioContext time that `mediaAnchorMs` corresponds to. */
   private ctxAnchor = 0;
@@ -99,6 +104,13 @@ export class AudioEngine {
     this.mediaAnchorMs = 0;
     this.nextTime = 0;
     this.residual = null;
+    this.mpegClockMs = null;
+    try {
+      this.mpeg?.destroy();
+    } catch {
+      /* ignore */
+    }
+    this.mpeg = null;
     // Already-scheduled buffers keep playing otherwise — the old channel's audio
     // would overlap the new one after a switch or a discontinuity.
     for (const src of this.scheduled) {
@@ -128,17 +140,22 @@ export class AudioEngine {
 
     if (!this.codec) {
       this.codec = sniffAudioCodec(bytes);
-      if (this.codec !== 'aac') {
-        // MP3 could go through WebCodecs too, but live TS 'mpeg' is nearly always
-        // Layer II, which WebCodecs cannot decode — treat as unsupported for now.
-        if (!this.unsupportedReported) {
-          this.unsupportedReported = true;
-          this.cb.onUnsupported?.(this.codec);
-        }
-        return;
-      }
     }
-    if (this.codec !== 'aac') return;
+
+    // MPEG-1/2 audio (Layer II ~30% of this panel) can't go through WebCodecs —
+    // route it to the lazily-loaded WASM decoder instead.
+    if (this.codec === 'mpeg') {
+      this.pushMpeg(bytes, ptsMs);
+      return;
+    }
+    if (this.codec !== 'aac') {
+      // AC-3 / unknown — no decoder wired; tell the UI rather than fail silently.
+      if (!this.unsupportedReported) {
+        this.unsupportedReported = true;
+        this.cb.onUnsupported?.(this.codec);
+      }
+      return;
+    }
 
     // An ADTS frame can straddle a PES boundary. Without carrying the remainder
     // forward, one 1024-sample frame is destroyed at every boundary — an audible
@@ -203,56 +220,54 @@ export class AudioEngine {
     });
   }
 
+  /** Decode & schedule an MPEG (Layer II) audio PES via the WASM decoder. */
+  private pushMpeg(bytes: Uint8Array, ptsMs: number): void {
+    const ctx = this.ensureContext();
+    if (ctx.state === 'suspended') return; // wait for the sound-unlock gesture
+
+    if (!this.mpeg) {
+      this.mpeg = new MpegAudioDecoder();
+      void this.mpeg.init().catch((e) => {
+        if (!this.unsupportedReported) {
+          this.unsupportedReported = true;
+          this.cb.onError?.('MP2 decoder load failed: ' + (e as Error).message);
+        }
+      });
+    }
+    if (!this.mpeg.ready) return; // still loading WASM — drop a few frames at startup
+
+    const out = this.mpeg.decode(bytes);
+    if (!out || !out.samplesDecoded) return;
+
+    // Anchor the MP2 clock to the stream PTS once, then advance it by the exact
+    // decoded duration. Re-sync if the incoming PTS diverges (discontinuity):
+    // the WASM decoder gives us no per-frame timestamps, so we keep our own.
+    if (this.mpegClockMs === null || Math.abs(ptsMs - this.mpegClockMs) > 700) {
+      this.mpegClockMs = ptsMs;
+      this.anchored = false; // rebuild the ctx-time mapping from here
+    }
+
+    const ctx2 = ctx;
+    const buf = ctx2.createBuffer(out.channelData.length, out.samplesDecoded, out.sampleRate);
+    for (let ch = 0; ch < out.channelData.length; ch++) {
+      buf.copyToChannel(out.channelData[ch], ch);
+    }
+    this.scheduleBuffer(buf, this.mpegClockMs);
+    this.mpegClockMs += (out.samplesDecoded / out.sampleRate) * 1000;
+  }
+
   private onDecoded(data: AudioData): void {
     const ctx = this.ensureContext();
     try {
       const channels = data.numberOfChannels;
       const frames = data.numberOfFrames;
-      const rate = data.sampleRate;
-      const buf = ctx.createBuffer(channels, frames, rate);
+      const buf = ctx.createBuffer(channels, frames, data.sampleRate);
       const tmp = new Float32Array(frames);
       for (let ch = 0; ch < channels; ch++) {
         data.copyTo(tmp, { planeIndex: ch, format: 'f32-planar' });
         buf.copyToChannel(tmp, ch);
       }
-
-      const mediaMs = data.timestamp / 1000;
-
-      // Establish (or re-establish) the media timeline.
-      if (!this.anchored) {
-        this.ctxAnchor = ctx.currentTime + START_LEAD_SEC;
-        this.mediaAnchorMs = mediaMs;
-        this.anchored = true;
-        this.nextTime = this.ctxAnchor;
-        // Tell the worker when this media time actually reaches the speakers.
-        const epochMs = nowEpochMs() + (this.ctxAnchor - ctx.currentTime) * 1000;
-        this.cb.onAnchor?.(this.mediaAnchorMs, epochMs);
-      }
-
-      let when = this.ctxAnchor + (mediaMs - this.mediaAnchorMs) / 1000;
-
-      // Re-anchor on large drift in EITHER direction. A forward PTS jump used to
-      // fall through this guard and schedule audio minutes into the future
-      // (silence forever); a backward jump used to sit in the dead band between
-      // "too late to play" and "far enough to resync" and drop every buffer.
-      if (Math.abs(when - ctx.currentTime) > RESYNC_THRESHOLD_SEC) {
-        this.anchored = false;
-        data.close();
-        return;
-      }
-      if (when < ctx.currentTime - LATE_TOLERANCE_SEC) {
-        data.close();
-        return; // too late to matter
-      }
-      if (when < ctx.currentTime) when = ctx.currentTime;
-
-      const src = ctx.createBufferSource();
-      src.buffer = buf;
-      src.connect(ctx.destination);
-      src.onended = () => this.scheduled.delete(src);
-      src.start(when);
-      this.scheduled.add(src);
-      this.nextTime = Math.max(this.nextTime, when + buf.duration);
+      this.scheduleBuffer(buf, data.timestamp / 1000);
     } catch (e) {
       this.cb.onError?.('audio render failed: ' + (e as Error).message);
     } finally {
@@ -262,5 +277,40 @@ export class AudioEngine {
         /* ignore */
       }
     }
+  }
+
+  /**
+   * Schedule a decoded PCM buffer on the shared media timeline. Both the AAC
+   * (WebCodecs) and MP2 (WASM) paths funnel through here so anchoring, drift
+   * re-anchoring and the master-clock hand-off to the worker stay in one place.
+   */
+  private scheduleBuffer(buf: AudioBuffer, mediaMs: number): void {
+    const ctx = this.ensureContext();
+
+    if (!this.anchored) {
+      this.ctxAnchor = ctx.currentTime + START_LEAD_SEC;
+      this.mediaAnchorMs = mediaMs;
+      this.anchored = true;
+      this.nextTime = this.ctxAnchor;
+      const epochMs = nowEpochMs() + (this.ctxAnchor - ctx.currentTime) * 1000;
+      this.cb.onAnchor?.(this.mediaAnchorMs, epochMs);
+    }
+
+    let when = this.ctxAnchor + (mediaMs - this.mediaAnchorMs) / 1000;
+
+    if (Math.abs(when - ctx.currentTime) > RESYNC_THRESHOLD_SEC) {
+      this.anchored = false; // re-anchor next buffer
+      return;
+    }
+    if (when < ctx.currentTime - LATE_TOLERANCE_SEC) return; // too late to matter
+    if (when < ctx.currentTime) when = ctx.currentTime;
+
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(ctx.destination);
+    src.onended = () => this.scheduled.delete(src);
+    src.start(when);
+    this.scheduled.add(src);
+    this.nextTime = Math.max(this.nextTime, when + buf.duration);
   }
 }
