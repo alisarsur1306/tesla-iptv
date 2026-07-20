@@ -30,6 +30,7 @@ export default function PlayerOverlay({ creds, channel, playlist = [], onSelect,
   const [needsAudioTap, setNeedsAudioTap] = useState(false);
   const [audioUnsupported, setAudioUnsupported] = useState<string | null>(null);
   const [videoUnsupported, setVideoUnsupported] = useState(false);
+  const [videoStalled, setVideoStalled] = useState(false);
   const [paused, setPaused] = useState(false);
   const [buffering, setBuffering] = useState(false);
   const [firstFrame, setFirstFrame] = useState(false);
@@ -53,6 +54,7 @@ export default function PlayerOverlay({ creds, channel, playlist = [], onSelect,
     setStatus('Loading…');
     setAudioUnsupported(null);
     setVideoUnsupported(false);
+    setVideoStalled(false);
     setBuffering(false);
     setFirstFrame(false);
 
@@ -79,6 +81,7 @@ export default function PlayerOverlay({ creds, channel, playlist = [], onSelect,
       onAudio: (data, pts) => audio.push(data, pts),
       onAudioReset: () => audio.reset(),
       onUnsupportedVideo: () => setVideoUnsupported(true),
+      onVideoStalled: () => setVideoStalled(true),
       onBuffering: (active) => setBuffering(active),
       onError: (msg) => {
         if (destroyed) return;
@@ -239,7 +242,7 @@ export default function PlayerOverlay({ creds, channel, playlist = [], onSelect,
 
       {/* Initial preloader — until the first frame is drawn, so a black canvas
           never looks like a failure while the channel is starting up. */}
-      {!firstFrame && !fatalError && !videoUnsupported && (
+      {!firstFrame && !fatalError && !videoUnsupported && !videoStalled && (
         <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-6">
           <Loader2 className="size-14 animate-spin text-red-500" />
           <span dir="auto" className="text-2xl font-medium text-zinc-200">
@@ -255,6 +258,22 @@ export default function PlayerOverlay({ creds, channel, playlist = [], onSelect,
             <Loader2 className="size-9 animate-spin text-white" />
             <span className="text-2xl font-medium text-white">Buffering…</span>
           </span>
+        </div>
+      )}
+
+      {/* Decoder accepted the stream but never produced a frame — typical of
+          iOS Safari WebCodecs. Say so (sound still plays) instead of hanging. */}
+      {videoStalled && !videoUnsupported && !fatalError && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-6 bg-black/90 p-8">
+          <TriangleAlert className="h-16 w-16 text-amber-500" />
+          <p className="max-w-2xl text-pretty text-center text-2xl text-zinc-200">
+            Video didn’t start on this browser (sound is playing). This usually means
+            the browser can’t decode video with WebCodecs — try Chrome, or update to
+            the latest iOS/Safari.
+          </p>
+          <Button onClick={onBack} className="h-16 min-w-64 bg-red-600 text-2xl font-bold hover:bg-red-500">
+            <ArrowLeft className="mr-3 h-7 w-7" /> Back to channels
+          </Button>
         </div>
       )}
 
