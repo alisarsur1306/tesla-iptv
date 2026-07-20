@@ -19,6 +19,12 @@ export interface PlayerCallbacks {
   onAudio?: (data: ArrayBuffer, ptsMs: number) => void;
   /** The stream's video is not H.264 (e.g. HEVC) and cannot be decoded. */
   onUnsupportedVideo?: () => void;
+  /**
+   * The worker restarted the media timeline (stream start or PTS discontinuity).
+   * The audio engine MUST drop everything it has scheduled, otherwise the old
+   * timeline keeps playing under the new one and you hear two streams at once.
+   */
+  onAudioReset?: () => void;
 }
 
 export class CanvasPlayer {
@@ -89,6 +95,9 @@ export class CanvasPlayer {
         break;
       case 'unsupportedVideo':
         this.cb.onUnsupportedVideo?.();
+        break;
+      case 'audioReset':
+        this.cb.onAudioReset?.();
         break;
       // 'canvasResize' is informational; the OffscreenCanvas already resized.
     }

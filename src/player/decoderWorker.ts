@@ -21,12 +21,40 @@ type InMsg =
   // (absolute epoch — a Worker's performance.now() origin differs from the page's).
   | { t: 'anchor'; mediaMs: number; epochMs: number };
 
-/** How many segments back from the live edge to join (buffer vs. latency). */
-const LIVE_EDGE_SEGMENTS = 2;
+/**
+ * How many segments back from the live edge to join. This IS the buffer: the
+ * intake pauses on backpressure with the rest of the segment still unread, so
+ * cushion is held cheaply as encoded bytes. Too small (2) and the playlist
+ * window drains, leaving the decoder starved between publishes — seen as the
+ * picture freezing for seconds at a time.
+ */
+const LIVE_EDGE_SEGMENTS = 4;
+/** Upper bound on the playlist poll interval, so new segments are picked up promptly. */
+const MAX_POLL_MS = 2000;
 /** Consecutive segment fetch failures before giving up on the stream. */
 const MAX_SEGMENT_FAILURES = 3;
 /** Consecutive polls with no new segment before declaring the stream dead. */
 const MAX_EMPTY_POLLS = 10;
+/** A head frame further ahead than this means the clock is wrong, not early. */
+const MAX_FUTURE_MS = 1000;
+/** Hard cap on buffered decoded frames (~2.5s at 25fps). Frames hold GPU memory,
+ *  so this is the ceiling the car has to live with. */
+const MAX_QUEUE_FRAMES = 60;
+/** Only trim for live-edge once we are comfortably buffered... */
+const LIVE_TRIM_MIN_FRAMES = 40;
+/** ...and only frames genuinely far behind the clock. */
+const LIVE_TRIM_MS = 2000;
+/** Pause intake once this many decoded frames are buffered. Must sit below
+ *  MAX_QUEUE_FRAMES so backpressure (not frame-dropping) is what limits us. */
+const BACKPRESSURE_FRAMES = 45;
+/**
+ * Cap on how long intake may block on backpressure. Generous on purpose:
+ * pausing the read IS the buffer — the rest of the segment stays unread and
+ * cheap, and decoding it early would only overflow the frame queue and throw
+ * the cushion away. The cap exists solely so a stalled presentation can never
+ * wedge intake forever (the re-anchor in tryPresentOne is the real guard).
+ */
+const MAX_BACKPRESSURE_MS = 30_000;
 
 let canvas: OffscreenCanvas | null = null;
 let ctx: OffscreenCanvasRenderingContext2D | null = null;
@@ -205,7 +233,7 @@ async function runSegments(m3u8Url: string) {
     }
     if (!media.live) break; // VOD ended
 
-    const waitMs = Math.max(500, (media.targetDuration || 4) * 500);
+    const waitMs = Math.min(MAX_POLL_MS, Math.max(500, (media.targetDuration || 4) * 500));
     await sleep(waitMs);
     if (!playing) return;
 
@@ -255,8 +283,16 @@ async function streamSegment(url: string) {
       demux!.push(value);
     }
     // Read-side backpressure: never drop encoded frames; pace intake instead.
-    while (playing && (queue.length >= 18 || (dec && dec.decodeQueueSize > 12))) {
+    // Bounded, because if presentation stalls this loop would otherwise block
+    // forever and the stream would wedge with no way back.
+    let waited = 0;
+    while (
+      playing &&
+      (queue.length >= BACKPRESSURE_FRAMES || (dec && dec.decodeQueueSize > 12)) &&
+      waited < MAX_BACKPRESSURE_MS
+    ) {
       await sleep(15);
+      waited += 15;
     }
   }
 }
@@ -400,7 +436,7 @@ function initDecoder() {
     output: (frame) => {
       frameCount++;
       queue.push({ frame, pts: frame.timestamp / 1000 });
-      while (queue.length > 30) {
+      while (queue.length > MAX_QUEUE_FRAMES) {
         try {
           queue.shift()!.frame.close();
         } catch {
@@ -469,17 +505,19 @@ function nextDelay(): number {
 }
 function tryPresentOne(): boolean {
   const now = presentationClock();
-  // Live-edge: drop stale head frames so we hug the live point.
-  while (queue.length > 5) {
-    if (now - queue[0].pts > 120) {
-      try {
-        queue.shift()!.frame.close();
-      } catch {
-        /* ignore */
-      }
-    } else break;
+  // Live-edge trim. This must NOT double as a buffer cap: trimming to ~5 frames
+  // whenever the head was 120ms old kept the queue at 0-9 frames, so any jitter
+  // in segment delivery starved presentation — visible as the picture freezing
+  // for seconds and flickering. Only trim when we are BOTH deeply buffered and
+  // genuinely far behind, so latency still can't grow without bound.
+  while (queue.length > LIVE_TRIM_MIN_FRAMES && now - queue[0].pts > LIVE_TRIM_MS) {
+    try {
+      queue.shift()!.frame.close();
+    } catch {
+      /* ignore */
+    }
   }
-  while (queue.length > 30) {
+  while (queue.length > MAX_QUEUE_FRAMES) {
     try {
       queue.shift()!.frame.close();
     } catch {
@@ -489,7 +527,25 @@ function tryPresentOne(): boolean {
   if (!queue.length) return false;
   const f = queue[0];
   const diff = f.pts - now;
-  if (diff > 60) return false; // future frame → wait
+  // A frame a little ahead just needs to wait for its moment.
+  // But a frame FAR ahead means the clock itself is wrong — typically because
+  // audio and video PTS have different bases, so the audio-master clock reads
+  // permanently behind the video. Previously such a frame was never presented
+  // AND never dropped: the queue filled, fetch backpressure wedged, and video
+  // froze for good while audio kept playing. Re-anchor onto this frame instead.
+  if (diff > MAX_FUTURE_MS) {
+    if (audioAnchorMediaMs !== null) {
+      audioAnchorEpochMs = nowEpochMs();
+      audioAnchorMediaMs = f.pts;
+    } else {
+      clockCalibrated = true;
+      wallStart = performance.now();
+      ptsStart = f.pts;
+    }
+    log(`presentation clock re-anchored (frame ${Math.round(diff)}ms in the future)`, 'warn');
+  } else if (diff > 60) {
+    return false; // future frame → wait
+  }
   if (diff < -250) {
     try {
       queue.shift()!.frame.close();
