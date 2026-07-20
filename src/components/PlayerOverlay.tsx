@@ -32,6 +32,7 @@ export default function PlayerOverlay({ creds, channel, playlist = [], onSelect,
   const [videoUnsupported, setVideoUnsupported] = useState(false);
   const [paused, setPaused] = useState(false);
   const [buffering, setBuffering] = useState(false);
+  const [firstFrame, setFirstFrame] = useState(false);
   const [volume, setVolume] = useState(1);
   const playerRef = useRef<CanvasPlayer | null>(null);
   const sourceRef = useRef<string>('');
@@ -53,6 +54,7 @@ export default function PlayerOverlay({ creds, channel, playlist = [], onSelect,
     setAudioUnsupported(null);
     setVideoUnsupported(false);
     setBuffering(false);
+    setFirstFrame(false);
 
     const canvas = document.createElement('canvas');
     canvas.className = 'h-full w-full object-contain';
@@ -71,6 +73,7 @@ export default function PlayerOverlay({ creds, channel, playlist = [], onSelect,
       onReady: () => setStatus('Ready'),
       onStats: () => {
         setStatus('Ready');
+        setFirstFrame(true); // frames are being drawn — hide the preloader
         retries = 0; // frames are flowing again — a later blip starts a fresh budget
       },
       onAudio: (data, pts) => audio.push(data, pts),
@@ -234,8 +237,19 @@ export default function PlayerOverlay({ creds, channel, playlist = [], onSelect,
         </div>
       )}
 
+      {/* Initial preloader — until the first frame is drawn, so a black canvas
+          never looks like a failure while the channel is starting up. */}
+      {!firstFrame && !fatalError && !videoUnsupported && (
+        <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-6">
+          <Loader2 className="size-14 animate-spin text-red-500" />
+          <span dir="auto" className="text-2xl font-medium text-zinc-200">
+            Loading {channel.name}…
+          </span>
+        </div>
+      )}
+
       {/* Rebuffering — the stream ran dry; we pause to rebuild a cushion */}
-      {buffering && !fatalError && !videoUnsupported && (
+      {firstFrame && buffering && !fatalError && !videoUnsupported && (
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
           <span className="flex items-center gap-4 rounded-2xl bg-black/70 px-8 py-5">
             <Loader2 className="size-9 animate-spin text-white" />
