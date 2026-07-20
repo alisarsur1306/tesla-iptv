@@ -12,6 +12,7 @@
 import { TsDemuxer } from '../lib/tsDemux';
 import { parsePlaylist, parseMediaPlaylist, diffNewSegments, type MediaPlaylist } from '../lib/hlsPlaylist';
 import { splitNALs, toAVCC, nalType, avccDescription, codecString, isValidSps, NAL_SPS, NAL_PPS, NAL_IDR, NAL_NON_IDR } from '../lib/h264';
+import { hevcNalType, isHevcKeySlice, isHevcSlice, looksLikeHevc, toAnnexB, HEVC_VPS, HEVC_SPS, HEVC_PPS, HEVC_MAIN_CODEC, HEVC_MAIN10_CODEC } from '../lib/hevc';
 
 type InMsg =
   | { t: 'init'; canvas: OffscreenCanvas }
@@ -79,6 +80,12 @@ let demux: TsDemuxer | null = null;
 let dec: VideoDecoder | null = null;
 let sps: Uint8Array | null = null;
 let pps: Uint8Array | null = null;
+// HEVC parameter sets (separate: 2-byte NAL header, different types).
+let hevcVps: Uint8Array | null = null;
+let hevcSps: Uint8Array | null = null;
+let hevcPps: Uint8Array | null = null;
+/** Detected video codec for this channel: null until the parameter sets arrive. */
+let videoCodec: 'h264' | 'hevc' | null = null;
 let ready = false;
 let gotIDR = false;
 let firstPTS: number | null = null;
@@ -142,6 +149,10 @@ function reset() {
   dec = null;
   sps = null;
   pps = null;
+  hevcVps = null;
+  hevcSps = null;
+  hevcPps = null;
+  videoCodec = null;
   ready = false;
   gotIDR = false;
   firstPTS = null;
@@ -449,23 +460,30 @@ function onPes(e: {
 }
 
 function handleVideo(data: Uint8Array, pts: number) {
-  const nals = splitNALs(data);
+  const nals = splitNALs(data); // Annex-B start codes are the same for H.264 and HEVC
   if (!nals.length) return;
 
-  // Codec check. Testing "does any NAL have type 1/5/7/8" is NOT enough: when a
-  // non-H.264 stream (HEVC, or scrambled payload) is parsed with H.264 rules the
-  // types come out uniformly spread over 0-31, so those values appear by chance
-  // and the stream looks decodable while producing nothing but a black canvas.
-  // A *valid SPS* is the reliable signal, so require one.
-  if (!gotIDR && !unsupportedVideoReported) {
-    videoPesSeen++;
-    if (videoPesSeen > UNSUPPORTED_PES_THRESHOLD) {
-      unsupportedVideoReported = true;
-      post({ t: 'unsupportedVideo' });
-      log('no valid H.264 SPS found — channel is HEVC or scrambled', 'error');
+  // Detect the codec once, from the parameter sets. H.264 SPS/PPS are a valid
+  // type-7/8 NAL; HEVC SPS/PPS are type 33/34 under the 6-bit HEVC header. These
+  // never collide, so this also distinguishes real video from MPEG-2/garbage
+  // (which yields neither) — that used to render a permanently black canvas.
+  if (videoCodec === null && !unsupportedVideoReported) {
+    if (nals.some((n) => nalType(n) === NAL_SPS && isValidSps(n))) videoCodec = 'h264';
+    else if (looksLikeHevc(nals)) videoCodec = 'hevc';
+    else {
+      videoPesSeen++;
+      if (videoPesSeen > UNSUPPORTED_PES_THRESHOLD) {
+        unsupportedVideoReported = true;
+        post({ t: 'unsupportedVideo' });
+        log('no H.264 or HEVC parameter sets found — channel is unsupported (MPEG-2 / scrambled)', 'error');
+      }
       return;
     }
+    log('video codec detected: ' + videoCodec, 'info');
   }
+
+  if (videoCodec === 'hevc') return handleHevc(nals, pts);
+  if (videoCodec !== 'h264') return;
 
   for (const n of nals) {
     const t = nalType(n);
@@ -542,6 +560,85 @@ function resetDecoderOnly() {
   queue = [];
 }
 
+// --- HEVC (H.265) ---
+// Fed as `hev1` Annex-B with in-band parameter sets, so no hvcC record is built.
+// Support is feature-detected at runtime: if the platform (e.g. the car) has no
+// HEVC decoder, configure()/the error callback fires and we report unsupported.
+function handleHevc(nals: Uint8Array[], pts: number) {
+  for (const n of nals) {
+    const t = hevcNalType(n);
+    if (t === HEVC_VPS) hevcVps = n;
+    else if (t === HEVC_SPS) hevcSps = n;
+    else if (t === HEVC_PPS) hevcPps = n;
+  }
+
+  const key = nals.some((n) => isHevcKeySlice(hevcNalType(n)));
+  const sliceNals = nals.filter((n) => isHevcSlice(hevcNalType(n)));
+
+  if (!gotIDR) {
+    if (key && hevcSps && hevcPps) {
+      log('First HEVC keyframe', 'success');
+      gotIDR = true;
+      initHevcDecoder();
+    } else {
+      return;
+    }
+  }
+  if (!ready || !dec || dec.state !== 'configured' || !sliceNals.length) return;
+
+  // Keyframe access unit carries the parameter sets in-band before the slices.
+  const out = key ? [hevcVps, hevcSps, hevcPps, ...sliceNals].filter((n): n is Uint8Array => !!n) : sliceNals;
+  try {
+    dec.decode(
+      new EncodedVideoChunk({
+        type: key ? 'key' : 'delta',
+        timestamp: Math.max(0, pts) * 1000,
+        data: toAnnexB(out),
+      }),
+    );
+  } catch (err) {
+    const msg = (err as Error)?.message || '';
+    log('HEVC decode error: ' + msg, 'error');
+    if (msg.includes('key') || msg.includes('closed')) gotIDR = false;
+  }
+}
+
+function initHevcDecoder() {
+  try {
+    dec?.close();
+  } catch {
+    /* ignore */
+  }
+  dec = new VideoDecoder({
+    output: onDecodedFrame,
+    error: (e) => {
+      // Runtime feature-detection: a platform without an HEVC decoder errors here.
+      log('HEVC VideoDecoder error: ' + e.message, 'error');
+      if (!unsupportedVideoReported) {
+        unsupportedVideoReported = true;
+        post({ t: 'unsupportedVideo' });
+      }
+      ready = false;
+      gotIDR = false;
+    },
+  });
+  // Try Main first, then Main10 (10-bit) — no description, Annex-B in-band.
+  for (const codec of [HEVC_MAIN_CODEC, HEVC_MAIN10_CODEC]) {
+    try {
+      dec.configure({ codec, optimizeForLatency: true, hardwareAcceleration: 'no-preference' });
+      ready = true;
+      log('HEVC decoder ready: ' + codec, 'success');
+      return;
+    } catch (e) {
+      log('HEVC configure failed for ' + codec + ': ' + (e as Error).message, 'warn');
+    }
+  }
+  if (!unsupportedVideoReported) {
+    unsupportedVideoReported = true;
+    post({ t: 'unsupportedVideo' });
+  }
+}
+
 function initDecoder() {
   try {
     dec?.close();
@@ -551,20 +648,7 @@ function initDecoder() {
   const codec = codecString(sps!);
   const description = avccDescription(sps!, pps!);
   dec = new VideoDecoder({
-    output: (frame) => {
-      frameCount++;
-      queue.push({ frame, pts: frame.timestamp / 1000 });
-      while (queue.length > MAX_QUEUE_FRAMES) {
-        try {
-          queue.shift()!.frame.close();
-        } catch {
-          /* ignore */
-        }
-      }
-      if (!presentPending) schedulePresent();
-      if ((frameCount & 15) === 0)
-        post({ t: 'stats', frames: frameCount, buffer: queue.length, reserveKB: Math.round(encodedBytes / 1024) });
-    },
+    output: onDecodedFrame,
     error: (e) => {
       log('VideoDecoder error: ' + e.message, 'error');
       gotIDR = false;
@@ -579,6 +663,22 @@ function initDecoder() {
     log('video configure failed: ' + (e as Error).message, 'error');
     ready = false;
   }
+}
+
+/** Shared decoder output: queue the frame, cap the queue, drive presentation. */
+function onDecodedFrame(frame: VideoFrame) {
+  frameCount++;
+  queue.push({ frame, pts: frame.timestamp / 1000 });
+  while (queue.length > MAX_QUEUE_FRAMES) {
+    try {
+      queue.shift()!.frame.close();
+    } catch {
+      /* ignore */
+    }
+  }
+  if (!presentPending) schedulePresent();
+  if ((frameCount & 15) === 0)
+    post({ t: 'stats', frames: frameCount, buffer: queue.length, reserveKB: Math.round(encodedBytes / 1024) });
 }
 
 // --- presentation (wall clock anchored at first frame; setTimeout paced) ---
