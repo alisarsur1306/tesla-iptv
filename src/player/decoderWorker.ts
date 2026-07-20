@@ -770,12 +770,30 @@ function tryPresentOne(): boolean {
     log(`presentation stalled ${Math.round(stalledMs)}ms — clock re-anchored`, 'warn');
   }
   if (diff < -250) {
-    try {
-      queue.shift()!.frame.close();
-    } catch {
-      /* ignore */
+    // This frame is late. Skip it to catch up ONLY if there is a fresher frame
+    // behind it worth jumping to. If it is the newest frame we have — which is
+    // what happens when the decoder can't keep up in realtime (slower phones on
+    // a 25fps+ stream) — present it anyway. Dropping the last frame left the
+    // canvas black and only flashed when a frame happened to land on time.
+    if (queue.length > 1) {
+      try {
+        queue.shift()!.frame.close();
+      } catch {
+        /* ignore */
+      }
+      return tryPresentOne();
     }
-    return tryPresentOne();
+    // Persistently behind: re-anchor the clock onto this frame so audio realigns
+    // to what the decoder can actually deliver, instead of drifting further ahead
+    // and dropping every frame forever.
+    if (audioAnchorMediaMs !== null) {
+      audioAnchorEpochMs = nowEpochMs();
+      audioAnchorMediaMs = f.pts;
+    } else {
+      clockCalibrated = true;
+      wallStart = performance.now();
+      ptsStart = f.pts;
+    }
   }
   calibrate(f.pts);
   queue.shift();
