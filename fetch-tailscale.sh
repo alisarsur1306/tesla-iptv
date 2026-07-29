@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # Downloads the static tailscale/tailscaled binaries into the project root.
-# Skipped entirely when TS_AUTHKEY is unset, so builds without an exit node stay fast.
+#
+# Always downloads, deliberately. Skipping this when TS_AUTHKEY is unset at BUILD
+# time is a trap: adding the key later only restarts the service, it does not
+# rebuild, so the start script finds no ./tailscaled and the deploy dies while
+# Render keeps serving the old instance. 30MB per build is worth avoiding that.
 set -euo pipefail
-
-if [ -z "${TS_AUTHKEY:-}" ]; then
-  echo "TS_AUTHKEY unset — skipping Tailscale download"
-  exit 0
-fi
 
 VER="${TS_VERSION:-1.98.9}"
 TARBALL="tailscale_${VER}_amd64.tgz"
