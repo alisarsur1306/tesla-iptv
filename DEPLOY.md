@@ -50,6 +50,32 @@ Leaving `TS_AUTHKEY` unset skips the whole mechanism: no Tailscale download at
 build time, and the app talks to upstream directly. That's the right setting for
 local use, where `car-tv-on.bat` already runs from a residential IP.
 
+### Troubleshooting the exit node
+
+Every failure below looks identical from the browser — a Cloudflare "you have
+been blocked" page — because whenever the tunnel isn't actually carrying
+traffic, requests silently fall back to Render's own (blocked) IP. Check in this
+order:
+
+| Symptom in Render logs | Cause | Fix |
+|---|---|---|
+| `netmap: suggested exit node:  ()` | No **approved** exit node exists — or the approved one is offline | `tailscale exit-node list` on any tailnet machine; a node showing `offline` is the culprit |
+| `invalid key: API key … not valid` | An **API access token** was used instead of an **auth key** | Generate under *Auth keys*; the value must start with `tskey-auth-` |
+| Works once, fails after the next restart | Auth key is not **Reusable** | Regenerate with Reusable ON — Render's free tier restarts constantly |
+| `./tailscaled: not found` / deploy dies, old instance keeps serving | Binaries missing | `fetch-tailscale.sh` now always downloads, so this shouldn't recur |
+
+Two traps worth stating explicitly:
+
+- **Advertising is not approving.** `tailscale set --advertise-exit-node` only
+  *offers* the machine. It stays unusable until someone ticks **Use as exit
+  node** in the admin console (Machines → ⋯ → Edit route settings). A machine
+  never lists *itself* in `tailscale exit-node list`, so check from another
+  machine or the console.
+- **An offline exit node fails silently.** Tailscale accepts a dead node and
+  blackholes through it, and the log line `Tailscale up; routing Xtream host via
+  exit node …` is only this script echoing what it *requested* — not proof the
+  route works. Trust `tailscale exit-node list`, not that line.
+
 ## Using it in the Tesla
 
 - Open `https://<your-app>.onrender.com/?key=<ACCESS_KEY>` **once** in the
