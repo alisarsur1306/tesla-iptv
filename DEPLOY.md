@@ -18,32 +18,37 @@ credentials and the access key are environment variables.
      strangers can't use your deployment (or your 1-connection account).
 5. Deploy. Render runs `npm install && npm run build`, then `node server.js`.
 
-## Required: the Cloudflare Worker
+## Required: a Tailscale exit node
 
 The Xtream provider sits behind Cloudflare, which **blocks Render's datacenter
-IPs**. Without a workaround the app boots and serves the UI, then fails at login
-with a Cloudflare "you have been blocked" page. Cloudflare does **not** block
-requests coming from its own network, so a tiny Cloudflare Worker fetches the
-Xtream host and relays the reply.
+IPs**. Without an exit node the app boots and serves the UI, then fails at login
+with a Cloudflare "you have been blocked" page. No code change can fix this — the
+requests have to leave from a residential IP.
 
-Only the Xtream API host goes through the Worker. It returns the origin's 3xx
-redirect rather than following it, so the CDN hop that carries the actual video
-is fetched **directly** from Render — the Worker only ever relays small
-redirects and the login JSON, never the stream.
+Only the Xtream API host is routed this way. Segments redirect to a CDN that does
+*not* block datacenter IPs, and its tokens are not IP-bound, so video streams
+direct from Render. Measured: ~3 KB per playlist refresh over the tunnel versus
+~2 MB per segment direct — the exit node carries metadata, never the video.
 
-1. Deploy the Worker (free Cloudflare account): see
-   [`cloudflare-worker/README.md`](cloudflare-worker/README.md). It prints a URL
-   like `https://tesla-iptv-xtream-proxy.<subdomain>.workers.dev`.
-2. Add two environment variables in Render:
-   - `XTREAM_PROXY_URL` — the Worker URL from `wrangler deploy`
-   - `XTREAM_PROXY_TOKEN` — the same token you set with `wrangler secret put PROXY_TOKEN`
+1. Install Tailscale on a device that is always on at home (an Android TV, Pi, or
+   NAS all work — it only handles a few KB per refresh).
+2. Advertise it as an exit node, and approve it in the Tailscale admin console
+   under **Machines → … → Edit route settings → Use as exit node**.
+3. Generate a **reusable, ephemeral** auth key (Settings → Keys). Ephemeral means
+   the Render node removes itself when the free tier sleeps, instead of piling up
+   stale machines.
+4. Add two more environment variables in Render:
+   - `TS_AUTHKEY` — the auth key from step 3
+   - `TS_EXIT_NODE` — the exit node's tailnet name or IP, e.g. `android-tv`
 
-Leaving `XTREAM_PROXY_URL` unset skips the Worker and talks to upstream directly
-— correct for local use, where `car-tv-on.bat` already runs from a residential
-IP, but it will hit the Cloudflare block from Render.
+Auth keys expire after at most 90 days. When yours does, the service will start
+but log `tailscale failed to come up` and upstream requests will be blocked again
+— generate a new key and update `TS_AUTHKEY`. Use an OAuth client with a tag if
+you want something that doesn't expire.
 
-The Cloudflare Worker free tier allows 100,000 requests/day; this uses a tiny
-fraction of that (one request per playlist refresh, none for video).
+Leaving `TS_AUTHKEY` unset skips the whole mechanism: no Tailscale download at
+build time, and the app talks to upstream directly. That's the right setting for
+local use, where `car-tv-on.bat` already runs from a residential IP.
 
 ## Using it in the Tesla
 

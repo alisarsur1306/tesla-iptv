@@ -34,37 +34,29 @@ for (const u of ['http://45.139.122.205:5566/hlsr/abc.ts', 'http://some-new-cdn.
   assert.notEqual(status, 403, `${u} should not be gate-blocked (got ${body})`);
 }
 
-// XTREAM_PROXY_URL (the Worker) must relay ONLY the Xtream API host, with the
-// shared token, and as ?u=<target>. Video segments redirect to a CDN that does
-// not block datacenter IPs, so they must stay direct — never touch the Worker.
-const seenByWorker = [];
-const stubWorker = http.createServer((req, res) => {
-  seenByWorker.push(req.url);
+// UPSTREAM_PROXY must route ONLY the Xtream API host. Video segments redirect to a
+// CDN that does not block datacenter IPs, so they must stay direct — otherwise the
+// whole stream would run over the exit node's home uplink.
+const seenByProxy = [];
+const stubProxy = http.createServer((req, res) => {
+  seenByProxy.push(req.url);
   res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl' });
   res.end('#EXTM3U\n');
 });
-await new Promise((r) => stubWorker.listen(0, '127.0.0.1', r));
-process.env.XTREAM_PROXY_URL = `http://127.0.0.1:${stubWorker.address().port}/`;
-process.env.XTREAM_PROXY_TOKEN = 'tok-abc';
+await new Promise((r) => stubProxy.listen(0, '127.0.0.1', r));
+process.env.UPSTREAM_PROXY = `127.0.0.1:${stubProxy.address().port}`;
 
 await call('http://mhd.snapmediatoghater.site:8080/player_api.php', 'test-key-123');
-assert.equal(seenByWorker.length, 1, 'Xtream API host must go through the Worker');
-const workerReq = new URL(seenByWorker[0], 'http://x');
-assert.match(
-  decodeURIComponent(workerReq.searchParams.get('u') || ''),
-  /snapmediatoghater\.site/,
-  'Worker must receive the Xtream URL as ?u=',
-);
-assert.equal(workerReq.searchParams.get('t'), 'tok-abc', 'Worker must receive the shared token');
+assert.equal(seenByProxy.length, 1, 'Xtream API host must go through UPSTREAM_PROXY');
+assert.match(seenByProxy[0], /snapmediatoghater\.site/);
 
-// A CDN host must bypass the Worker entirely (this one fails to resolve, which is
-// fine — the assertion is that the Worker never saw it).
+// A CDN host must bypass the proxy entirely (this one fails to resolve, which is
+// fine — the assertion is that the proxy never saw it).
 await call('http://45.139.122.205:5566/hlsr/x.ts', 'test-key-123');
-assert.equal(seenByWorker.length, 1, `CDN traffic must bypass the Worker, saw: ${seenByWorker[1]}`);
+assert.equal(seenByProxy.length, 1, `CDN traffic must bypass the proxy, saw: ${seenByProxy[1]}`);
 
-stubWorker.close();
-delete process.env.XTREAM_PROXY_URL;
-delete process.env.XTREAM_PROXY_TOKEN;
+stubProxy.close();
+delete process.env.UPSTREAM_PROXY;
 
 server.close();
 console.log('hlsProxy gate + routing checks passed');

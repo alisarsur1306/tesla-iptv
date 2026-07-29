@@ -1,4 +1,5 @@
-// HLS / IPTV proxy for Node http servers. Uses Node's built-in fetch throughout.
+// HLS / IPTV proxy for Node http servers. Uses undici (the same HTTP stack Node's
+// global fetch is built on) for its ProxyAgent — see UPSTREAM_PROXY below.
 // Usage: handleProxy(req, res) for GET /api/proxy?u=<urlencoded absolute URL>[&key=...]
 //
 // Security model (so a public deployment is not an open proxy):
@@ -11,58 +12,67 @@
 //   playback the moment that changes. Keep ACCESS_KEY long and random.
 // - Playlist rewriting propagates the incoming `key` param into every rewritten
 //   /api/proxy?u=... URL (segments, sub-playlists, EXT-X-KEY URIs).
-// - XTREAM_PROXY_URL (optional): a Cloudflare Worker that re-fetches the Xtream
-//   API host from Cloudflare's edge. The Xtream host blocks datacenter IPs (so a
-//   cloud deploy is refused), but not requests originating from Cloudflare. Only
-//   the Xtream host is routed through it; it returns the origin's 3xx redirect so
-//   the CDN hop that follows goes DIRECT from this server. See DEPLOY.md.
+// - UPSTREAM_PROXY (optional): HTTP proxy used ONLY for the Xtream API host, so a
+//   cloud deployment can borrow a residential IP for the few requests Cloudflare
+//   blocks. Video segments always go direct. See DEPLOY.md.
 
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { readFileSync } from 'node:fs';
+// undici's fetch is used ONLY for requests routed through the Tailscale proxy
+// (plain HTTP to the Xtream host). Direct traffic uses Node's built-in fetch:
+// undici 8.7's standalone agent crashes the process with an uncaught TypeError
+// in closeClientIfUnused when an HTTP/2 CDN connection closes after streaming.
+import { fetch as undiciFetch, ProxyAgent } from 'undici';
 
 const TIMEOUT_MS = 25_000;
 const USER_AGENT =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 
-// Only the Xtream API host is routed through the Worker; it is the one host
-// Cloudflare blocks for datacenter IPs. Segments redirect to CDNs that do not
-// block datacenter IPs and whose tokens are not IP-bound, so they go direct —
-// keeping the video off the Worker (which then only relays tiny redirects/JSON).
+// Hosts reached through UPSTREAM_PROXY when it is set. Only the Xtream API host
+// belongs here: it sits behind Cloudflare, which blocks datacenter IPs, so on a
+// cloud deployment those requests must exit via a residential IP (see DEPLOY.md).
+// Segments redirect to a CDN that does NOT block datacenter IPs and whose tokens
+// are not IP-bound, so they go direct — keeping the video off the tunnel.
 const PROXY_HOST_SUFFIXES = ['snapmediatoghater.site'];
 
-/** Worker base URL that re-fetches the Xtream host from Cloudflare. '' = direct. */
-function getXtreamProxyUrl() {
-  return process.env.XTREAM_PROXY_URL || '';
+/** HTTP proxy for Cloudflare-blocked hosts, e.g. '127.0.0.1:1055'. Unset = direct. */
+function getUpstreamProxy() {
+  return process.env.UPSTREAM_PROXY || '';
 }
 
 function shouldProxy(hostname) {
-  if (!getXtreamProxyUrl()) return false;
+  if (!getUpstreamProxy()) return false;
   const h = hostname.toLowerCase();
   return PROXY_HOST_SUFFIXES.some((s) => h === s || h.endsWith('.' + s));
 }
 
-/** Wrap a target URL as a call to the Worker: <worker>?u=<target>&t=<token>. */
-function toWorkerUrl(target) {
-  const base = getXtreamProxyUrl();
-  const token = process.env.XTREAM_PROXY_TOKEN || '';
-  let out = `${base}${base.includes('?') ? '&' : '?'}u=${encodeURIComponent(target)}`;
-  if (token) out += `&t=${encodeURIComponent(token)}`;
-  return out;
+let cachedAgent = null;
+let cachedAgentFor = '';
+function proxyAgent() {
+  const spec = getUpstreamProxy();
+  if (cachedAgentFor !== spec) {
+    cachedAgent = new ProxyAgent(spec.includes('://') ? spec : `http://${spec}`);
+    cachedAgentFor = spec;
+  }
+  return cachedAgent;
 }
 
 /**
- * fetch() that follows redirects manually so each hop is routed independently:
- * the Xtream host goes through the Worker, and the CDN it redirects to is then
- * fetched DIRECTLY (CDN isn't blocked). Following redirects inside fetch would
- * send the whole video stream through the Worker. SSRF guard re-checked per hop.
+ * fetch() with per-hop client selection. Redirects are followed manually:
+ * Xtream playlist URLs 302 to an HTTPS CDN, and letting undici follow that
+ * redirect itself lands the CDN connection on undici's H2 client — whose idle
+ * close crashes the process (agent.js closeClientIfUnused TypeError). Each hop
+ * therefore re-picks: undici+proxy for the Xtream host, built-in fetch for
+ * everything else. Also re-checks the SSRF guard on every hop.
  */
 async function upstreamFetch(target, options) {
   let url = target;
   for (let hop = 0; hop < 5; hop++) {
     if (isForbiddenHostname(url.hostname)) throw new Error('Redirect to forbidden host');
-    const fetchUrl = shouldProxy(url.hostname) ? toWorkerUrl(url.toString()) : url.toString();
-    const resp = await globalThis.fetch(fetchUrl, { ...options, redirect: 'manual' });
+    const resp = shouldProxy(url.hostname)
+      ? await undiciFetch(url.toString(), { ...options, dispatcher: proxyAgent(), redirect: 'manual' })
+      : await globalThis.fetch(url.toString(), { ...options, redirect: 'manual' });
     const location = resp.status >= 300 && resp.status < 400 && resp.headers.get('location');
     if (!location) return resp;
     try {

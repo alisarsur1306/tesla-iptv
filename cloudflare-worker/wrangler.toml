@@ -1,6 +1,0 @@
-name = "tesla-iptv-xtream-proxy"
-main = "worker.js"
-compatibility_date = "2026-07-01"
-
-# PROXY_TOKEN is a secret, set with:  wrangler secret put PROXY_TOKEN
-# (do NOT put it here — this file is committed).
