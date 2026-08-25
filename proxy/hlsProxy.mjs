@@ -25,7 +25,15 @@ import { readFileSync } from 'node:fs';
 // in closeClientIfUnused when an HTTP/2 CDN connection closes after streaming.
 import { fetch as undiciFetch, ProxyAgent } from 'undici';
 
+// Connect timeout for a streaming request: it covers the handshake only and is
+// cleared once the headers arrive, because a live channel's body never ends.
 const TIMEOUT_MS = 25_000;
+// Whole-response timeout for a bulk list download (the Xtream player_api channel
+// lists and the M3U playlist). Those are megabytes of JSON pulled through the
+// upstream proxy in one shot, so the streaming budget was routinely too short and
+// the client got "Channel list failed" instead of a channel list. Streaming is
+// unaffected — it keeps TIMEOUT_MS.
+const LIST_TIMEOUT_MS = 90_000;
 const USER_AGENT =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 
@@ -277,7 +285,7 @@ async function getM3uChannels() {
     const resp = await upstreamFetch(new URL(src.value), {
       redirect: 'follow',
       headers: { 'User-Agent': USER_AGENT, Accept: '*/*' },
-      signal: AbortSignal.timeout(TIMEOUT_MS),
+      signal: AbortSignal.timeout(LIST_TIMEOUT_MS),
     });
     if (!resp.ok) throw new Error(`M3U fetch failed (${resp.status})`);
     text = await resp.text();
@@ -285,6 +293,39 @@ async function getM3uChannels() {
   m3uCache = parseM3u(text);
   m3uCacheAt = Date.now();
   return m3uCache;
+}
+
+/**
+ * Shape parsed M3U channels as the Xtream response the client expects for
+ * `action`. The channel's array index is its opaque stream id.
+ */
+function shapeM3uAs(channels, action) {
+  if (action === 'get_live_categories') {
+    const seen = new Set();
+    const data = [];
+    for (const c of channels) {
+      if (seen.has(c.group)) continue;
+      seen.add(c.group);
+      data.push({ category_id: c.group, category_name: c.group });
+    }
+    return data;
+  }
+  if (action === 'get_live_streams') {
+    return channels.map((c, i) => ({
+      stream_id: i,
+      name: c.name,
+      stream_icon: c.logo,
+      category_id: c.group,
+    }));
+  }
+  return { user_info: { auth: 1, status: 'Active' } }; // login: always active
+}
+
+/** The M3U answer for `action`, or null when no M3U source is configured. */
+async function m3uResponse(action) {
+  const channels = await getM3uChannels();
+  if (!channels) return null;
+  return shapeM3uAs(channels, action);
 }
 
 /** Which source is configured — Xtream takes priority when both are set. */
@@ -308,18 +349,56 @@ function keyGate(req, res, url) {
   return true;
 }
 
-/** Fetch a player_api.php action server-side and return the parsed JSON. */
+// The player_api actions that download the whole channel list (as opposed to the
+// tiny login probe): slow, big, and worth both the long timeout and the cache.
+const LIST_ACTIONS = new Set(['get_live_streams', 'get_live_categories']);
+
+// player_api responses are cached for 30 minutes, matching M3U_TTL_MS. The list
+// changes rarely but every page load asked for it again, re-paying a multi-
+// megabyte download through the upstream proxy — the reason the channel list
+// timed out under load. Entries are kept past their TTL on purpose: a stale list
+// still beats an error when the upstream is down (see handleXtreamApi).
+const XTREAM_TTL_MS = 30 * 60 * 1000;
+const xtreamCache = new Map(); // action -> { at, data }
+const xtreamInflight = new Map(); // action -> Promise, so parallel callers share one fetch
+
+/** The cached response for `action` regardless of age, or undefined. */
+function staleXtreamResponse(action) {
+  return xtreamCache.get(action)?.data;
+}
+
+/** Fetch a player_api.php action server-side and return the parsed JSON (cached). */
 async function xtreamApi(creds, action) {
+  const hit = xtreamCache.get(action);
+  if (hit && Date.now() - hit.at < XTREAM_TTL_MS) return hit.data;
+  // A second request arriving while the first is still downloading must not
+  // start its own — that is how one slow list turns into several.
+  const inflight = xtreamInflight.get(action);
+  if (inflight) return inflight;
+
   const base = `${creds.server}/player_api.php?username=${encodeURIComponent(creds.username)}&password=${encodeURIComponent(creds.password)}`;
   const url = new URL(action ? `${base}&action=${action}` : base);
-  const resp = await upstreamFetch(url, {
-    redirect: 'follow',
-    headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' },
-    signal: AbortSignal.timeout(TIMEOUT_MS),
-  });
-  if (!resp.ok) throw new Error(`upstream ${resp.status}`);
-  return resp.json();
+  const pending = (async () => {
+    const resp = await upstreamFetch(url, {
+      redirect: 'follow',
+      headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' },
+      signal: AbortSignal.timeout(LIST_ACTIONS.has(action) ? LIST_TIMEOUT_MS : TIMEOUT_MS),
+    });
+    if (!resp.ok) throw new Error(`upstream ${resp.status}`);
+    const data = await resp.json();
+    xtreamCache.set(action, { at: Date.now(), data });
+    return data;
+  })().finally(() => xtreamInflight.delete(action));
+
+  xtreamInflight.set(action, pending);
+  return pending;
 }
+
+// Which source produced the channel list the client is currently holding.
+// /api/stream ids are source-specific (an Xtream stream_id vs. the channel's
+// index in the parsed M3U), so a list served from the M3U fallback must also be
+// played from the M3U. Reset as soon as Xtream serves a list again.
+let liveListSource = null; // 'xtream' | 'm3u' | null
 
 /**
  * GET /api/xt?action=get_live_streams|get_live_categories  (login = no action)
@@ -343,42 +422,45 @@ export async function handleXtreamApi(req, res) {
   if (!keyGate(req, res, url)) return;
 
   const action = url.searchParams.get('action') || '';
-  const allowed = new Set(['', 'get_live_streams', 'get_live_categories']);
-  if (!allowed.has(action)) return sendError(res, 400, 'Unsupported action');
+  if (action !== '' && !LIST_ACTIONS.has(action)) return sendError(res, 400, 'Unsupported action');
 
   const source = getSourceType();
   if (!source) return sendError(res, 503, 'Server has no IPTV source configured');
 
-  try {
-    if (source === 'm3u') {
-      // Present the M3U as the same shapes the client already expects from
-      // Xtream — the channel's array index is its opaque stream id.
-      const channels = await getM3uChannels();
-      let data;
-      if (action === 'get_live_categories') {
-        const seen = new Set();
-        data = [];
-        for (const c of channels) {
-          if (seen.has(c.group)) continue;
-          seen.add(c.group);
-          data.push({ category_id: c.group, category_name: c.group });
-        }
-      } else if (action === 'get_live_streams') {
-        data = channels.map((c, i) => ({
-          stream_id: i,
-          name: c.name,
-          stream_icon: c.logo,
-          category_id: c.group,
-        }));
-      } else {
-        data = { user_info: { auth: 1, status: 'Active' } }; // login: always active
-      }
+  if (source === 'm3u') {
+    try {
+      const data = await m3uResponse(action);
+      if (action === 'get_live_streams') liveListSource = 'm3u';
       return sendJsonBody(res, data);
+    } catch (err) {
+      return sendError(res, 502, `Channel list failed: ${String(err && err.message ? err.message : err)}`);
     }
+  }
 
-    // Xtream: server-side player_api call.
-    return sendJsonBody(res, await xtreamApi(getXtreamCreds(), action));
+  // Xtream: server-side player_api call, cached for XTREAM_TTL_MS.
+  try {
+    const data = await xtreamApi(getXtreamCreds(), action);
+    if (action === 'get_live_streams') liveListSource = 'xtream';
+    return sendJsonBody(res, data);
   } catch (err) {
+    // Xtream is down or too slow. Rather than leave the car with no channels,
+    // fall back in order of fidelity: the last list we saw (stale, but the real
+    // account), then the M3U playlist (M3U_URL, else public/playlist.m3u).
+    const stale = staleXtreamResponse(action);
+    if (stale !== undefined) {
+      if (action === 'get_live_streams') liveListSource = 'xtream';
+      return sendJsonBody(res, stale);
+    }
+    let fallback = null;
+    try {
+      fallback = await m3uResponse(action);
+    } catch {
+      /* the playlist is unreadable too — report the Xtream failure below */
+    }
+    if (fallback !== null) {
+      if (action === 'get_live_streams') liveListSource = 'm3u';
+      return sendJsonBody(res, fallback);
+    }
     sendError(res, 502, `Channel list failed: ${String(err && err.message ? err.message : err)}`);
   }
 }
@@ -400,7 +482,9 @@ export async function handleStream(req, res) {
   if (!source) return sendError(res, 503, 'Server has no IPTV source configured');
 
   let upstreamUrl;
-  if (source === 'm3u') {
+  // The M3U path also covers an Xtream deployment whose last channel list came
+  // from the fallback: those ids are M3U indexes, not Xtream stream ids.
+  if (source === 'm3u' || liveListSource === 'm3u') {
     // The id is the channel's index in the parsed M3U; look up its stream URL.
     let channels;
     try {
