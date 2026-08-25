@@ -76,6 +76,25 @@ Two traps worth stating explicitly:
   exit node …` is only this script echoing what it *requested* — not proof the
   route works. Trust `tailscale exit-node list`, not that line.
 
+## When the channel list is slow or Xtream is down
+
+The channel list is the one big download the app makes (megabytes of JSON,
+pulled through the exit node). Three things keep it from stranding the car:
+
+- **Cached for 30 minutes.** The first request pays for the download; every
+  page load inside that window is answered from memory, and concurrent requests
+  share a single upstream fetch instead of each starting their own.
+- **A 90 s budget.** List downloads get their own timeout, separate from the
+  25 s connect timeout used for playback, because a slow list is still a usable
+  list. Streaming behaviour is unchanged.
+- **A playlist fallback.** When Xtream fails outright, the last list it served
+  is reused; if there isn't one, the app serves an M3U channel list instead —
+  `M3U_URL` if set, else `public/playlist.m3u`. Channels then play from the
+  playlist's own URLs, so a fallback list is playable, not just visible. To get
+  that safety net on Render, set `M3U_URL`: `public/playlist.m3u` is untracked
+  (like `config.json`), so it only exists in local dev. With no M3U source at
+  all, a hard Xtream failure still returns an error.
+
 ## Using it in the Tesla
 
 - Open `https://<your-app>.onrender.com/?key=<ACCESS_KEY>` **once** in the
