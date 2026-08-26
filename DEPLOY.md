@@ -18,17 +18,48 @@ credentials and the access key are environment variables.
      strangers can't use your deployment (or your 1-connection account).
 5. Deploy. Render runs `npm install && npm run build`, then `node server.js`.
 
-## Required: a Tailscale exit node
+## Reaching the Xtream host from a datacenter
 
 The Xtream provider sits behind Cloudflare, which **blocks Render's datacenter
-IPs**. Without an exit node the app boots and serves the UI, then fails at login
-with a Cloudflare "you have been blocked" page. No code change can fix this — the
-requests have to leave from a residential IP.
+IPs**. Without a way around that, the app boots and serves the UI, then fails at
+login with a Cloudflare "you have been blocked" page. There are three ways to
+give it a non-blocked path; the app supports all three and picks in this order:
 
-Only the Xtream API host is routed this way. Segments redirect to a CDN that does
-*not* block datacenter IPs, and its tokens are not IP-bound, so video streams
-direct from Render. Measured: ~3 KB per playlist refresh over the tunnel versus
-~2 MB per segment direct — the exit node carries metadata, never the video.
+| Env var | Route | Needs |
+| --- | --- | --- |
+| `XTREAM_PROXY_URL` | A Cloudflare Worker re-fetches the host from Cloudflare's own network, which the origin does not block | A free Cloudflare account. No hardware. |
+| `UPSTREAM_PROXY` | An HTTP proxy borrows a non-datacenter IP — a Tailscale exit node at home, or a commercial residential proxy | An always-on device, or a few $/month |
+| *(neither set)* | Direct from Render | Only works if the origin stops blocking |
+
+`XTREAM_PROXY_URL` wins when both are set, so you can leave the Tailscale vars
+configured while testing the Worker and fall back by clearing one variable.
+
+**The Worker** — see `cloudflare-worker/README.md`. Deploy it, then set
+`XTREAM_PROXY_URL` and `XTREAM_PROXY_TOKEN` in Render. Note its central claim
+(that Cloudflare's edge is not blocked) has never been confirmed against the
+live origin; the README says how to check in one request.
+
+**A commercial residential proxy** needs no code and no hardware — set
+
+```
+UPSTREAM_PROXY=http://user:pass@proxy-host:port
+```
+
+Credentials in that URL are honoured (undici's `ProxyAgent` turns them into a
+`proxy-authorization` header). Clear `TS_AUTHKEY` so the start script skips
+Tailscale and leaves your `UPSTREAM_PROXY` value alone.
+
+Either way, only the Xtream API host is routed. Segments redirect to a CDN that
+does *not* block datacenter IPs, and its tokens are not IP-bound, so video
+streams direct from Render — the detour carries metadata, never the video.
+
+## Option: a Tailscale exit node
+
+This routes the Xtream host out through a device at home, so the requests leave
+from a residential IP. Measured: ~3 KB per playlist refresh over the tunnel
+versus ~2 MB per segment direct — the exit node carries metadata, never the
+video. Skip this section if you are using `XTREAM_PROXY_URL` or a commercial
+residential proxy instead.
 
 1. Install Tailscale on a device that is always on at home (an Android TV, Pi, or
    NAS all work — it only handles a few KB per refresh).

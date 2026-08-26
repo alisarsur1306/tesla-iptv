@@ -12,9 +12,14 @@
 //   playback the moment that changes. Keep ACCESS_KEY long and random.
 // - Playlist rewriting propagates the incoming `key` param into every rewritten
 //   /api/proxy?u=... URL (segments, sub-playlists, EXT-X-KEY URIs).
-// - UPSTREAM_PROXY (optional): HTTP proxy used ONLY for the Xtream API host, so a
-//   cloud deployment can borrow a residential IP for the few requests Cloudflare
-//   blocks. Video segments always go direct. See DEPLOY.md.
+// - Two optional transports exist for the Xtream API host, which Cloudflare
+//   refuses to serve to datacenter IPs. Either one carries ONLY that host's
+//   small API/redirect requests; video segments always go direct. See DEPLOY.md.
+//     * XTREAM_PROXY_URL — a Cloudflare Worker that re-fetches the host from
+//       Cloudflare's own network (which the origin does not block). Needs no
+//       always-on hardware, so it wins when both are set.
+//     * UPSTREAM_PROXY — an HTTP proxy (a Tailscale exit node, or a commercial
+//       residential proxy) that borrows a non-datacenter IP.
 
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -49,10 +54,36 @@ function getUpstreamProxy() {
   return process.env.UPSTREAM_PROXY || '';
 }
 
-function shouldProxy(hostname) {
-  if (!getUpstreamProxy()) return false;
+/** Cloudflare Worker base URL that re-fetches the Xtream host. Unset = direct. */
+function getXtreamProxyUrl() {
+  return process.env.XTREAM_PROXY_URL || '';
+}
+
+function isXtreamHost(hostname) {
   const h = hostname.toLowerCase();
   return PROXY_HOST_SUFFIXES.some((s) => h === s || h.endsWith('.' + s));
+}
+
+/**
+ * How a request to `hostname` is carried: 'worker' | 'tunnel' | 'direct'.
+ * Only the Xtream host is ever diverted. The Worker wins when both transports
+ * are configured — it needs no always-on hardware, so it is the more reliable
+ * of the two; leaving UPSTREAM_PROXY set keeps the tunnel one env var away.
+ */
+function transportFor(hostname) {
+  if (!isXtreamHost(hostname)) return 'direct';
+  if (getXtreamProxyUrl()) return 'worker';
+  if (getUpstreamProxy()) return 'tunnel';
+  return 'direct';
+}
+
+/** Wrap a target URL as a call to the Worker: <worker>?u=<target>&t=<token>. */
+function toWorkerUrl(target) {
+  const base = getXtreamProxyUrl();
+  const token = process.env.XTREAM_PROXY_TOKEN || '';
+  let out = `${base}${base.includes('?') ? '&' : '?'}u=${encodeURIComponent(target)}`;
+  if (token) out += `&t=${encodeURIComponent(token)}`;
+  return out;
 }
 
 let cachedAgent = null;
@@ -67,22 +98,36 @@ function proxyAgent() {
 }
 
 /**
- * fetch() with per-hop client selection. Redirects are followed manually:
- * Xtream playlist URLs 302 to an HTTPS CDN, and letting undici follow that
- * redirect itself lands the CDN connection on undici's H2 client — whose idle
+ * fetch() with per-hop transport selection. Redirects are followed manually for
+ * two reasons: the Xtream host 302s to an HTTPS CDN that must be fetched DIRECTLY
+ * (otherwise the whole video would ride the Worker or the tunnel), and letting
+ * undici follow it lands the CDN connection on undici's H2 client — whose idle
  * close crashes the process (agent.js closeClientIfUnused TypeError). Each hop
- * therefore re-picks: undici+proxy for the Xtream host, built-in fetch for
- * everything else. Also re-checks the SSRF guard on every hop.
+ * therefore re-picks its transport and re-checks the SSRF guard.
  */
 async function upstreamFetch(target, options) {
   let url = target;
   for (let hop = 0; hop < 5; hop++) {
     if (isForbiddenHostname(url.hostname)) throw new Error('Redirect to forbidden host');
-    const resp = shouldProxy(url.hostname)
-      ? await undiciFetch(url.toString(), { ...options, dispatcher: proxyAgent(), redirect: 'manual' })
-      : await globalThis.fetch(url.toString(), { ...options, redirect: 'manual' });
+    const transport = transportFor(url.hostname);
+    let resp;
+    if (transport === 'worker') {
+      // The Worker is asked for the target; `url` stays the real one, so a
+      // relayed Location still resolves against the origin, not the Worker.
+      resp = await globalThis.fetch(toWorkerUrl(url.toString()), { ...options, redirect: 'manual' });
+    } else if (transport === 'tunnel') {
+      resp = await undiciFetch(url.toString(), { ...options, dispatcher: proxyAgent(), redirect: 'manual' });
+    } else {
+      resp = await globalThis.fetch(url.toString(), { ...options, redirect: 'manual' });
+    }
     const location = resp.status >= 300 && resp.status < 400 && resp.headers.get('location');
-    if (!location) return resp;
+    if (!location) {
+      // resp.url is the URL fetch was ASKED for — the Worker's, on a worker hop.
+      // Playlist rewriting resolves segment URLs against this, so record the
+      // origin URL that actually served the body.
+      Object.defineProperty(resp, 'realUrl', { value: url.toString() });
+      return resp;
+    }
     try {
       await resp.body?.cancel();
     } catch {
@@ -589,7 +634,7 @@ export async function handleProxy(req, res) {
   clearTimeout(connectTimer); // headers are in; the body may now stream forever
 
   const upstreamType = upstream.headers.get('content-type') || '';
-  const finalUrl = upstream.url || target.toString();
+  const finalUrl = upstream.realUrl || upstream.url || target.toString();
   const isPlaylist =
     /\.m3u8($|\?)/i.test(finalUrl) ||
     /\.m3u8($|\?)/i.test(target.toString()) ||
