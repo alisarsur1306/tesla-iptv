@@ -126,6 +126,36 @@ pulled through the exit node). Three things keep it from stranding the car:
   (like `config.json`), so it only exists in local dev. With no M3U source at
   all, a hard Xtream failure still returns an error.
 
+## Making the offline backup
+
+The caches above live in memory, and the free tier sleeps after ~15 min idle —
+so a cold start begins with nothing cached. A backup that survives that has to
+live outside the process, which is what `M3U_URL` is for.
+
+The server can now produce that file itself (it reaches Xtream through the exit
+node), so no second machine is involved:
+
+1. With `ACCESS_KEY` set, open in any browser and save the file:
+
+   ```
+   https://<your-app>.onrender.com/api/export.m3u?key=<ACCESS_KEY>
+   ```
+
+   It returns the live channel list as a plain M3U — names, logos, category
+   names, and one credentialed stream URL per channel.
+
+2. Host it somewhere Render can fetch, and set `M3U_URL` to that URL.
+3. Re-export whenever your provider's channel lineup changes.
+
+**Treat both the export URL and the hosted file as passwords.** Every line
+contains your Xtream username and password, which is why the endpoint refuses to
+run at all unless `ACCESS_KEY` is configured, and why the playlist must never be
+committed to this repo — it is public, and anything under `public/` is copied
+into `dist/` at build time and served without a key.
+
+Once `M3U_URL` is set, Xtream stays primary and this is only reached when Xtream
+fails. To fall straight to the backup instead, clear `XTREAM_SERVER`.
+
 ## Using it in the Tesla
 
 - Open `https://<your-app>.onrender.com/?key=<ACCESS_KEY>` **once** in the

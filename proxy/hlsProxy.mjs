@@ -511,6 +511,78 @@ export async function handleXtreamApi(req, res) {
 }
 
 /**
+ * GET /api/export.m3u?key=... — the live channel list as a plain M3U, for use as
+ * the offline backup (host it and point M3U_URL at it; see DEPLOY.md).
+ *
+ * This is the one endpoint that hands out the account in the clear: every line
+ * carries the credentialed stream URL. It is therefore refused outright unless
+ * ACCESS_KEY is configured — an open deployment must not be able to export it.
+ */
+export async function handleExportM3u(req, res) {
+  res.on('error', () => {});
+  const url = new URL(req.url || '/', 'http://localhost');
+  setCors(res);
+
+  if (!getRequiredKey()) {
+    return sendError(res, 403, 'Export requires ACCESS_KEY to be configured on the server');
+  }
+  if (!keyGate(req, res, url)) return;
+
+  const source = getSourceType();
+  if (!source) return sendError(res, 503, 'Server has no IPTV source configured');
+
+  try {
+    let channels;
+    if (source === 'm3u') {
+      channels = await getM3uChannels();
+    } else {
+      const creds = getXtreamCreds();
+      const [streams, categories] = await Promise.all([
+        xtreamApi(creds, 'get_live_streams'),
+        xtreamApi(creds, 'get_live_categories').catch(() => []),
+      ]);
+      // get_live_streams carries category_id; the readable name lives in
+      // get_live_categories. A missing categories call only costs group names.
+      const names = new Map(
+        (Array.isArray(categories) ? categories : []).map((c) => [String(c.category_id), c.category_name]),
+      );
+      channels = (Array.isArray(streams) ? streams : []).map((c) => ({
+        name: c.name || `Channel ${c.stream_id}`,
+        logo: c.stream_icon || '',
+        group: names.get(String(c.category_id)) || 'Uncategorized',
+        url: `${creds.server}/live/${encodeURIComponent(creds.username)}/${encodeURIComponent(creds.password)}/${c.stream_id}.ts`,
+      }));
+    }
+
+    const body = Buffer.from(buildM3u(channels || []), 'utf8');
+    res.writeHead(200, {
+      'Content-Type': 'audio/x-mpegurl; charset=utf-8',
+      'Content-Disposition': 'attachment; filename="playlist.m3u"',
+      'Content-Length': body.length,
+      'Cache-Control': 'no-store',
+    });
+    res.end(body);
+  } catch (err) {
+    sendError(res, 502, `Export failed: ${String(err && err.message ? err.message : err)}`);
+  }
+}
+
+/** Serialise channels as an M3U that parseM3u() can read back. */
+export function buildM3u(channels) {
+  const lines = ['#EXTM3U'];
+  for (const c of channels) {
+    const attrs = [];
+    if (c.logo) attrs.push(`tvg-logo="${String(c.logo).replace(/"/g, '')}"`);
+    attrs.push(`group-title="${String(c.group || 'Uncategorized').replace(/"/g, '')}"`);
+    // The name follows the last comma, so a comma inside it would split the
+    // entry when read back — parseM3u splits on lastIndexOf(',').
+    lines.push(`#EXTINF:-1 ${attrs.join(' ')},${String(c.name).replace(/\s*,\s*/g, ' ').trim()}`);
+    lines.push(c.url);
+  }
+  return lines.join('\n') + '\n';
+}
+
+/**
  * GET /api/stream?id=N  — stream live channel N. The credentialed upstream URL
  * is built here and handed to the existing proxy pipeline, so the browser only
  * ever sees the opaque channel id.
