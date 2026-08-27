@@ -4,6 +4,7 @@ export declare function handleProxy(req: IncomingMessage, res: ServerResponse): 
 export declare function handleXtreamApi(req: IncomingMessage, res: ServerResponse): Promise<void>;
 export declare function handleStream(req: IncomingMessage, res: ServerResponse): Promise<void>;
 export declare function handleExportM3u(req: IncomingMessage, res: ServerResponse): Promise<void>;
+export declare function handleDiag(req: IncomingMessage, res: ServerResponse): Promise<void>;
 export declare function buildM3u(channels: { name: string; logo?: string; group?: string; url: string }[]): string;
 export declare function isManaged(): boolean;
 export declare function parseM3u(text: string): { name: string; logo: string; group: string; url: string }[];
