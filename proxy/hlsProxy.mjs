@@ -511,6 +511,131 @@ export async function handleXtreamApi(req, res) {
 }
 
 /**
+ * Replace the account's secrets in text meant for display.
+ *
+ * Only DELIMITED occurrences are replaced. A plain substring swap corrupts the
+ * text it is supposed to make readable — a one-character username turns
+ * "Attention Required! | Cloudflare" into "Attention Req***ired! | Clo***dflare",
+ * destroying the diagnosis. Credentials always sit against a non-alphanumeric
+ * boundary where they matter (\"username\":\"x\", ?username=x&, /live/x/y/1.ts),
+ * so that is what is matched.
+ */
+function redact(text, creds) {
+  let out = String(text);
+  for (const secret of [creds?.username, creds?.password].filter(Boolean)) {
+    const escaped = String(secret).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    out = out.replace(new RegExp(`(^|[^A-Za-z0-9])${escaped}(?=[^A-Za-z0-9]|$)`, 'g'), '$1***');
+  }
+  return out;
+}
+
+/** Run one upstream probe and describe the outcome without ever throwing. */
+async function probe(name, run, creds) {
+  const started = Date.now();
+  try {
+    const { status, body } = await run();
+    return {
+      name,
+      ok: status >= 200 && status < 300,
+      status,
+      ms: Date.now() - started,
+      bytes: body.length,
+      // Enough to recognise a Cloudflare interstitial or an Xtream error, no more.
+      preview: redact(body.slice(0, 200).replace(/\s+/g, ' ').trim(), creds),
+    };
+  } catch (err) {
+    return {
+      name,
+      ok: false,
+      ms: Date.now() - started,
+      error: redact(String(err && err.message ? err.message : err), creds),
+    };
+  }
+}
+
+/**
+ * GET /api/diag?key=... — what the server sees when it talks upstream, right now.
+ *
+ * Exists because every failure so far has looked identical from the browser
+ * ("Channel list failed") whether the cause was a Cloudflare block, a dead exit
+ * node, a slow list, or missing configuration. This distinguishes them: which
+ * source and transport are in play, and what the upstream actually answers.
+ * Probes bypass the cache — a cached list would hide a broken upstream.
+ *
+ * Reports only whether each secret is SET, never its value, and redacts the
+ * account out of every upstream preview. Gated like the export.
+ */
+export async function handleDiag(req, res) {
+  res.on('error', () => {});
+  const url = new URL(req.url || '/', 'http://localhost');
+  setCors(res);
+
+  if (!getRequiredKey()) {
+    return sendError(res, 403, 'Diagnostics require ACCESS_KEY to be configured on the server');
+  }
+  if (!keyGate(req, res, url)) return;
+
+  const creds = getXtreamCreds();
+  const m3u = getM3uSource();
+  const out = {
+    source: getSourceType(),
+    env: {
+      XTREAM_SERVER: Boolean(process.env.XTREAM_SERVER),
+      XTREAM_USERNAME: Boolean(process.env.XTREAM_USERNAME),
+      XTREAM_PASSWORD: Boolean(process.env.XTREAM_PASSWORD),
+      M3U_URL: Boolean(process.env.M3U_URL),
+      UPSTREAM_PROXY: Boolean(process.env.UPSTREAM_PROXY),
+      XTREAM_PROXY_URL: Boolean(process.env.XTREAM_PROXY_URL),
+      ACCESS_KEY: true,
+    },
+    m3uSource: m3u ? m3u.kind : null,
+    cachedActions: [...xtreamCache.entries()].map(([action, v]) => ({
+      action: action || '(login)',
+      ageMs: Date.now() - v.at,
+    })),
+    checks: [],
+  };
+
+  if (creds) {
+    out.xtreamHost = new URL(creds.server).host;
+    out.transport = transportFor(new URL(creds.server).hostname);
+    const base = `${creds.server}/player_api.php?username=${encodeURIComponent(creds.username)}&password=${encodeURIComponent(creds.password)}`;
+    const hit = async (suffix, timeout) => {
+      const resp = await upstreamFetch(new URL(base + suffix), {
+        redirect: 'follow',
+        headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' },
+        signal: AbortSignal.timeout(timeout),
+      });
+      return { status: resp.status, body: await resp.text() };
+    };
+    out.checks.push(await probe('player_api login', () => hit('', TIMEOUT_MS), creds));
+    out.checks.push(
+      await probe('player_api get_live_streams', () => hit('&action=get_live_streams', LIST_TIMEOUT_MS), creds),
+    );
+  }
+
+  if (m3u) {
+    out.checks.push(
+      await probe(
+        `m3u fallback (${m3u.kind})`,
+        async () => {
+          if (m3u.kind === 'file') return { status: 200, body: readFileSync(m3u.value, 'utf8') };
+          const resp = await upstreamFetch(new URL(m3u.value), {
+            redirect: 'follow',
+            headers: { 'User-Agent': USER_AGENT, Accept: '*/*' },
+            signal: AbortSignal.timeout(LIST_TIMEOUT_MS),
+          });
+          return { status: resp.status, body: await resp.text() };
+        },
+        creds,
+      ),
+    );
+  }
+
+  sendJsonBody(res, out);
+}
+
+/**
  * GET /api/export.m3u?key=... — the live channel list as a plain M3U, for use as
  * the offline backup (host it and point M3U_URL at it; see DEPLOY.md).
  *

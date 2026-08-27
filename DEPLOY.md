@@ -126,6 +126,36 @@ pulled through the exit node). Three things keep it from stranding the car:
   (like `config.json`), so it only exists in local dev. With no M3U source at
   all, a hard Xtream failure still returns an error.
 
+## When it fails: find out why in one request
+
+Every upstream failure looks the same from the browser — "Channel list failed" —
+whether the cause is a Cloudflare block, a dead exit node, a slow list, or a
+missing environment variable. `/api/diag` tells them apart:
+
+```
+https://<your-app>.onrender.com/api/diag?key=<ACCESS_KEY>
+```
+
+It reports which source and transport are in play, which env vars are set (as
+booleans — never their values), what is cached and how old it is, and then
+probes each upstream live, bypassing the cache, with status, timing and the
+first 200 characters of the reply. A Cloudflare interstitial, an Xtream error
+and a timeout are then obvious at a glance.
+
+Read it like this:
+
+- `transport: "tunnel"` with a 403 whose preview says Cloudflare → the exit node
+  is not carrying the request (dead, or not actually selected).
+- `transport: "direct"` when you expected otherwise → neither `UPSTREAM_PROXY`
+  nor `XTREAM_PROXY_URL` is set, so requests leave from Render's own IP.
+- `player_api login` fine but `get_live_streams` slow or timing out → the list is
+  simply big and slow; that is what the cache and `LIST_TIMEOUT_MS` are for.
+- Every Xtream check failing while `m3u fallback` is `ok` → the backup is doing
+  its job; the channel list you see is coming from it.
+
+The account is redacted out of every preview, and the endpoint refuses to run
+unless `ACCESS_KEY` is configured.
+
 ## Making the offline backup
 
 The caches above live in memory, and the free tier sleeps after ~15 min idle —
