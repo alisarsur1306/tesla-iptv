@@ -739,6 +739,11 @@ export async function handleDiag(req, res) {
     checks: [],
   };
 
+  // ?quick=1 answers "how is this configured?" without the probes, which take up to
+  // LIST_TIMEOUT_MS each against an unresponsive provider — long enough that the diagnostic
+  // itself times out in most clients, exactly when it is most needed.
+  const quick = url.searchParams.get('quick') === '1';
+
   if (creds) {
     out.xtreamHost = new URL(creds.server).host;
     out.transport = transportFor(new URL(creds.server).hostname);
@@ -751,10 +756,28 @@ export async function handleDiag(req, res) {
       });
       return { status: resp.status, body: await resp.text() };
     };
-    out.checks.push(await probe('player_api login', () => hit('', TIMEOUT_MS), creds));
-    out.checks.push(
-      await probe('player_api get_live_streams', () => hit('&action=get_live_streams', LIST_TIMEOUT_MS), creds),
-    );
+    if (!quick) {
+      out.checks.push(await probe('player_api login', () => hit('', TIMEOUT_MS), creds));
+      out.checks.push(
+        await probe('player_api get_live_streams', () => hit('&action=get_live_streams', LIST_TIMEOUT_MS), creds),
+      );
+    }
+  }
+  if (quick) {
+    out.quick = true;
+    out.env.TS_AUTHKEY = Boolean(process.env.TS_AUTHKEY);
+    out.env.TS_EXIT_NODE = process.env.TS_EXIT_NODE || null;
+    out.upstreamProxy = process.env.UPSTREAM_PROXY
+      ? String(process.env.UPSTREAM_PROXY).replace(/\/\/[^@]*@/, '//***@')
+      : null;
+    out.note =
+      out.transport === 'tunnel'
+        ? 'All provider traffic is being forced through UPSTREAM_PROXY. If the tunnel or its exit node is down, every request fails here regardless of whether the provider is reachable.'
+        : out.transport === 'worker'
+          ? 'Provider traffic goes through the Cloudflare Worker.'
+          : 'Provider traffic leaves from this host\'s own IP.';
+    setCors(res);
+    return sendJsonBody(res, out);
   }
 
   if (m3u) {
