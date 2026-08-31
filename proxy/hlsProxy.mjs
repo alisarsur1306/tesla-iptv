@@ -434,7 +434,12 @@ const LIST_ACTIONS = new Set(['get_live_streams', 'get_live_categories']);
 // — so an app with a perfectly good M3U backup still took 90s per list, twice over, and looked
 // dead. One failure is enough to know: skip straight to the fallback for a cooldown, then try
 // again. This is what makes a broken exit node degrade into "slightly stale" rather than "down".
-const XTREAM_COOLDOWN_MS = 5 * 60 * 1000;
+// Short, because a background probe (below) is what actually detects recovery — this is only
+// the ceiling on how long we would stay pessimistic if every probe also failed.
+const XTREAM_COOLDOWN_MS = 60 * 1000;
+// One probe at a time while marked down, so a burst of requests does not become a burst of
+// upstream calls.
+let xtreamProbe = null;
 // How long a viewer may be made to wait for the provider when we already hold something to
 // show. The cooldown alone was not enough: it expires, the next request retries live, and that
 // one viewer pays the full 90s. Nobody should ever wait 90s for a list we could serve instantly
@@ -570,6 +575,16 @@ export async function handleXtreamApi(req, res) {
   // Xtream: server-side player_api call, cached for XTREAM_TTL_MS.
   // A cached answer is still served while Xtream is down — only the network call is skipped.
   if (xtreamIsDown()) {
+    // Recovery has to be noticed by trying, and nobody should wait for that trial. Probe in the
+    // background while this request is served from the fallback: a success calls
+    // noteXtreamSuccess() and clears the mark, so the very next request goes to the provider
+    // again. Without this, a provider that came back stayed "down" for the whole cooldown —
+    // which is exactly what a fixed exit node looked like from outside.
+    if (!xtreamProbe) {
+      xtreamProbe = xtreamApi(getXtreamCreds(), action)
+        .then(() => {}, () => {})
+        .finally(() => { xtreamProbe = null; });
+    }
     const cached = xtreamCache.get(action);
     if (cached) return sendJsonBody(res, cached.data);
     // Both routes are down, so BOTH reasons have to reach the caller. Reporting only the
