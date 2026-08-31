@@ -120,18 +120,22 @@ function proxyAgent() {
  */
 async function upstreamFetch(target, options) {
   let url = target;
+  // forceTunnel lets a diagnostic ask "what does the world see when we go through the tunnel?"
+  // about a host that is not itself on the tunnel list.
+  const { forceTunnel, ...fetchOptions } = options || {};
   for (let hop = 0; hop < 5; hop++) {
     if (isForbiddenHostname(url.hostname)) throw new Error('Redirect to forbidden host');
-    const transport = transportFor(url.hostname);
+    const transport =
+      forceTunnel && getUpstreamProxy() ? 'tunnel' : transportFor(url.hostname);
     let resp;
     if (transport === 'worker') {
       // The Worker is asked for the target; `url` stays the real one, so a
       // relayed Location still resolves against the origin, not the Worker.
-      resp = await globalThis.fetch(toWorkerUrl(url.toString()), { ...options, redirect: 'manual' });
+      resp = await globalThis.fetch(toWorkerUrl(url.toString()), { ...fetchOptions, redirect: 'manual' });
     } else if (transport === 'tunnel') {
-      resp = await undiciFetch(url.toString(), { ...options, dispatcher: proxyAgent(), redirect: 'manual' });
+      resp = await undiciFetch(url.toString(), { ...fetchOptions, dispatcher: proxyAgent(), redirect: 'manual' });
     } else {
-      resp = await globalThis.fetch(url.toString(), { ...options, redirect: 'manual' });
+      resp = await globalThis.fetch(url.toString(), { ...fetchOptions, redirect: 'manual' });
     }
     const location = resp.status >= 300 && resp.status < 400 && resp.headers.get('location');
     if (!location) {
@@ -857,6 +861,23 @@ export async function handleDiag(req, res) {
   }
   if (quick) {
     out.quick = true;
+    // What address does the provider actually see? The whole point of the tunnel is to leave
+    // from a residential IP, and nothing reported whether that was still true — so an exit node
+    // that quietly started routing through somewhere else (a VPN coming up on that machine, a
+    // changed default route) looked identical to a dead tunnel: requests simply stopped being
+    // answered. This turns that into one line.
+    try {
+      const ipRes = await upstreamFetch(new URL('https://api.ipify.org?format=json'), {
+        headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' },
+        signal: AbortSignal.timeout(10000),
+        forceTunnel: true,
+      });
+      const j = await ipRes.json().catch(() => ({}));
+      out.egressIp = j.ip || null;
+    } catch (e) {
+      out.egressIp = null;
+      out.egressIpError = String(e && e.message ? e.message : e);
+    }
     // The backup is a separate failure domain from the provider, and its config is the part
     // people get wrong: a stale URL, a token that cannot see the repo, a missing Bearer prefix.
     // Reporting the URL (which carries no credentials) plus the real status makes it a
