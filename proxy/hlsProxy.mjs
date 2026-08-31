@@ -1061,7 +1061,14 @@ export async function handleStream(req, res) {
         ? channels[wanted]
         : null);
     if (!chan) return sendError(res, 404, 'Unknown channel');
-    upstreamUrl = chan.url;
+    // The player decodes one continuous MPEG-TS response; it is not an HLS client. An Xtream
+    // panel serves the same channel either way, so a playlist written with .m3u8 URLs would
+    // otherwise hand the decoder a manifest and stall until the connect timeout. Normalise the
+    // Xtream stream shape to .ts and leave every other URL exactly as the playlist gave it.
+    upstreamUrl = String(chan.url).replace(
+      /^(https?:\/\/[^/]+\/(?:[^/?#]+\/){2}\d+)\.m3u8(\?|$)/i,
+      '$1.ts$2',
+    );
   } else {
     const creds = getXtreamCreds();
     upstreamUrl = `${creds.server}/live/${encodeURIComponent(creds.username)}/${encodeURIComponent(creds.password)}/${id}.ts`;

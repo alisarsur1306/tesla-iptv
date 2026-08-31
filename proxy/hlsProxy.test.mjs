@@ -141,5 +141,20 @@ delete process.env.UPSTREAM_PROXY;
   assert.equal(shaped[2].stream_id, 2, 'a URL with no id falls back to its position');
 }
 
+// --- stream URL format -----------------------------------------------------
+// The player consumes continuous MPEG-TS, not HLS, so an Xtream .m3u8 stream URL has to be
+// normalised to .ts or the decoder waits on a manifest it cannot read.
+{
+  const norm = (u) =>
+    String(u).replace(/^(https?:\/\/[^/]+\/(?:[^/?#]+\/){2}\d+)\.m3u8(\?|$)/i, '$1.ts$2');
+  assert.equal(norm('http://h:8080/USER/PASS/37312.m3u8'), 'http://h:8080/USER/PASS/37312.ts');
+  assert.equal(norm('http://h:8080/USER/PASS/37312.ts'), 'http://h:8080/USER/PASS/37312.ts');
+  assert.equal(
+    norm('http://h:8080/hls/chan/playlist.m3u8'),
+    'http://h:8080/hls/chan/playlist.m3u8',
+    'a non-Xtream HLS URL must be left alone',
+  );
+}
+
 server.close();
 console.log('hlsProxy gate + routing checks passed');
