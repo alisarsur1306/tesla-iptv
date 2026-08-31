@@ -430,6 +430,23 @@ const LIST_ACTIONS = new Set(['get_live_streams', 'get_live_categories']);
 // megabyte download through the upstream proxy — the reason the channel list
 // timed out under load. Entries are kept past their TTL on purpose: a stale list
 // still beats an error when the upstream is down (see handleXtreamApi).
+// When Xtream is unreachable, every request paid the full LIST_TIMEOUT_MS before falling back
+// — so an app with a perfectly good M3U backup still took 90s per list, twice over, and looked
+// dead. One failure is enough to know: skip straight to the fallback for a cooldown, then try
+// again. This is what makes a broken exit node degrade into "slightly stale" rather than "down".
+const XTREAM_COOLDOWN_MS = 2 * 60 * 1000;
+let xtreamDownUntil = 0;
+let xtreamLastError = '';
+const xtreamIsDown = () => Date.now() < xtreamDownUntil;
+function noteXtreamFailure(err) {
+  xtreamDownUntil = Date.now() + XTREAM_COOLDOWN_MS;
+  xtreamLastError = String(err && err.message ? err.message : err);
+}
+function noteXtreamSuccess() {
+  xtreamDownUntil = 0;
+  xtreamLastError = '';
+}
+
 const XTREAM_TTL_MS = 30 * 60 * 1000;
 const xtreamCache = new Map(); // action -> { at, data }
 const xtreamInflight = new Map(); // action -> Promise, so parallel callers share one fetch
@@ -459,6 +476,7 @@ async function xtreamApi(creds, action) {
     if (!resp.ok) throw new Error(`upstream ${resp.status}`);
     const data = await resp.json();
     xtreamCache.set(action, { at: Date.now(), data });
+    noteXtreamSuccess();
     return data;
   })().finally(() => xtreamInflight.delete(action));
 
@@ -530,11 +548,23 @@ export async function handleXtreamApi(req, res) {
   }
 
   // Xtream: server-side player_api call, cached for XTREAM_TTL_MS.
+  // A cached answer is still served while Xtream is down — only the network call is skipped.
+  if (xtreamIsDown()) {
+    const cached = xtreamCache.get(action);
+    if (cached) return sendJsonBody(res, cached.data);
+    const quick = await m3uResponse(action).catch(() => null);
+    if (quick !== null) {
+      if (action === 'get_live_streams') liveListSource = 'm3u';
+      return sendJsonBody(res, quick);
+    }
+    return sendError(res, 502, `Channel list failed: upstream unreachable (${xtreamLastError})`);
+  }
   try {
     const data = await xtreamApi(getXtreamCreds(), action);
     if (action === 'get_live_streams') liveListSource = 'xtream';
     return sendJsonBody(res, data);
   } catch (err) {
+    noteXtreamFailure(err);
     // Xtream is down or too slow. Rather than leave the car with no channels,
     // fall back in order of fidelity: the last list we saw (stale, but the real
     // account), then the M3U playlist (M3U_URL, else public/playlist.m3u).
@@ -637,6 +667,9 @@ export async function handleDiag(req, res) {
       ACCESS_KEY: true,
     },
     m3uSource: m3u ? m3u.kind : null,
+    xtreamDown: xtreamIsDown(),
+    xtreamLastError: xtreamLastError || null,
+    xtreamRetryInSec: xtreamIsDown() ? Math.ceil((xtreamDownUntil - Date.now()) / 1000) : 0,
     cachedActions: [...xtreamCache.entries()].map(([action, v]) => ({
       action: action || '(login)',
       ageMs: Date.now() - v.at,
