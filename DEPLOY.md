@@ -158,6 +158,35 @@ unless `ACCESS_KEY` is configured.
 
 ## Making the offline backup
 
+**The exported playlist contains your account.** Every line carries a stream URL with the
+username and password in it, which is why `public/playlist.m3u` is gitignored and why this
+repository — which is public — must never contain it. Host it somewhere private instead.
+
+1. Export it from the running server (it can reach Xtream through the exit node):
+
+       curl -fL -o playlist.m3u "https://<app>/api/export.m3u?key=<ACCESS_KEY>"
+
+2. Put that file in a **private** store. A private GitHub repo works and needs no extra
+   service — commit `playlist.m3u` to one, then create a fine-grained personal access token
+   limited to that repository with **Contents: read-only**.
+
+3. Point the server at it, using the contents API URL (not the web URL):
+
+       M3U_URL=https://api.github.com/repos/<owner>/<repo>/contents/playlist.m3u
+       M3U_AUTH=Bearer github_pat_...
+
+   `M3U_AUTH` is sent verbatim as the `Authorization` header, so `Basic <base64>` works just
+   as well for any other private host. The request offers `application/vnd.github.raw`, so a
+   contents URL returns the file rather than its JSON metadata.
+
+`/api/diag` reports `M3U_AUTH` as a boolean — it never echoes the token. A 401 or 403 is
+reported as the token being rejected; note that GitHub answers **404** for a repository the
+token cannot see, so a 404 with `M3U_AUTH` set usually means the token's scope, not the path.
+
+Refresh the backup by re-running step 1 and committing the new file whenever your channel
+lineup changes.
+
+
 The caches above live in memory, and the free tier sleeps after ~15 min idle —
 so a cold start begins with nothing cached. A backup that survives that has to
 live outside the process, which is what `M3U_URL` is for.

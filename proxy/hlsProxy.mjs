@@ -280,6 +280,22 @@ const M3U_TTL_MS = 30 * 60 * 1000; // re-fetch the playlist at most twice an hou
 let m3uCache = null;
 let m3uCacheAt = 0;
 
+// A playlist exported from this server contains the account in every stream URL, so the only
+// safe place to host it is somewhere private — which means the fetch needs to authenticate.
+// M3U_AUTH is sent verbatim as the Authorization header, so any scheme works:
+//   M3U_AUTH="Bearer ghp_..."   with a GitHub contents API URL (private repo)
+//   M3U_AUTH="Basic <base64>"   for anything using HTTP basic auth
+// The GitHub raw media type is offered first so a contents URL returns the file itself rather
+// than its JSON metadata; */* keeps every other host happy.
+export function m3uHeaders() {
+  const headers = {
+    'User-Agent': USER_AGENT,
+    Accept: 'application/vnd.github.raw, */*',
+  };
+  if (process.env.M3U_AUTH) headers.Authorization = process.env.M3U_AUTH;
+  return headers;
+}
+
 function getM3uSource() {
   if (process.env.M3U_URL) return { kind: 'url', value: process.env.M3U_URL };
   try {
@@ -330,10 +346,20 @@ async function getM3uChannels() {
   } else {
     const resp = await upstreamFetch(new URL(src.value), {
       redirect: 'follow',
-      headers: { 'User-Agent': USER_AGENT, Accept: '*/*' },
+      headers: m3uHeaders(),
       signal: AbortSignal.timeout(LIST_TIMEOUT_MS),
     });
-    if (!resp.ok) throw new Error(`M3U fetch failed (${resp.status})`);
+    if (!resp.ok) {
+      // 401/404 on a private host almost always means the token, not the file: GitHub returns
+      // 404 rather than 403 for a repo the credential cannot see, which reads as "wrong URL".
+      const hint =
+        resp.status === 401 || resp.status === 403
+          ? ' — M3U_AUTH was rejected'
+          : resp.status === 404 && process.env.M3U_AUTH
+            ? ' — not found, or M3U_AUTH cannot see it (private hosts often return 404 instead of 403)'
+            : '';
+      throw new Error(`M3U fetch failed (${resp.status})${hint}`);
+    }
     text = await resp.text();
   }
   m3uCache = parseM3u(text);
@@ -605,6 +631,7 @@ export async function handleDiag(req, res) {
       XTREAM_USERNAME: Boolean(process.env.XTREAM_USERNAME),
       XTREAM_PASSWORD: Boolean(process.env.XTREAM_PASSWORD),
       M3U_URL: Boolean(process.env.M3U_URL),
+      M3U_AUTH: Boolean(process.env.M3U_AUTH),
       UPSTREAM_PROXY: Boolean(process.env.UPSTREAM_PROXY),
       XTREAM_PROXY_URL: Boolean(process.env.XTREAM_PROXY_URL),
       ACCESS_KEY: true,

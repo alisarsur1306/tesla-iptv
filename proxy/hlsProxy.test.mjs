@@ -1,7 +1,7 @@
 // Smallest check that fails if the proxy's gate breaks: node proxy/hlsProxy.test.mjs
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { handleProxy } from './hlsProxy.mjs';
+import { handleProxy, m3uHeaders } from './hlsProxy.mjs';
 
 const server = http.createServer(handleProxy);
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
@@ -57,6 +57,33 @@ assert.equal(seenByProxy.length, 1, `CDN traffic must bypass the proxy, saw: ${s
 
 stubProxy.close();
 delete process.env.UPSTREAM_PROXY;
+
+// --- M3U_AUTH -------------------------------------------------------------
+// The exported playlist embeds the account in every stream URL, so it can only be
+// hosted somewhere private — which the fetch has to be able to authenticate to.
+{
+  const before = process.env.M3U_AUTH;
+
+  delete process.env.M3U_AUTH;
+  const anon = m3uHeaders();
+  assert.equal(anon.Authorization, undefined, 'no Authorization header without M3U_AUTH');
+  assert.match(anon.Accept, /vnd\.github\.raw/, 'GitHub raw media type must be offered');
+  assert.match(anon.Accept, /\*\/\*/, 'other hosts must still be accepted');
+  assert.ok(anon['User-Agent'], 'User-Agent must survive');
+
+  process.env.M3U_AUTH = 'Bearer ghp_example';
+  assert.equal(
+    m3uHeaders().Authorization,
+    'Bearer ghp_example',
+    'M3U_AUTH must be sent verbatim so any scheme works',
+  );
+
+  process.env.M3U_AUTH = 'Basic dXNlcjpwYXNz';
+  assert.equal(m3uHeaders().Authorization, 'Basic dXNlcjpwYXNz', 'Basic auth must pass through');
+
+  if (before === undefined) delete process.env.M3U_AUTH;
+  else process.env.M3U_AUTH = before;
+}
 
 server.close();
 console.log('hlsProxy gate + routing checks passed');

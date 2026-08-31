@@ -18,8 +18,13 @@ services:
         sync: false
       - key: XTREAM_PASSWORD
         sync: false
-      # Alternative to Xtream: a remote M3U/M3U8 channel-list URL.
+      # Alternative to Xtream, and the offline backup when Xtream is unreachable:
+      # a remote M3U/M3U8 channel-list URL. An exported playlist embeds the account
+      # in every stream URL, so host it privately and authenticate with M3U_AUTH
+      # (sent verbatim as the Authorization header). See DEPLOY.md.
       - key: M3U_URL
+        sync: false
+      - key: M3U_AUTH
         sync: false
       - key: ACCESS_KEY
         sync: false
