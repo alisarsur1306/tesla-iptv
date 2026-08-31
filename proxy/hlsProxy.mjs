@@ -842,7 +842,33 @@ export async function handleDiag(req, res) {
     // one-request answer instead of a guessing game. The token itself is never echoed.
     if (process.env.M3U_URL) {
       out.m3uUrl = process.env.M3U_URL;
-      out.m3uAuthScheme = (process.env.M3U_AUTH || '').split(' ')[0] || null;
+      const auth = process.env.M3U_AUTH || '';
+      out.m3uAuthScheme = auth.split(' ')[0] || null;
+      // Enough to tell WHICH credential is stored without disclosing it: the token family and
+      // its length. A value that arrived mangled (wrapped, truncated, an extra prefix, a
+      // trailing newline) shows up here as a wrong length or a prefix that is not a token at
+      // all — which is invisible when only the status code is reported. This route is
+      // ACCESS_KEY-gated, and a 4-character family prefix plus a length reconstructs nothing.
+      const token = auth.replace(/^\S+\s+/, '');
+      out.m3uAuthToken = token
+        ? { family: token.slice(0, 4), length: token.length, hasWhitespace: /\s/.test(token) }
+        : null;
+      // Who does GitHub think we are? Distinguishes "valid credential, no access to that repo"
+      // (404 here but a login below) from "the credential itself is wrong" (401 on both).
+      if (token) {
+        try {
+          const who = await upstreamFetch(new URL('https://api.github.com/user'), {
+            headers: m3uHeaders(),
+            signal: AbortSignal.timeout(15000),
+          });
+          const body = await who.json().catch(() => ({}));
+          out.m3uAuthIdentity = who.ok
+            ? { login: body.login, status: who.status }
+            : { status: who.status, message: body.message || null };
+        } catch (e) {
+          out.m3uAuthIdentity = { error: String(e && e.message ? e.message : e) };
+        }
+      }
       try {
         const r = await upstreamFetch(new URL(process.env.M3U_URL), {
           redirect: 'follow',
