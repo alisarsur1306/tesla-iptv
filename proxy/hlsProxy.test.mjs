@@ -1,7 +1,7 @@
 // Smallest check that fails if the proxy's gate breaks: node proxy/hlsProxy.test.mjs
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { handleProxy, m3uHeaders } from './hlsProxy.mjs';
+import { handleProxy, m3uHeaders, persistList, loadPersistedList } from './hlsProxy.mjs';
 
 const server = http.createServer(handleProxy);
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
@@ -83,6 +83,38 @@ delete process.env.UPSTREAM_PROXY;
 
   if (before === undefined) delete process.env.M3U_AUTH;
   else process.env.M3U_AUTH = before;
+}
+
+// --- disk-backed list cache ------------------------------------------------
+// The in-memory cache dies with the process, so without this a restart has nothing to serve
+// and the app falls back to an external M3U — a URL and a token that can fail on their own.
+{
+  const { mkdtempSync, existsSync, writeFileSync } = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'lc-'));
+  process.env.CACHE_DIR = dir;
+
+  const channels = Array.from({ length: 300 }, (_, i) => ({ stream_id: i, name: `Ch ${i}` }));
+  persistList('get_live_streams', channels);
+  await new Promise((r) => setTimeout(r, 150)); // the write is async by design
+
+  const file = path.join(dir, 'xt-get_live_streams.json');
+  assert.ok(existsSync(file), 'a list action must be written to disk');
+
+  const back = await loadPersistedList('get_live_streams');
+  assert.equal(back?.length, 300, 'the persisted list must come back intact');
+  assert.equal(back[0].name, 'Ch 0');
+
+  // Actions that are not big lists are not worth persisting.
+  persistList('', [{ user_info: {} }]);
+  await new Promise((r) => setTimeout(r, 100));
+  assert.ok(!existsSync(path.join(dir, 'xt-login.json')), 'only list actions are persisted');
+
+  // A corrupt or empty file must never take the app down — it just means no cache.
+  writeFileSync(path.join(dir, 'xt-get_live_categories.json'), 'not json{');
+  assert.equal(await loadPersistedList('get_live_categories'), null, 'corrupt cache reads as absent');
+  assert.equal(await loadPersistedList('never_fetched'), null, 'missing cache reads as absent');
 }
 
 server.close();

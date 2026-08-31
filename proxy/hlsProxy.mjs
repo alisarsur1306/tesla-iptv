@@ -24,6 +24,9 @@
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { readFileSync } from 'node:fs';
+import { promises as fsp } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 // undici's fetch is used ONLY for requests routed through the Tailscale proxy
 // (plain HTTP to the Xtream host). Direct traffic uses Node's built-in fetch:
 // undici 8.7's standalone agent crashes the process with an uncaught TypeError
@@ -474,6 +477,44 @@ function noteXtreamSuccess() {
 
 const XTREAM_TTL_MS = 30 * 60 * 1000;
 const xtreamCache = new Map(); // action -> { at, data }
+
+// The in-memory cache dies with the process, so a restart began with nothing and the app was
+// entirely dependent on an external backup — a GitHub-hosted M3U, its URL, and a token that
+// can read it. That is a lot of moving parts for "show the channels we already had".
+//
+// Every list that loads is therefore also written to disk. It costs one write per 30 minutes
+// and removes the external dependency from the common case: a restarted or redeployed instance
+// serves the last known list immediately, with no network and no credentials involved. The M3U
+// backup stays as the layer below this, for a container that has never seen a good list.
+//
+// CACHE_DIR defaults to the system temp dir. That survives a process restart but not a fresh
+// container; point it at a mounted disk to outlive deploys.
+// Read at call time, not at import: a value captured once cannot be changed by a test and
+// silently ignores an env var set after the module loads.
+const listCacheDir = () => process.env.CACHE_DIR || path.join(os.tmpdir(), 'tesla-iptv-lists');
+const listCacheFile = (action) =>
+  path.join(listCacheDir(), `xt-${(action || 'login').replace(/[^a-z0-9_-]/gi, '_')}.json`);
+
+export function persistList(action, data) {
+  if (!LIST_ACTIONS.has(action)) return; // only the big lists are worth keeping
+  fsp
+    .mkdir(listCacheDir(), { recursive: true })
+    .then(() => fsp.writeFile(listCacheFile(action), JSON.stringify({ at: Date.now(), data })))
+    .catch((e) => console.error(`[cache] could not persist ${action}: ${e.message}`));
+}
+
+/** The last list written for this action, or null. Never throws. */
+export async function loadPersistedList(action) {
+  try {
+    const rec = JSON.parse(await fsp.readFile(listCacheFile(action), 'utf8'));
+    if (!rec || !Array.isArray(rec.data) || rec.data.length === 0) return null;
+    xtreamCache.set(action, { at: rec.at || 0, data: rec.data });
+    console.log(`[cache] restored ${action} from disk (${rec.data.length} entries)`);
+    return rec.data;
+  } catch {
+    return null;
+  }
+}
 const xtreamInflight = new Map(); // action -> Promise, so parallel callers share one fetch
 
 /** The cached response for `action` regardless of age, or undefined. */
@@ -501,6 +542,7 @@ async function xtreamApi(creds, action, budgetMs) {
     if (!resp.ok) throw new Error(`upstream ${resp.status}`);
     const data = await resp.json();
     xtreamCache.set(action, { at: Date.now(), data });
+    persistList(action, data);
     noteXtreamSuccess();
     return data;
   })().finally(() => xtreamInflight.delete(action));
@@ -585,8 +627,13 @@ export async function handleXtreamApi(req, res) {
         .then(() => {}, () => {})
         .finally(() => { xtreamProbe = null; });
     }
-    const cached = xtreamCache.get(action);
+    const cached = xtreamCache.get(action) || null;
     if (cached) return sendJsonBody(res, cached.data);
+    const fromDisk = await loadPersistedList(action);
+    if (fromDisk) {
+      if (action === 'get_live_streams') liveListSource = 'xtream';
+      return sendJsonBody(res, fromDisk);
+    }
     // Both routes are down, so BOTH reasons have to reach the caller. Reporting only the
     // Xtream error sent people to look at the exit node when the actual problem was the
     // backup — a missing M3U_URL, or a token that cannot read the file.
@@ -648,8 +695,8 @@ export async function handleXtreamApi(req, res) {
     // Xtream is down or too slow. Rather than leave the car with no channels,
     // fall back in order of fidelity: the last list we saw (stale, but the real
     // account), then the M3U playlist (M3U_URL, else public/playlist.m3u).
-    const stale = staleXtreamResponse(action);
-    if (stale !== undefined) {
+    const stale = staleXtreamResponse(action) ?? (await loadPersistedList(action)) ?? undefined;
+    if (stale !== undefined && stale !== null) {
       if (action === 'get_live_streams') liveListSource = 'xtream';
       return sendJsonBody(res, stale);
     }
