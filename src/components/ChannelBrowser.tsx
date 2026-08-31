@@ -47,6 +47,16 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
   const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
   const [favorites, setFavorites] = useState<Set<number>>(() => loadFavorites());
   const [brokenIcons, setBrokenIcons] = useState<Set<number>>(new Set());
+  // A bare spinner cannot be told apart from a hung one. Counting proves the app is alive and
+  // makes "it is stuck" a number we can actually act on.
+  const [elapsed, setElapsed] = useState(0);
+
+  useEffect(() => {
+    if (!loading) return;
+    const started = Date.now();
+    const id = setInterval(() => setElapsed(Math.round((Date.now() - started) / 1000)), 250);
+    return () => clearInterval(id);
+  }, [loading, retryToken]);
 
   useEffect(() => {
     let cancelled = false;
@@ -105,9 +115,22 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
 
   if (loading) {
     return (
-      <div className="flex h-dvh flex-col items-center justify-center gap-6 bg-zinc-950 text-zinc-100">
+      <div className="flex h-dvh flex-col items-center justify-center gap-6 bg-zinc-950 p-8 text-zinc-100">
         <Loader2 className="size-16 animate-spin text-red-500" />
-        <p className="text-2xl text-zinc-400">Loading channels…</p>
+        <p className="text-2xl text-zinc-400">Loading channels… {elapsed}s</p>
+        {/* The channel list is megabytes of JSON pulled through the upstream proxy, so a slow
+            first load is normal. Say so before it reads as a hang. */}
+        {elapsed >= 10 && (
+          <p className="max-w-xl text-pretty text-center text-lg text-zinc-500">
+            The full channel list can take up to a minute on a cold start.
+          </p>
+        )}
+        {elapsed >= 45 && (
+          <p className="max-w-xl text-pretty text-center text-lg text-amber-500">
+            Still waiting on the IPTV source. If this fails, open{' '}
+            <span className="font-mono">/api/diag</span> to see which step is failing.
+          </p>
+        )}
       </div>
     );
   }
@@ -116,9 +139,23 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
     return (
       <div className="flex h-dvh flex-col items-center justify-center gap-6 bg-zinc-950 p-8 text-zinc-100">
         <p className="max-w-xl text-pretty text-center text-2xl text-red-400">{error}</p>
-        <Button onClick={onLogout} className="h-16 min-w-56 bg-zinc-800 text-xl hover:bg-zinc-700">
-          <LogOut className="mr-2 size-6" /> Back to login
-        </Button>
+        <div className="flex flex-wrap items-center justify-center gap-4">
+          <Button
+            onClick={() => window.location.reload()}
+            className="h-16 min-w-56 bg-red-600 text-xl hover:bg-red-500"
+          >
+            Try again
+          </Button>
+          <Button onClick={onLogout} className="h-16 min-w-56 bg-zinc-800 text-xl hover:bg-zinc-700">
+            <LogOut className="mr-2 size-6" /> Back to login
+          </Button>
+        </div>
+        <a
+          href="/api/diag"
+          className="text-lg text-zinc-500 underline underline-offset-4 hover:text-zinc-300"
+        >
+          Open /api/diag
+        </a>
       </div>
     );
   }

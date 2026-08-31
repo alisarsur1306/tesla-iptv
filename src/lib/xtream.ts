@@ -123,13 +123,59 @@ function xtApiUrl(action?: string): string {
   return withKey(`/api/xt${action ? `?action=${action}` : ''}`);
 }
 
+// The backend allows itself up to LIST_TIMEOUT_MS (90s) for a channel list before it gives
+// up and falls back to its stale cache or the M3U playlist. This budget has to sit ABOVE
+// that, or we abandon a request the server was about to answer. It also has to exist at all:
+// a bare `await fetch` never settles if the response stalls, and the caller's `loading` state
+// then stays true forever — which is exactly the spinner that never stops.
+const LIST_BUDGET_MS = 105_000;
+const DEFAULT_BUDGET_MS = 30_000;
+
+export class TimeoutError extends Error {
+  readonly ms: number;
+
+  constructor(ms: number) {
+    super(
+      `The server did not answer within ${Math.round(ms / 1000)}s. It may still be fetching a ` +
+        `large channel list, or the IPTV source is unreachable. Check /api/diag for details.`,
+    );
+    this.name = 'TimeoutError';
+    this.ms = ms;
+  }
+}
+
+const LIST_ACTIONS = new Set(['get_live_streams', 'get_live_categories']);
+
 async function fetchXtJson<T>(action?: string): Promise<T> {
-  const res = await fetch(xtApiUrl(action));
+  const budget = action && LIST_ACTIONS.has(action) ? LIST_BUDGET_MS : DEFAULT_BUDGET_MS;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), budget);
+  let res: Response;
+  try {
+    res = await fetch(xtApiUrl(action), { signal: controller.signal });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') throw new TimeoutError(budget);
+    throw new Error(
+      `Could not reach the server${action ? ` for ${action}` : ''}: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+    );
+  } finally {
+    clearTimeout(timer);
+  }
   if (res.status === 403) {
     throw new AccessKeyError();
   }
   if (!res.ok) {
-    throw new Error(`Request failed (${res.status})`);
+    // The backend sends {error: "..."} on failure; surfacing it beats a bare status code,
+    // since it already says whether the source was unreachable, slow, or misconfigured.
+    let detail = '';
+    try {
+      const body = (await res.json()) as { error?: string };
+      if (body && typeof body.error === 'string') detail = ` — ${body.error}`;
+    } catch {
+      /* not JSON; the status alone will have to do */
+    }
+    throw new Error(`Request failed (${res.status})${detail}`);
   }
   return (await res.json()) as T;
 }
