@@ -434,7 +434,23 @@ const LIST_ACTIONS = new Set(['get_live_streams', 'get_live_categories']);
 // — so an app with a perfectly good M3U backup still took 90s per list, twice over, and looked
 // dead. One failure is enough to know: skip straight to the fallback for a cooldown, then try
 // again. This is what makes a broken exit node degrade into "slightly stale" rather than "down".
-const XTREAM_COOLDOWN_MS = 2 * 60 * 1000;
+const XTREAM_COOLDOWN_MS = 5 * 60 * 1000;
+// How long a viewer may be made to wait for the provider when we already hold something to
+// show. The cooldown alone was not enough: it expires, the next request retries live, and that
+// one viewer pays the full 90s. Nobody should ever wait 90s for a list we could serve instantly
+// — so the provider gets this long to win the race, and otherwise keeps loading in the
+// background to populate the cache for next time.
+const FAST_FAIL_MS = 8000;
+
+/** Resolves to null after ms. The underlying promise keeps running — that is the point: its
+ *  result still lands in the cache, it just no longer holds up the response. */
+function raceTimeout(promise, ms) {
+  let timer;
+  return Promise.race([
+    promise.catch(() => null),
+    new Promise((resolve) => { timer = setTimeout(() => resolve(null), ms); }),
+  ]).finally(() => clearTimeout(timer));
+}
 let xtreamDownUntil = 0;
 let xtreamLastError = '';
 const xtreamIsDown = () => Date.now() < xtreamDownUntil;
@@ -457,7 +473,7 @@ function staleXtreamResponse(action) {
 }
 
 /** Fetch a player_api.php action server-side and return the parsed JSON (cached). */
-async function xtreamApi(creds, action) {
+async function xtreamApi(creds, action, budgetMs) {
   const hit = xtreamCache.get(action);
   if (hit && Date.now() - hit.at < XTREAM_TTL_MS) return hit.data;
   // A second request arriving while the first is still downloading must not
@@ -471,7 +487,7 @@ async function xtreamApi(creds, action) {
     const resp = await upstreamFetch(url, {
       redirect: 'follow',
       headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' },
-      signal: AbortSignal.timeout(LIST_ACTIONS.has(action) ? LIST_TIMEOUT_MS : TIMEOUT_MS),
+      signal: AbortSignal.timeout(budgetMs || (LIST_ACTIONS.has(action) ? LIST_TIMEOUT_MS : TIMEOUT_MS)),
     });
     if (!resp.ok) throw new Error(`upstream ${resp.status}`);
     const data = await resp.json();
@@ -571,6 +587,34 @@ export async function handleXtreamApi(req, res) {
       `Channel list failed. Provider: ${xtreamLastError}. Backup playlist: ${m3uErr}.`,
     );
   }
+  // With a cached list or an M3U backup in hand, the provider gets FAST_FAIL_MS to answer and
+  // no longer. Losing that race is not a failure: the request carries on in the background and
+  // its result is cached, so the next viewer gets fresh data without this one waiting for it.
+  const haveFallback = Boolean(xtreamCache.get(action)) || Boolean(getM3uSource());
+  if (haveFallback) {
+    const fresh = await raceTimeout(xtreamApi(getXtreamCreds(), action), FAST_FAIL_MS);
+    if (fresh !== null) {
+      if (action === 'get_live_streams') liveListSource = 'xtream';
+      return sendJsonBody(res, fresh);
+    }
+    noteXtreamFailure(new Error(`no answer within ${FAST_FAIL_MS}ms; still loading in the background`));
+    const stale = staleXtreamResponse(action);
+    if (stale !== undefined) {
+      if (action === 'get_live_streams') liveListSource = 'xtream';
+      return sendJsonBody(res, stale);
+    }
+    try {
+      const backup = await m3uResponse(action);
+      if (backup !== null) {
+        if (action === 'get_live_streams') liveListSource = 'm3u';
+        return sendJsonBody(res, backup);
+      }
+    } catch (e) {
+      return sendError(res, 502, `Channel list failed. Provider: no answer within ${FAST_FAIL_MS}ms. ` +
+        `Backup playlist: ${String(e && e.message ? e.message : e)}.`);
+    }
+  }
+
   try {
     const data = await xtreamApi(getXtreamCreds(), action);
     if (action === 'get_live_streams') liveListSource = 'xtream';
