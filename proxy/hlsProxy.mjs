@@ -774,6 +774,38 @@ export async function handleDiag(req, res) {
   }
   if (quick) {
     out.quick = true;
+    // The backup is a separate failure domain from the provider, and its config is the part
+    // people get wrong: a stale URL, a token that cannot see the repo, a missing Bearer prefix.
+    // Reporting the URL (which carries no credentials) plus the real status makes it a
+    // one-request answer instead of a guessing game. The token itself is never echoed.
+    if (process.env.M3U_URL) {
+      out.m3uUrl = process.env.M3U_URL;
+      out.m3uAuthScheme = (process.env.M3U_AUTH || '').split(' ')[0] || null;
+      try {
+        const r = await upstreamFetch(new URL(process.env.M3U_URL), {
+          redirect: 'follow',
+          headers: m3uHeaders(),
+          signal: AbortSignal.timeout(20000),
+        });
+        const head = (await r.text()).slice(0, 120);
+        out.m3uCheck = {
+          status: r.status,
+          ok: r.ok,
+          looksLikeM3u: head.startsWith('#EXTM3U'),
+          firstBytes: head.replace(/[^\x20-\x7e]/g, '.').slice(0, 90),
+          hint:
+            r.status === 404
+              ? 'Either the path is wrong, or the token cannot see that repository — GitHub returns 404, not 403, for a repo outside a token\'s scope.'
+              : r.status === 401
+                ? 'The token was rejected. Check that M3U_AUTH starts with "Bearer " and has no stray whitespace.'
+                : r.ok
+                  ? 'Backup is reachable.'
+                  : null,
+        };
+      } catch (e) {
+        out.m3uCheck = { error: String(e && e.message ? e.message : e) };
+      }
+    }
     out.env.TS_AUTHKEY = Boolean(process.env.TS_AUTHKEY);
     out.env.TS_EXIT_NODE = process.env.TS_EXIT_NODE || null;
     out.upstreamProxy = process.env.UPSTREAM_PROXY
