@@ -47,7 +47,11 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
   const [streams, setStreams] = useState<XtreamLiveStream[]>(() => seed?.streams ?? []);
   const [loading, setLoading] = useState(() => !seed);
   const [error, setError] = useState<string | null>(null);
-  const [activeCategory, setActiveCategory] = useState<string>(FAVORITES_ID);
+  // Favourites is the right landing tab once there are some, and the wrong one before that:
+  // a first run opened on an empty screen saying "No favorites yet" instead of channels.
+  const [activeCategory, setActiveCategory] = useState<string>(() =>
+    loadFavorites().size > 0 ? FAVORITES_ID : ALL_ID,
+  );
   const [search, setSearch] = useState('');
   const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
   const [favorites, setFavorites] = useState<Set<number>>(() => loadFavorites());
@@ -103,6 +107,12 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
     });
   }
 
+  const categoryName = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const c of categories) m.set(String(c.category_id), c.category_name || '');
+    return m;
+  }, [categories]);
+
   const filtered = useMemo(() => {
     let list = streams;
     if (activeCategory === FAVORITES_ID) {
@@ -111,9 +121,18 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
       list = list.filter((s) => String(s.category_id) === activeCategory);
     }
     const q = search.trim().toLowerCase();
-    if (q) list = list.filter((s) => (s.name || '').toLowerCase().includes(q));
+    if (q) {
+      // Match the group as well as the channel: with 5,000 channels, "sport" is far more often
+      // "show me the sports groups" than "channels with sport in the name". Searching only names
+      // made whole categories unreachable without knowing a channel in them by name.
+      list = list.filter(
+        (s) =>
+          (s.name || '').toLowerCase().includes(q) ||
+          (categoryName.get(String(s.category_id)) || '').toLowerCase().includes(q),
+      );
+    }
     return list;
-  }, [streams, activeCategory, search, favorites]);
+  }, [streams, activeCategory, search, favorites, categoryName]);
 
   const visible = filtered.slice(0, visibleCount);
 
@@ -187,7 +206,7 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
                 setSearch(e.target.value);
                 setVisibleCount(PAGE_SIZE);
               }}
-              placeholder="Search channels…"
+              placeholder="Search channels or groups…"
               className="h-16 w-56 border-zinc-700 bg-zinc-900 pl-14 text-xl md:w-[28rem]"
             />
           </div>
@@ -244,19 +263,20 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
           </div>
         ) : (
           <>
-            <div className="grid grid-cols-2 gap-5 md:grid-cols-3 xl:grid-cols-4">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4">
               {visible.map((ch) => {
                 const icon = brokenIcons.has(ch.stream_id) ? null : proxiedIcon(ch.stream_icon);
                 const isFav = favorites.has(ch.stream_id);
                 return (
                   <div
                     key={ch.stream_id}
-                    className="group relative flex min-h-32 items-center gap-4 rounded-2xl border border-zinc-800 bg-zinc-900 p-5 transition-colors hover:border-red-600/60 hover:bg-zinc-800 active:bg-zinc-800"
+                    className="group relative flex items-center gap-3 rounded-xl border border-zinc-800 bg-zinc-900 p-3 transition-colors hover:border-red-600/60 hover:bg-zinc-800 active:bg-zinc-800"
                   >
                     <button
                       onClick={() => onPlay(ch, filtered)}
                       aria-label={`Play ${ch.name}`}
-                      className="flex min-w-0 flex-1 items-center gap-4 text-left"
+                      title={ch.name}
+                      className="flex min-h-16 min-w-0 flex-1 items-center gap-3 text-left"
                     >
                       {icon ? (
                         <img
@@ -266,24 +286,37 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
                           onError={() =>
                             setBrokenIcons((prev) => new Set(prev).add(ch.stream_id))
                           }
-                          className="size-20 shrink-0 rounded-xl bg-zinc-800 object-contain p-1"
+                          className="size-12 shrink-0 rounded-lg bg-zinc-800 object-contain p-0.5"
                         />
                       ) : (
-                        <div className="flex size-20 shrink-0 items-center justify-center rounded-xl bg-zinc-800 text-3xl font-bold text-zinc-500">
+                        <div className="flex size-12 shrink-0 items-center justify-center rounded-lg bg-zinc-800 text-xl font-bold text-zinc-500">
                           {(ch.name || '?').trim().charAt(0)}
                         </div>
                       )}
-                      <span dir="auto" className="line-clamp-2 text-pretty text-xl font-medium leading-snug">
-                        {ch.name}
+                      {/* The logo was 80px and the name was clamped to two lines, so a long name
+                          lost its end — exactly the part that distinguishes one feed of a channel
+                          from another. The logo is decoration; the name is the thing being picked. */}
+                      <span className="flex min-w-0 flex-col gap-0.5">
+                        <span
+                          dir="auto"
+                          className="line-clamp-3 text-pretty text-lg font-medium leading-tight"
+                        >
+                          {ch.name}
+                        </span>
+                        {categoryName.get(String(ch.category_id)) && (
+                          <span dir="auto" className="truncate text-sm text-zinc-500">
+                            {categoryName.get(String(ch.category_id))}
+                          </span>
+                        )}
                       </span>
                     </button>
                     <button
                       onClick={() => toggleFavorite(ch.stream_id)}
                       aria-label={isFav ? 'Remove from favorites' : 'Add to favorites'}
-                      className="flex size-16 shrink-0 items-center justify-center rounded-full hover:bg-zinc-700 active:bg-zinc-700"
+                      className="flex size-14 shrink-0 items-center justify-center rounded-full hover:bg-zinc-700 active:bg-zinc-700"
                     >
                       <Star
-                        className={`size-8 ${isFav ? 'fill-amber-400 text-amber-400' : 'text-zinc-600'}`}
+                        className={`size-7 ${isFav ? 'fill-amber-400 text-amber-400' : 'text-zinc-600'}`}
                       />
                     </button>
                   </div>
