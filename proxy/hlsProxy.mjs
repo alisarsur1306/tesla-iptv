@@ -442,14 +442,18 @@ const XTREAM_COOLDOWN_MS = 5 * 60 * 1000;
 // background to populate the cache for next time.
 const FAST_FAIL_MS = 8000;
 
-/** Resolves to null after ms. The underlying promise keeps running — that is the point: its
- *  result still lands in the cache, it just no longer holds up the response. */
-function raceTimeout(promise, ms) {
+/** Races a call against a deadline, reporting WHICH of the three things happened. The
+ *  distinction matters more than it looks: an instant Cloudflare 403 and a silent blackhole are
+ *  opposite diagnoses — one means the request arrived and was refused, the other means it never
+ *  got there — and collapsing both into "no answer" sends you to debug the wrong layer.
+ *  On timeout the underlying promise keeps running, so its result still reaches the cache. */
+function raceDeadline(promise, ms) {
   let timer;
-  return Promise.race([
-    promise.catch(() => null),
-    new Promise((resolve) => { timer = setTimeout(() => resolve(null), ms); }),
-  ]).finally(() => clearTimeout(timer));
+  const attempt = promise.then((value) => ({ value }), (error) => ({ error }));
+  const deadline = new Promise((resolve) => {
+    timer = setTimeout(() => resolve({ timedOut: true }), ms);
+  });
+  return Promise.race([attempt, deadline]).finally(() => clearTimeout(timer));
 }
 let xtreamDownUntil = 0;
 let xtreamLastError = '';
@@ -592,12 +596,17 @@ export async function handleXtreamApi(req, res) {
   // its result is cached, so the next viewer gets fresh data without this one waiting for it.
   const haveFallback = Boolean(xtreamCache.get(action)) || Boolean(getM3uSource());
   if (haveFallback) {
-    const fresh = await raceTimeout(xtreamApi(getXtreamCreds(), action), FAST_FAIL_MS);
-    if (fresh !== null) {
+    const raced = await raceDeadline(xtreamApi(getXtreamCreds(), action), FAST_FAIL_MS);
+    if (raced.value !== undefined) {
       if (action === 'get_live_streams') liveListSource = 'xtream';
-      return sendJsonBody(res, fresh);
+      return sendJsonBody(res, raced.value);
     }
-    noteXtreamFailure(new Error(`no answer within ${FAST_FAIL_MS}ms; still loading in the background`));
+    // Report what actually happened: a refusal names itself, a blackhole reads as a timeout.
+    noteXtreamFailure(
+      raced.error ||
+        new Error(`no answer within ${FAST_FAIL_MS}ms (no refusal, no reset — the request went nowhere, ` +
+          `which is what a dead proxy or exit node looks like); still loading in the background`),
+    );
     const stale = staleXtreamResponse(action);
     if (stale !== undefined) {
       if (action === 'get_live_streams') liveListSource = 'xtream';
@@ -610,7 +619,7 @@ export async function handleXtreamApi(req, res) {
         return sendJsonBody(res, backup);
       }
     } catch (e) {
-      return sendError(res, 502, `Channel list failed. Provider: no answer within ${FAST_FAIL_MS}ms. ` +
+      return sendError(res, 502, `Channel list failed. Provider: ${xtreamLastError}. ` +
         `Backup playlist: ${String(e && e.message ? e.message : e)}.`);
     }
   }
