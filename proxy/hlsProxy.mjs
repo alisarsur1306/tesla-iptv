@@ -51,7 +51,16 @@ const USER_AGENT =
 // cloud deployment those requests must exit via a residential IP (see DEPLOY.md).
 // Segments redirect to a CDN that does NOT block datacenter IPs and whose tokens
 // are not IP-bound, so they go direct — keeping the video off the tunnel.
-const PROXY_HOST_SUFFIXES = ['snapmediatoghater.site'];
+// Hosts that Cloudflare refuses from a datacenter IP, and which therefore have to leave through
+// the tunnel. The channel logos live on a different domain from the API, and only the API was
+// listed — so every logo went out directly and came back 403, filling the console and leaving
+// the grid on letter placeholders. Logos are lazy-loaded, so this is roughly a dozen extra
+// requests through the tunnel per screen, not five thousand.
+// PROXY_HOSTS overrides the list (comma-separated suffixes) for a provider that uses others.
+const PROXY_HOST_SUFFIXES = (process.env.PROXY_HOSTS || 'snapmediatoghater.site,mctvpal.site')
+  .split(',')
+  .map((h) => h.trim().toLowerCase())
+  .filter(Boolean);
 
 /** HTTP proxy for Cloudflare-blocked hosts, e.g. '127.0.0.1:1055'. Unset = direct. */
 function getUpstreamProxy() {
