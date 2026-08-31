@@ -374,6 +374,15 @@ async function getM3uChannels() {
  * Shape parsed M3U channels as the Xtream response the client expects for
  * `action`. The channel's array index is its opaque stream id.
  */
+/** An Xtream stream URL ends /<user>/<pass>/<id>.<ext>, and that id is the channel's real id.
+ *  A playlist exported from such a panel therefore already carries the same ids the API uses,
+ *  which is what lets both sources agree instead of one numbering from zero. */
+function streamIdFromUrl(u) {
+  const m = /\/(\d+)\.(?:ts|m3u8)(?:[?#]|$)/i.exec(u || '');
+  return m ? Number(m[1]) : null;
+}
+
+export function shapeM3uForTest(channels, action) { return shapeM3uAs(channels, action); }
 function shapeM3uAs(channels, action) {
   if (action === 'get_live_categories') {
     const seen = new Set();
@@ -386,8 +395,11 @@ function shapeM3uAs(channels, action) {
     return data;
   }
   if (action === 'get_live_streams') {
+    // Prefer the id embedded in the stream URL over the array position. Positional ids meant
+    // the two sources numbered the same channels differently, so a client holding one list and
+    // a server that had switched to the other disagreed about every single channel.
     return channels.map((c, i) => ({
-      stream_id: i,
+      stream_id: streamIdFromUrl(c.url) ?? i,
       name: c.name,
       stream_icon: c.logo,
       category_id: c.group,
@@ -1029,9 +1041,18 @@ export async function handleStream(req, res) {
     } catch (err) {
       return sendError(res, 502, `Playlist load failed: ${String(err && err.message ? err.message : err)}`);
     }
-    const idx = Number(id);
-    if (!channels || idx < 0 || idx >= channels.length) return sendError(res, 404, 'Unknown channel');
-    upstreamUrl = channels[idx].url;
+    // Match the id carried in the URL first; fall back to the array position for playlists
+    // whose URLs have no id. Resolving by id means a stream request works whichever list the
+    // client happens to be holding, so a mid-session switch between sources is no longer a
+    // session-wide breakage.
+    const wanted = Number(id);
+    const chan =
+      channels?.find((c) => streamIdFromUrl(c.url) === wanted) ??
+      (Number.isInteger(wanted) && wanted >= 0 && wanted < (channels?.length ?? 0)
+        ? channels[wanted]
+        : null);
+    if (!chan) return sendError(res, 404, 'Unknown channel');
+    upstreamUrl = chan.url;
   } else {
     const creds = getXtreamCreds();
     upstreamUrl = `${creds.server}/live/${encodeURIComponent(creds.username)}/${encodeURIComponent(creds.password)}/${id}.ts`;

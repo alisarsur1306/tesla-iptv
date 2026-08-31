@@ -304,7 +304,7 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
                           {ch.name}
                         </span>
                         {categoryName.get(String(ch.category_id)) && (
-                          <span dir="auto" className="truncate text-sm text-zinc-500">
+                          <span dir="auto" className="truncate text-sm text-zinc-400">
                             {categoryName.get(String(ch.category_id))}
                           </span>
                         )}
@@ -316,7 +316,7 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
                       className="flex size-14 shrink-0 items-center justify-center rounded-full hover:bg-zinc-700 active:bg-zinc-700"
                     >
                       <Star
-                        className={`size-7 ${isFav ? 'fill-amber-400 text-amber-400' : 'text-zinc-600'}`}
+                        className={`size-7 ${isFav ? 'fill-amber-400 text-amber-400' : 'text-zinc-400'}`}
                       />
                     </button>
                   </div>

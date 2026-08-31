@@ -117,5 +117,29 @@ delete process.env.UPSTREAM_PROXY;
   assert.equal(await loadPersistedList('never_fetched'), null, 'missing cache reads as absent');
 }
 
+// --- stream ids agree across sources ---------------------------------------
+// The M3U list numbered channels from zero while the Xtream API uses the provider's own ids,
+// and the stream endpoint chose between the two tables from a module-global. A client holding
+// one list while the server had switched to the other therefore resolved every channel wrongly.
+{
+  const { parseM3u } = await import('./hlsProxy.mjs');
+  const m3u = [
+    '#EXTM3U',
+    '#EXTINF:-1 group-title="Sports",beIN 1',
+    'http://h:8080/live/USER/PASS/37312.m3u8',
+    '#EXTINF:-1 group-title="News",Al Jazeera',
+    'http://h:8080/live/USER/PASS/40255.ts',
+    '#EXTINF:-1 group-title="Other",No Id Here',
+    'http://h:8080/some/other/path.m3u8',
+  ].join('\n');
+  const parsed = parseM3u(m3u);
+  assert.equal(parsed.length, 3);
+  const { shapeM3uForTest } = await import('./hlsProxy.mjs');
+  const shaped = shapeM3uForTest(parsed, 'get_live_streams');
+  assert.equal(shaped[0].stream_id, 37312, 'the id in the stream URL must win over the index');
+  assert.equal(shaped[1].stream_id, 40255, '.ts URLs carry ids too');
+  assert.equal(shaped[2].stream_id, 2, 'a URL with no id falls back to its position');
+}
+
 server.close();
 console.log('hlsProxy gate + routing checks passed');

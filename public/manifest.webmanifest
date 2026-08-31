@@ -1,0 +1,14 @@
+{
+  "name": "Tesla IPTV",
+  "short_name": "IPTV",
+  "description": "Live TV channels, laid out for a car's touchscreen.",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#09090b",
+  "theme_color": "#09090b",
+  "icons": [
+    { "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "/apple-touch-icon.png", "sizes": "180x180", "type": "image/png" }
+  ]
+}
