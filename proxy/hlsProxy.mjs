@@ -582,6 +582,37 @@ async function xtreamApi(creds, action, budgetMs) {
 // played from the M3U. Reset as soon as Xtream serves a list again.
 let liveListSource = null; // 'xtream' | 'm3u' | null
 
+// Channels the provider refuses for this line. A catalogue of 5,000 channels is not the same
+// as 5,000 you can watch: the provider authorises a subset and answers 403 for the rest,
+// forever. Remembering which ones did that turns a list you have to rediscover by trial into
+// one that gets more accurate the more it is used. Only 403 counts — a timeout means the
+// network, and marking those would slowly hide working channels.
+const unavailable = new Map(); // stream_id -> epoch ms first refused
+const unavailableFile = () => path.join(listCacheDir(), 'unavailable.json');
+
+function noteUnavailable(id) {
+  const key = String(id);
+  if (unavailable.has(key)) return;
+  unavailable.set(key, Date.now());
+  fsp
+    .mkdir(listCacheDir(), { recursive: true })
+    .then(() => fsp.writeFile(unavailableFile(), JSON.stringify([...unavailable])))
+    .catch(() => {}); // losing this costs accuracy, never correctness
+}
+
+let unavailableLoaded = false;
+async function loadUnavailable() {
+  if (unavailableLoaded) return;
+  unavailableLoaded = true;
+  try {
+    for (const [k, v] of JSON.parse(await fsp.readFile(unavailableFile(), 'utf8'))) {
+      if (!unavailable.has(k)) unavailable.set(k, v);
+    }
+  } catch {
+    /* nothing remembered yet */
+  }
+}
+
 /**
  * GET /api/xt?action=get_live_streams|get_live_categories  (login = no action)
  * Server-side player_api call; the response carries only channel metadata
@@ -800,6 +831,16 @@ async function probe(name, run, creds) {
  * Reports only whether each secret is SET, never its value, and redacts the
  * account out of every upstream preview. Gated like the export.
  */
+/** GET /api/unavailable — stream ids the provider has refused, so the UI can mark them. */
+export async function handleUnavailable(req, res) {
+  res.on('error', () => {});
+  setCors(res);
+  const url = new URL(req.url || '/', 'http://localhost');
+  if (!keyGate(req, res, url)) return;
+  await loadUnavailable();
+  sendJsonBody(res, { ids: [...unavailable.keys()].map(Number).filter(Number.isFinite) });
+}
+
 export async function handleDiag(req, res) {
   res.on('error', () => {});
   const url = new URL(req.url || '/', 'http://localhost');
@@ -1060,6 +1101,7 @@ export async function handleStream(req, res) {
   const source = getSourceType();
   if (!source) return sendError(res, 503, 'Server has no IPTV source configured');
 
+  req.streamId = id;
   let upstreamUrl;
   // The M3U path also covers an Xtream deployment whose last channel list came
   // from the fallback: those ids are M3U indexes, not Xtream stream ids.

@@ -10,7 +10,7 @@ import http from 'node:http';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { handleProxy, handleXtreamApi, handleStream, handleExportM3u, handleDiag, isManaged, getRequiredKey, isKeyValid } from './proxy/hlsProxy.mjs';
+import { handleProxy, handleXtreamApi, handleStream, handleExportM3u, handleDiag, handleUnavailable, isManaged, getRequiredKey, isKeyValid } from './proxy/hlsProxy.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DIST_DIR = path.join(__dirname, 'dist');
@@ -163,6 +163,10 @@ const server = http.createServer((req, res) => {
   }
   if (url.pathname === '/api/export.m3u') {
     void handleExportM3u(req, res);
+    return;
+  }
+  if (url.pathname === '/api/unavailable') {
+    void handleUnavailable(req, res);
     return;
   }
   if (url.pathname === '/api/diag') {

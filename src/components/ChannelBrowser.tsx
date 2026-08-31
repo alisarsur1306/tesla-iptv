@@ -5,6 +5,7 @@ import {
   AccessKeyError,
   getLiveCategories,
   getLiveStreams,
+  getUnavailableIds,
   proxiedIcon,
   readChannelCache,
   writeChannelCache,
@@ -59,6 +60,19 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
   // A bare spinner cannot be told apart from a hung one. Counting proves the app is alive and
   // makes "it is stuck" a number we can actually act on.
   const [elapsed, setElapsed] = useState(0);
+  const [unavailable, setUnavailable] = useState<Set<number>>(new Set());
+
+  // Loaded alongside the channels, and deliberately not awaited with them: an unavailable list
+  // that fails to load should cost a hint, never the channel list.
+  useEffect(() => {
+    let cancelled = false;
+    void getUnavailableIds().then((ids) => {
+      if (!cancelled) setUnavailable(ids);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [retryToken]);
 
   useEffect(() => {
     if (!loading) return;
@@ -267,10 +281,15 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
               {visible.map((ch) => {
                 const icon = brokenIcons.has(ch.stream_id) ? null : proxiedIcon(ch.stream_icon);
                 const isFav = favorites.has(ch.stream_id);
+                const refused = unavailable.has(ch.stream_id);
                 return (
                   <div
                     key={ch.stream_id}
-                    className="group relative flex items-center gap-3 rounded-xl border border-zinc-800 bg-zinc-900 p-3 transition-colors hover:border-red-600/60 hover:bg-zinc-800 active:bg-zinc-800"
+                    className={`group relative flex items-center gap-3 rounded-xl border p-3 transition-colors ${
+                      refused
+                        ? 'border-zinc-900 bg-zinc-900/40 opacity-60'
+                        : 'border-zinc-800 bg-zinc-900 hover:border-red-600/60 hover:bg-zinc-800 active:bg-zinc-800'
+                    }`}
                   >
                     <button
                       onClick={() => onPlay(ch, filtered)}
@@ -303,10 +322,16 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
                         >
                           {ch.name}
                         </span>
-                        {categoryName.get(String(ch.category_id)) && (
-                          <span dir="auto" className="truncate text-sm text-zinc-400">
-                            {categoryName.get(String(ch.category_id))}
+                        {refused ? (
+                          <span className="truncate text-sm text-amber-500">
+                            Not included in your subscription
                           </span>
+                        ) : (
+                          categoryName.get(String(ch.category_id)) && (
+                            <span dir="auto" className="truncate text-sm text-zinc-400">
+                              {categoryName.get(String(ch.category_id))}
+                            </span>
+                          )
                         )}
                       </span>
                     </button>

@@ -276,6 +276,20 @@ export function writeChannelCache(categories: XtreamCategory[], streams: XtreamL
   }
 }
 
+/** Stream ids the provider has refused for this line. A 5,000-channel catalogue is not 5,000
+ *  watchable channels — the provider authorises a subset and answers 403 for the rest — so the
+ *  list is worth marking rather than rediscovering by trial. Never throws: this is a hint. */
+export async function getUnavailableIds(): Promise<Set<number>> {
+  try {
+    const res = await fetch(withKey('/api/unavailable'));
+    if (!res.ok) return new Set();
+    const body = (await res.json()) as { ids?: number[] };
+    return new Set(Array.isArray(body.ids) ? body.ids : []);
+  } catch {
+    return new Set();
+  }
+}
+
 /** Proxied URL for a channel icon (safe for <img src>). Empty when no icon. */
 export function proxiedIcon(icon: string | undefined): string | null {
   if (!icon) return null;
