@@ -552,12 +552,24 @@ export async function handleXtreamApi(req, res) {
   if (xtreamIsDown()) {
     const cached = xtreamCache.get(action);
     if (cached) return sendJsonBody(res, cached.data);
-    const quick = await m3uResponse(action).catch(() => null);
-    if (quick !== null) {
-      if (action === 'get_live_streams') liveListSource = 'm3u';
-      return sendJsonBody(res, quick);
+    // Both routes are down, so BOTH reasons have to reach the caller. Reporting only the
+    // Xtream error sent people to look at the exit node when the actual problem was the
+    // backup — a missing M3U_URL, or a token that cannot read the file.
+    let m3uErr = 'M3U_URL is not configured';
+    try {
+      const quick = await m3uResponse(action);
+      if (quick !== null) {
+        if (action === 'get_live_streams') liveListSource = 'm3u';
+        return sendJsonBody(res, quick);
+      }
+    } catch (err) {
+      m3uErr = String(err && err.message ? err.message : err);
     }
-    return sendError(res, 502, `Channel list failed: upstream unreachable (${xtreamLastError})`);
+    return sendError(
+      res,
+      502,
+      `Channel list failed. Provider: ${xtreamLastError}. Backup playlist: ${m3uErr}.`,
+    );
   }
   try {
     const data = await xtreamApi(getXtreamCreds(), action);
@@ -574,16 +586,22 @@ export async function handleXtreamApi(req, res) {
       return sendJsonBody(res, stale);
     }
     let fallback = null;
+    let m3uErr = process.env.M3U_URL ? 'unknown' : 'M3U_URL is not configured';
     try {
       fallback = await m3uResponse(action);
-    } catch {
-      /* the playlist is unreadable too — report the Xtream failure below */
+    } catch (e) {
+      m3uErr = String(e && e.message ? e.message : e);
     }
     if (fallback !== null) {
       if (action === 'get_live_streams') liveListSource = 'm3u';
       return sendJsonBody(res, fallback);
     }
-    sendError(res, 502, `Channel list failed: ${String(err && err.message ? err.message : err)}`);
+    sendError(
+      res,
+      502,
+      `Channel list failed. Provider: ${String(err && err.message ? err.message : err)}. ` +
+        `Backup playlist: ${m3uErr}.`,
+    );
   }
 }
 
