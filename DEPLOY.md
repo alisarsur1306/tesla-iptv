@@ -126,6 +126,33 @@ pulled through the exit node). Three things keep it from stranding the car:
   (like `config.json`), so it only exists in local dev. With no M3U source at
   all, a hard Xtream failure still returns an error.
 
+## A VPN on the exit node silently undoes the tunnel
+
+The tunnel exists for one reason: to make requests leave from a residential IP, because the
+provider's Cloudflare rules refuse datacenter ones. Anything that changes where the exit node's
+traffic leaves from therefore breaks the whole arrangement — and a corporate VPN on that machine
+does exactly that.
+
+It is hard to spot because the machine itself keeps working. The exit node forwards traffic on
+behalf of other devices, and that forwarded path is separate from the host's own connections: a
+`curl` from the Mac can reach the provider perfectly while everything Render routes through it
+is dropped or leaves from the VPN's datacenter address. "It works when I test it here" and "the
+app gets nothing" are both true at once.
+
+The symptom is a timeout with no refusal and no reset — indistinguishable, from the outside,
+from a dead exit node, an asleep machine, or an exhausted connection limit. All of those were
+investigated before the VPN was.
+
+`GET /api/diag?key=<ACCESS_KEY>&quick=1` reports `egressIp`, fetched through the tunnel itself.
+That is the one measurement that settles it:
+
+- a residential address — the route is doing its job
+- a cloud provider's address — something on the exit node is re-routing the traffic
+- `null` with `egressIpError` — forwarding is broken rather than redirected
+
+So: if streams stop and `egressIp` is not the home connection, check what else is running on the
+exit node before touching anything here.
+
 ## When it fails: find out why in one request
 
 Every upstream failure looks the same from the browser — "Channel list failed" —
