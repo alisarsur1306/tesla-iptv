@@ -29,6 +29,7 @@ import { readFileSync } from 'node:fs';
 // undici 8.7's standalone agent crashes the process with an uncaught TypeError
 // in closeClientIfUnused when an HTTP/2 CDN connection closes after streaming.
 import { fetch as undiciFetch, ProxyAgent } from 'undici';
+import { gzip } from 'node:zlib';
 
 // Connect timeout for a streaming request: it covers the handshake only and is
 // cleared once the headers arrive, because a live channel's body never ends.
@@ -450,14 +451,34 @@ let liveListSource = null; // 'xtream' | 'm3u' | null
  * Server-side player_api call; the response carries only channel metadata
  * (id/name/icon/category) — never the account.
  */
+// A live channel list is megabytes of extremely repetitive JSON, and it was going out
+// uncompressed — on a car's connection that transfer dominates the wait. gzip typically cuts
+// it by an order of magnitude. Compression is async so a multi-megabyte list does not block
+// the event loop for every other request, and any failure just sends the plain body.
 function sendJsonBody(res, data) {
   const body = Buffer.from(JSON.stringify(data), 'utf8');
-  res.writeHead(200, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Cache-Control': 'no-store',
-    'Content-Length': body.length,
+  const accepts = String(res.req?.headers?.['accept-encoding'] || '');
+  const plain = () => {
+    res.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'Content-Length': body.length,
+    });
+    res.end(body);
+  };
+  // Not worth a compressor for a small payload (login, an empty list).
+  if (body.length < 4096 || !/\bgzip\b/.test(accepts)) return plain();
+  gzip(body, (err, packed) => {
+    if (err || res.writableEnded || res.destroyed) return err ? plain() : undefined;
+    res.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'Content-Encoding': 'gzip',
+      'Vary': 'Accept-Encoding',
+      'Content-Length': packed.length,
+    });
+    res.end(packed);
   });
-  res.end(body);
 }
 
 export async function handleXtreamApi(req, res) {

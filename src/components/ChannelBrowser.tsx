@@ -6,6 +6,8 @@ import {
   getLiveCategories,
   getLiveStreams,
   proxiedIcon,
+  readChannelCache,
+  writeChannelCache,
   type XtreamCategory,
   type XtreamCreds,
   type XtreamLiveStream,
@@ -38,9 +40,12 @@ interface ChannelBrowserProps {
 }
 
 export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, retryToken }: ChannelBrowserProps) {
-  const [categories, setCategories] = useState<XtreamCategory[]>([]);
-  const [streams, setStreams] = useState<XtreamLiveStream[]>([]);
-  const [loading, setLoading] = useState(true);
+  // Seeded from the browser cache so a repeat visit renders immediately instead of waiting on
+  // a cold server. Lazy initialisers, so this costs one read and no extra effect.
+  const seed = useState(() => readChannelCache())[0];
+  const [categories, setCategories] = useState<XtreamCategory[]>(() => seed?.categories ?? []);
+  const [streams, setStreams] = useState<XtreamLiveStream[]>(() => seed?.streams ?? []);
+  const [loading, setLoading] = useState(() => !seed);
   const [error, setError] = useState<string | null>(null);
   const [activeCategory, setActiveCategory] = useState<string>(FAVORITES_ID);
   const [search, setSearch] = useState('');
@@ -58,15 +63,17 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
     return () => clearInterval(id);
   }, [loading, retryToken]);
 
+  const hasCache = Boolean(seed);
+
   useEffect(() => {
     let cancelled = false;
-    setLoading(true);
     setError(null);
     Promise.all([getLiveCategories(creds), getLiveStreams(creds)])
       .then(([cats, chans]) => {
         if (cancelled) return;
         setCategories(cats);
         setStreams(chans);
+        writeChannelCache(cats, chans);
         setLoading(false);
       })
       .catch((err) => {
@@ -74,15 +81,17 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
         if (err instanceof AccessKeyError) {
           setError(null);
           onNeedKey(); // ask for the key; saving it bumps retryToken and refires this effect
-        } else {
+        } else if (!hasCache) {
           setError(err instanceof Error ? err.message : 'Failed to load channels.');
         }
+        // With a cached list on screen, a failed refresh is not worth replacing it with an
+        // error page — the channels shown are still the real ones, just older.
         setLoading(false);
       });
     return () => {
       cancelled = true;
     };
-  }, [creds, retryToken, onNeedKey]);
+  }, [creds, retryToken, onNeedKey, hasCache]);
 
   function toggleFavorite(id: number) {
     setFavorites((prev) => {

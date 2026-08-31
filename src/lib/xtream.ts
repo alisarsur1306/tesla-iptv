@@ -213,6 +213,69 @@ export function liveStreamUrl(_creds: XtreamCreds, streamId: number): string {
   return withKey(`/api/stream?id=${streamId}`);
 }
 
+// ---------------------------------------------------------------------------
+// Browser-side channel list cache.
+//
+// The backend caches lists in memory, which is exactly what a free Render instance throws away
+// when it idles down after ~15 minutes. So every visit paid full price: a cold container
+// pulling megabytes of JSON from the Xtream host through the Tailscale exit node, while the
+// screen showed a spinner.
+//
+// Keeping the last list in the browser makes a repeat visit instant, and it survives the
+// server being cold, asleep, or unreachable. The fresh list is fetched underneath and swapped
+// in when it arrives.
+const LIST_CACHE_KEY = 'tesla-iptv:channelCache';
+const LIST_CACHE_VERSION = 1;
+
+export interface ChannelCache {
+  categories: XtreamCategory[];
+  streams: XtreamLiveStream[];
+  at: number;
+}
+
+/** Only the fields the UI reads — a full Xtream row is several times larger, and localStorage
+ *  gives us a handful of megabytes at most. */
+function trim(streams: XtreamLiveStream[]): XtreamLiveStream[] {
+  return streams.map((s) => ({
+    stream_id: s.stream_id,
+    name: s.name,
+    stream_icon: s.stream_icon,
+    category_id: s.category_id,
+    epg_channel_id: s.epg_channel_id,
+  }));
+}
+
+export function readChannelCache(): ChannelCache | null {
+  try {
+    const raw = localStorage.getItem(LIST_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as ChannelCache & { v?: number };
+    if (parsed.v !== LIST_CACHE_VERSION) return null;
+    if (!Array.isArray(parsed.categories) || !Array.isArray(parsed.streams)) return null;
+    if (!parsed.streams.length) return null;
+    return { categories: parsed.categories, streams: parsed.streams, at: parsed.at || 0 };
+  } catch {
+    return null;
+  }
+}
+
+export function writeChannelCache(categories: XtreamCategory[], streams: XtreamLiveStream[]): void {
+  try {
+    localStorage.setItem(
+      LIST_CACHE_KEY,
+      JSON.stringify({ v: LIST_CACHE_VERSION, categories, streams: trim(streams), at: Date.now() }),
+    );
+  } catch {
+    // Over quota, or private mode. A missing cache only costs speed, so drop any half-written
+    // entry and carry on rather than failing the load.
+    try {
+      localStorage.removeItem(LIST_CACHE_KEY);
+    } catch {
+      /* nothing more to do */
+    }
+  }
+}
+
 /** Proxied URL for a channel icon (safe for <img src>). Empty when no icon. */
 export function proxiedIcon(icon: string | undefined): string | null {
   if (!icon) return null;
