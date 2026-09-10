@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import CategoryPicker from '@/components/CategoryPicker';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import {
@@ -13,7 +14,7 @@ import {
   type XtreamCreds,
   type XtreamLiveStream,
 } from '@/lib/xtream';
-import { Loader2, LogOut, Search, Star, Tv } from 'lucide-react';
+import { Loader2, LogOut, Search, Star, Tv, X } from 'lucide-react';
 
 const FAVORITES_KEY = 'tesla-iptv:favorites';
 const PAGE_SIZE = 120;
@@ -41,6 +42,8 @@ interface ChannelBrowserProps {
 }
 
 export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, retryToken }: ChannelBrowserProps) {
+  const gridRef = useRef<HTMLElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
   // Seeded from the browser cache so a repeat visit renders immediately instead of waiting on
   // a cold server. Lazy initialisers, so this costs one read and no extra effect.
   const seed = useState(() => readChannelCache())[0];
@@ -116,7 +119,11 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
-      localStorage.setItem(FAVORITES_KEY, JSON.stringify([...next]));
+      try {
+        localStorage.setItem(FAVORITES_KEY, JSON.stringify([...next]));
+      } catch {
+        // Keep favourites usable for this visit even if browser storage is full.
+      }
       return next;
     });
   }
@@ -153,6 +160,13 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
   function selectCategory(id: string) {
     setActiveCategory(id);
     setVisibleCount(PAGE_SIZE);
+    gridRef.current?.scrollTo({ top: 0 });
+  }
+
+  function updateSearch(value: string) {
+    setSearch(value);
+    setVisibleCount(PAGE_SIZE);
+    gridRef.current?.scrollTo({ top: 0 });
   }
 
   if (loading) {
@@ -205,25 +219,34 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
   return (
     <div className="flex h-dvh flex-col bg-zinc-950 text-zinc-100">
       {/* Header */}
-      <header className="flex items-center gap-4 border-b border-zinc-800 px-6 py-5">
-        <Tv className="size-10 shrink-0 text-red-500" />
-        <h1 className="text-3xl font-bold tracking-tight">Tesla IPTV</h1>
-        <span className="hidden rounded-full bg-zinc-800 px-4 py-1.5 text-base tabular-nums text-zinc-300 sm:inline">
+      <header className="flex shrink-0 flex-wrap items-center gap-3 border-b border-zinc-800 px-4 py-4 sm:px-6">
+        <Tv className="size-8 shrink-0 text-red-500" />
+        <h1 className="text-2xl font-bold tracking-tight">Tesla IPTV</h1>
+        <span className="hidden rounded-full bg-zinc-800 px-3 py-1.5 text-base tabular-nums text-zinc-300 xl:inline">
           {filtered.length.toLocaleString()} / {streams.length.toLocaleString()}
         </span>
-        <div className="ml-auto flex items-center gap-3">
-          <div className="relative">
+        <div className="flex w-full items-center gap-3 sm:ml-auto sm:w-auto sm:min-w-0 sm:flex-1 sm:justify-end">
+          <form className="relative min-w-0 flex-1 sm:max-w-md" onSubmit={(event) => {
+            event.preventDefault();
+            searchRef.current?.blur();
+          }}>
             <Search className="absolute left-4 top-1/2 size-6 -translate-y-1/2 text-zinc-500" />
             <Input
+              ref={searchRef}
+              aria-label="Search channels or groups"
+              enterKeyHint="search"
               value={search}
-              onChange={(e) => {
-                setSearch(e.target.value);
-                setVisibleCount(PAGE_SIZE);
-              }}
+              onChange={(e) => updateSearch(e.target.value)}
               placeholder="Search channels or groups…"
-              className="h-16 w-56 border-zinc-700 bg-zinc-900 pl-14 text-xl md:w-[28rem]"
+              className="h-16 w-full border-zinc-700 bg-zinc-900 pl-14 pr-16 text-xl md:text-xl"
             />
-          </div>
+            {search && (
+              <button type="button" aria-label="Clear search" onClick={() => updateSearch('')}
+                className="absolute right-1 top-1 flex size-14 items-center justify-center rounded-xl text-zinc-300 hover:bg-zinc-800">
+                <X className="size-7" />
+              </button>
+            )}
+          </form>
           <Button
             onClick={onLogout}
             variant="outline"
@@ -236,7 +259,7 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
       </header>
 
       {/* Category chips */}
-      <div className="flex gap-3 overflow-x-auto border-b border-zinc-800 px-6 py-4 [scrollbar-width:thin]">
+      <nav aria-label="Channel filters" className="flex shrink-0 flex-wrap gap-3 border-b border-zinc-800 px-4 py-3 sm:px-6">
         <CategoryChip
           active={activeCategory === FAVORITES_ID}
           onClick={() => selectCategory(FAVORITES_ID)}
@@ -246,27 +269,24 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
         <CategoryChip active={activeCategory === ALL_ID} onClick={() => selectCategory(ALL_ID)}>
           All
         </CategoryChip>
-        {categories.map((c) => (
-          <CategoryChip
-            key={c.category_id}
-            active={activeCategory === String(c.category_id)}
-            onClick={() => selectCategory(String(c.category_id))}
-          >
-            <span dir="auto">{c.category_name}</span>
-          </CategoryChip>
-        ))}
-      </div>
+        <CategoryPicker categories={categories} activeCategory={activeCategory} onSelect={selectCategory} />
+      </nav>
 
       {/* Channel grid */}
-      <main className="flex-1 overflow-y-auto p-6">
+      <main ref={gridRef} className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-4 sm:p-6">
         {visible.length === 0 ? (
           <div className="mt-24 flex flex-col items-center gap-6 text-center">
             <p className="text-pretty text-2xl text-zinc-500">
-              {activeCategory === FAVORITES_ID
+              {search.trim() ? 'No channels match your search in this group.' : activeCategory === FAVORITES_ID
                 ? 'No favorites yet — star a channel to pin it here.'
                 : 'No channels found.'}
             </p>
-            {activeCategory === FAVORITES_ID && (
+            {search.trim() && (
+              <Button onClick={() => updateSearch('')} className="h-16 min-w-56 bg-zinc-800 text-xl hover:bg-zinc-700">
+                Clear search
+              </Button>
+            )}
+            {activeCategory !== ALL_ID && (
               <Button
                 onClick={() => selectCategory(ALL_ID)}
                 className="h-16 min-w-64 bg-red-600 text-xl font-semibold hover:bg-red-500"
@@ -377,7 +397,8 @@ function CategoryChip({
   return (
     <button
       onClick={onClick}
-      className={`h-16 shrink-0 whitespace-nowrap rounded-full px-7 text-xl font-medium transition-colors ${
+      aria-pressed={active}
+      className={`h-16 shrink-0 whitespace-nowrap rounded-full px-5 text-xl font-medium transition-colors ${
         active
           ? 'bg-red-600 text-white'
           : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700 hover:text-white'

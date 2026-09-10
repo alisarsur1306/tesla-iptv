@@ -29,7 +29,7 @@ give it a non-blocked path; the app supports all three and picks in this order:
 | --- | --- | --- |
 | `XTREAM_PROXY_URL` | A Cloudflare Worker re-fetches the host from Cloudflare's own network, which the origin does not block | A free Cloudflare account. No hardware. |
 | `UPSTREAM_PROXY` | An HTTP proxy borrows a non-datacenter IP — a Tailscale exit node at home, or a commercial residential proxy | An always-on device, or a few $/month |
-| *(neither set)* | Direct from Render | Only works if the origin stops blocking |
+| *(neither set)* | Provider requests blocked on Render; direct in local development | Configure a proxy on Render |
 
 `XTREAM_PROXY_URL` wins when both are set, so you can leave the Tailscale vars
 configured while testing the Worker and fall back by clearing one variable.
@@ -49,7 +49,18 @@ Credentials in that URL are honoured (undici's `ProxyAgent` turns them into a
 `proxy-authorization` header). Clear `TS_AUTHKEY` so the start script skips
 Tailscale and leaves your `UPSTREAM_PROXY` value alone.
 
-Either way, only the Xtream API host is routed. Segments redirect to a CDN that
+The hostname from the configured Xtream account is always routed, even when it
+is absent from the legacy domain list. `PROXY_HOSTS` supplies additional provider
+or image-host suffixes. Redirects re-check routing on each hop.
+
+On Render, a missing proxy now fails closed for those hosts: the app reports the
+missing configuration instead of contacting the provider from its cloud IP.
+This uses Render's documented [`RENDER=true` environment variable](https://render.com/docs/environment-variables).
+A configured proxy that fails is not retried directly. This guard does not check
+where the proxy itself exits; a VPN on the home device still requires separate
+diagnosis below. Unlisted CDN hosts continue to use direct transport.
+
+Segments redirect to a CDN that
 does *not* block datacenter IPs, and its tokens are not IP-bound, so video
 streams direct from Render — the detour carries metadata, never the video.
 
@@ -83,10 +94,9 @@ local use, where `car-tv-on.bat` already runs from a residential IP.
 
 ### Troubleshooting the exit node
 
-Every failure below looks identical from the browser — a Cloudflare "you have
-been blocked" page — because whenever the tunnel isn't actually carrying
-traffic, requests silently fall back to Render's own (blocked) IP. Check in this
-order:
+Distinguish a provider refusal (403) from a tunnel connection failure or timeout.
+A configured tunnel has no automatic direct retry. A missing proxy is now
+explicitly blocked on Render rather than silently using its IP. Check in this order:
 
 | Symptom in Render logs | Cause | Fix |
 |---|---|---|
@@ -171,10 +181,13 @@ and a timeout are then obvious at a glance.
 
 Read it like this:
 
-- `transport: "tunnel"` with a 403 whose preview says Cloudflare → the exit node
-  is not carrying the request (dead, or not actually selected).
-- `transport: "direct"` when you expected otherwise → neither `UPSTREAM_PROXY`
-  nor `XTREAM_PROXY_URL` is set, so requests leave from Render's own IP.
+- `transport: "tunnel"` with a 403 whose preview says Cloudflare → the response
+  refused the request. Check the exit node's actual egress and VPN state; the
+  status alone does not prove that the request went directly from Render.
+- `transport: "blocked"` → neither proxy transport is configured on Render;
+  restore it. No direct provider request was made.
+- `transport: "direct"` → local direct mode, or a host outside the provider
+  routing set. Check the configured account hostname and `PROXY_HOSTS`.
 - `player_api login` fine but `get_live_streams` slow or timing out → the list is
   simply big and slow; that is what the cache and `LIST_TIMEOUT_MS` are for.
 - Every Xtream check failing while `m3u fallback` is `ok` → the backup is doing

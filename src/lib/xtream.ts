@@ -150,34 +150,36 @@ async function fetchXtJson<T>(action?: string): Promise<T> {
   const budget = action && LIST_ACTIONS.has(action) ? LIST_BUDGET_MS : DEFAULT_BUDGET_MS;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), budget);
-  let res: Response;
   try {
-    res = await fetch(xtApiUrl(action), { signal: controller.signal });
+    let res: Response;
+    try {
+      res = await fetch(xtApiUrl(action), { signal: controller.signal });
+    } catch (err) {
+      throw new Error(
+        `Could not reach the server${action ? ` for ${action}` : ''}: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (res.status === 403) throw new AccessKeyError();
+    if (!res.ok) {
+      let detail = '';
+      try {
+        const body = (await res.json()) as { error?: string };
+        if (body && typeof body.error === 'string') detail = ` — ${body.error}`;
+      } catch {
+        // Non-JSON error pages still report the status. A stalled body reports timeout.
+        if (controller.signal.aborted) throw new TimeoutError(budget);
+      }
+      throw new Error(`Request failed (${res.status})${detail}`);
+    }
+    // fetch resolves at the headers; keep the deadline through body consumption too.
+    return (await res.json()) as T;
   } catch (err) {
-    if (err instanceof DOMException && err.name === 'AbortError') throw new TimeoutError(budget);
-    throw new Error(
-      `Could not reach the server${action ? ` for ${action}` : ''}: ` +
-        `${err instanceof Error ? err.message : String(err)}`,
-    );
+    if (controller.signal.aborted) throw new TimeoutError(budget);
+    throw err;
   } finally {
     clearTimeout(timer);
   }
-  if (res.status === 403) {
-    throw new AccessKeyError();
-  }
-  if (!res.ok) {
-    // The backend sends {error: "..."} on failure; surfacing it beats a bare status code,
-    // since it already says whether the source was unreachable, slow, or misconfigured.
-    let detail = '';
-    try {
-      const body = (await res.json()) as { error?: string };
-      if (body && typeof body.error === 'string') detail = ` — ${body.error}`;
-    } catch {
-      /* not JSON; the status alone will have to do */
-    }
-    throw new Error(`Request failed (${res.status})${detail}`);
-  }
-  return (await res.json()) as T;
 }
 
 /** Validate against the server-side account. Throws on bad auth. */
