@@ -56,7 +56,8 @@ const USER_AGENT =
 // listed — so every logo went out directly and came back 403, filling the console and leaving
 // the grid on letter placeholders. Logos are lazy-loaded, so this is roughly a dozen extra
 // requests through the tunnel per screen, not five thousand.
-// PROXY_HOSTS overrides the list (comma-separated suffixes) for a provider that uses others.
+// PROXY_HOSTS overrides these additional suffixes. The configured account host
+// always belongs to the routed set, even when the provider changes domains.
 const PROXY_HOST_SUFFIXES = (process.env.PROXY_HOSTS || 'snapmediatoghater.site,mctvpal.site')
   .split(',')
   .map((h) => h.trim().toLowerCase())
@@ -74,11 +75,19 @@ function getXtreamProxyUrl() {
 
 function isXtreamHost(hostname) {
   const h = hostname.toLowerCase();
+  const server = getXtreamCreds()?.server;
+  if (server) {
+    try {
+      if (new URL(server).hostname.toLowerCase() === h) return true;
+    } catch {
+      // Invalid account URLs are reported by the account request path.
+    }
+  }
   return PROXY_HOST_SUFFIXES.some((s) => h === s || h.endsWith('.' + s));
 }
 
 /**
- * How a request to `hostname` is carried: 'worker' | 'tunnel' | 'direct'.
+ * How a request is carried: 'worker' | 'tunnel' | 'direct' | 'blocked'.
  * Only the Xtream host is ever diverted. The Worker wins when both transports
  * are configured — it needs no always-on hardware, so it is the more reliable
  * of the two; leaving UPSTREAM_PROXY set keeps the tunnel one env var away.
@@ -87,6 +96,9 @@ function transportFor(hostname) {
   if (!isXtreamHost(hostname)) return 'direct';
   if (getXtreamProxyUrl()) return 'worker';
   if (getUpstreamProxy()) return 'tunnel';
+  // Render sets RENDER=true. Never silently send a provider request from its
+  // datacenter IP when the configured proxy disappears after a restart.
+  if (process.env.RENDER === 'true') return 'blocked';
   return 'direct';
 }
 
@@ -127,6 +139,9 @@ async function upstreamFetch(target, options) {
     if (isForbiddenHostname(url.hostname)) throw new Error('Redirect to forbidden host');
     const transport =
       forceTunnel && getUpstreamProxy() ? 'tunnel' : transportFor(url.hostname);
+    if (transport === 'blocked') {
+      throw new Error('Provider proxy is not configured on Render; direct cloud-IP requests are disabled. Restore the Tailscale exit node or configure UPSTREAM_PROXY / XTREAM_PROXY_URL.');
+    }
     let resp;
     if (transport === 'worker') {
       // The Worker is asked for the target; `url` stays the real one, so a
@@ -987,7 +1002,9 @@ export async function handleDiag(req, res) {
         ? 'All provider traffic is being forced through UPSTREAM_PROXY. If the tunnel or its exit node is down, every request fails here regardless of whether the provider is reachable.'
         : out.transport === 'worker'
           ? 'Provider traffic goes through the Cloudflare Worker.'
-          : 'Provider traffic leaves from this host\'s own IP.';
+          : out.transport === 'blocked'
+            ? 'Provider requests are blocked because no proxy is configured on Render. No direct provider request is sent.'
+            : 'Provider traffic leaves from this host\'s own IP.';
     setCors(res);
     return sendJsonBody(res, out);
   }

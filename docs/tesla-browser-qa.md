@@ -33,3 +33,24 @@ Chrome with a synthetic local catalogue (400 channels, 80 groups), at 1200×760 
 - Submit search: the input loses focus so the on-screen keyboard can dismiss.
 
 This is desktop browser verification, not a test on Tesla hardware. Live playback and actual in-car keyboard behavior remain unverified. The local preview uses synthetic metadata and does not connect to the IPTV provider. Production was not deployed as part of these checks.
+
+## Cloud-IP routing follow-up
+
+The user's reported history concerns cloud-IP refusals after refreshing. Code inspection found
+that routing used only fixed domain suffixes, ignoring the configured account host if it changed.
+With no proxy configured it also selected direct transport on Render. Both paths were reproduced
+using local HTTP fixtures; this does not establish the cause of the historical production incident.
+
+- Add the configured account hostname to the routed hosts, including redirect hops.
+- Block routed provider requests on Render when neither proxy transport is configured.
+- Preserve local direct mode and direct requests to unrelated CDN hosts.
+- Report the blocked transport accurately in diagnostics and correct misleading documentation
+  that previously claimed every tunnel failure silently fell back to direct transport.
+- `node --test proxy/routing.test.mjs`: six passed (four failed before the fix).
+  Includes a failed-proxy response with no direct retry.
+- Routing plus existing Worker tests: 11 passed. Build, `npm test`, and the five
+  frontend deadline tests also passed after the routing change. Full suite: 57/59
+  passed, with the same two failures recorded above.
+
+A corporate VPN on the exit-node device can still change that device's outgoing IP. The changes
+do not identify an IP as residential or verify the historical incident's egress address.
