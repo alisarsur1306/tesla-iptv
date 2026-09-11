@@ -1,7 +1,17 @@
 // Smallest check that fails if the proxy's gate breaks: node proxy/hlsProxy.test.mjs
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { mock } from 'node:test';
 import { handleProxy, m3uHeaders, persistList, loadPersistedList } from './hlsProxy.mjs';
+
+// Keep real HTTP between the test client and local app/proxy, but never hit a
+// former provider/CDN on the public internet just to verify routing.
+const clientFetch = globalThis.fetch;
+const directRequests = [];
+mock.method(globalThis, 'fetch', async (url) => {
+  directRequests.push(String(url));
+  return new Response('test segment', { headers: { 'content-type': 'video/mp2t' } });
+});
 
 const server = http.createServer(handleProxy);
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
@@ -9,7 +19,7 @@ const base = `http://127.0.0.1:${server.address().port}/api/proxy`;
 
 const call = async (u, key) => {
   const url = `${base}?u=${encodeURIComponent(u)}${key === undefined ? '' : `&key=${encodeURIComponent(key)}`}`;
-  const res = await fetch(url);
+  const res = await clientFetch(url);
   return { status: res.status, body: await res.text() };
 };
 
@@ -31,7 +41,8 @@ for (const u of ['http://127.0.0.1/x', 'http://10.0.0.5/x', 'http://192.168.1.1/
 // which silently broke playback whenever the provider changed CDN.
 for (const u of ['http://45.139.122.205:5566/hlsr/abc.ts', 'http://some-new-cdn.example.net/x.ts']) {
   const { status, body } = await call(u, 'test-key-123');
-  assert.notEqual(status, 403, `${u} should not be gate-blocked (got ${body})`);
+  assert.equal(status, 200, `${u} should reach the public upstream stub (got ${body})`);
+  assert.equal(directRequests.at(-1), u);
 }
 
 // UPSTREAM_PROXY must route ONLY the Xtream API host. Video segments redirect to a
@@ -50,10 +61,10 @@ await call('http://mhd.snapmediatoghater.site:8080/player_api.php', 'test-key-12
 assert.equal(seenByProxy.length, 1, 'Xtream API host must go through UPSTREAM_PROXY');
 assert.match(seenByProxy[0], /snapmediatoghater\.site/);
 
-// A CDN host must bypass the proxy entirely (this one fails to resolve, which is
-// fine — the assertion is that the proxy never saw it).
+// A CDN host must bypass the proxy and reach the direct fetch stub.
 await call('http://45.139.122.205:5566/hlsr/x.ts', 'test-key-123');
 assert.equal(seenByProxy.length, 1, `CDN traffic must bypass the proxy, saw: ${seenByProxy[1]}`);
+assert.equal(directRequests.at(-1), 'http://45.139.122.205:5566/hlsr/x.ts');
 
 stubProxy.close();
 delete process.env.UPSTREAM_PROXY;
@@ -157,4 +168,5 @@ delete process.env.UPSTREAM_PROXY;
 }
 
 server.close();
+mock.restoreAll();
 console.log('hlsProxy gate + routing checks passed');

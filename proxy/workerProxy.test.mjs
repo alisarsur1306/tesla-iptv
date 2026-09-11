@@ -56,11 +56,20 @@ test('the Xtream host is fetched through the Worker, with the token attached', a
   assert.equal(seenByWorker[0].token, 'tok-abc');
 });
 
-test('a non-Xtream host never touches the Worker', async () => {
+test('a non-Xtream host never touches the Worker', async (t) => {
   seenByWorker.length = 0;
-  // Fails to resolve, which is fine — the assertion is that it went direct.
+  const originalFetch = globalThis.fetch;
+  let directHits = 0;
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    if (String(url) === 'http://some-cdn.example.invalid/x.ts') {
+      directHits++;
+      return new Response('test segment');
+    }
+    return originalFetch(url, options);
+  });
   await call('http://some-cdn.example.invalid/x.ts');
   assert.equal(seenByWorker.length, 0, 'CDN traffic must never ride the Worker');
+  assert.equal(directHits, 1, 'the direct transport must receive the CDN URL');
 });
 
 test('a Location the Worker relays resolves against the origin, not the Worker', async () => {

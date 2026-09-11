@@ -33,6 +33,7 @@ process.env.XTREAM_PASSWORD = PASSWORD;
 process.env.M3U_URL = `http://${XT_HOST}/playlist.m3u`;
 delete process.env.XTREAM_PROXY_URL;
 delete process.env.ACCESS_KEY;
+delete process.env.M3U_AUTH;
 
 const { handleDiag } = await import('./hlsProxy.mjs');
 const app = http.createServer(handleDiag);
@@ -73,6 +74,7 @@ test('secrets are reported as set/unset and never echoed, even by upstream', asy
     XTREAM_USERNAME: true,
     XTREAM_PASSWORD: true,
     M3U_URL: true,
+    M3U_AUTH: false,
     UPSTREAM_PROXY: true,
     XTREAM_PROXY_URL: false,
     ACCESS_KEY: true,

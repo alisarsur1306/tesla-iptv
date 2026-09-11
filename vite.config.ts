@@ -2,7 +2,7 @@ import path from "path"
 import react from "@vitejs/plugin-react"
 import { defineConfig, type Plugin } from "vite"
 import { inspectAttr } from 'kimi-plugin-inspect-react'
-import { handleProxy, handleXtreamApi, handleStream, handleExportM3u, handleDiag, isManaged, getRequiredKey, isKeyValid } from './proxy/hlsProxy.mjs'
+import { handleProxy, handleXtreamApi, handleStream, handleExportM3u, handleDiag, handleHealth, isManaged, getRequiredKey, isKeyValid } from './proxy/hlsProxy.mjs'
 
 // Same-origin /api/proxy middleware so the browser never hits the IPTV
 // server directly (the upstream HLS endpoints send no CORS headers).
@@ -12,6 +12,10 @@ function hlsProxyPlugin(): Plugin {
     name: 'hls-proxy',
     configureServer(server) {
       server.middlewares.use((req, res, next) => {
+        if (req.url?.split('?')[0] === '/api/health') {
+          void handleHealth(req, res)
+          return
+        }
         if (req.url?.startsWith('/api/proxy')) {
           void handleProxy(req, res)
           return

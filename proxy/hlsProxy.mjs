@@ -14,10 +14,10 @@
 //   /api/proxy?u=... URL (segments, sub-playlists, EXT-X-KEY URIs).
 // - Two optional transports exist for the Xtream API host, which Cloudflare
 //   refuses to serve to datacenter IPs. Either one carries ONLY that host's
-//   small API/redirect requests; video segments always go direct. See DEPLOY.md.
+//   API/redirect requests; unlisted CDN hosts go direct. See DEPLOY.md.
 //     * XTREAM_PROXY_URL — a Cloudflare Worker that re-fetches the host from
-//       Cloudflare's own network (which the origin does not block). Needs no
-//       always-on hardware, so it wins when both are set.
+//       Cloudflare's own network. Acceptance depends on the provider's rules;
+//       this route wins when both transports are set.
 //     * UPSTREAM_PROXY — an HTTP proxy (a Tailscale exit node, or a commercial
 //       residential proxy) that borrows a non-datacenter IP.
 
@@ -49,8 +49,8 @@ const USER_AGENT =
 // Hosts reached through UPSTREAM_PROXY when it is set. Only the Xtream API host
 // belongs here: it sits behind Cloudflare, which blocks datacenter IPs, so on a
 // cloud deployment those requests must exit via a residential IP (see DEPLOY.md).
-// Segments redirect to a CDN that does NOT block datacenter IPs and whose tokens
-// are not IP-bound, so they go direct — keeping the video off the tunnel.
+// Unlisted CDN hosts go direct to keep video off the tunnel. Whether a given
+// CDN accepts this path and its tokens work across IPs must be verified.
 // Hosts that Cloudflare refuses from a datacenter IP, and which therefore have to leave through
 // the tunnel. The channel logos live on a different domain from the API, and only the API was
 // listed — so every logo went out directly and came back 403, filling the console and leaving
@@ -63,12 +63,12 @@ const PROXY_HOST_SUFFIXES = (process.env.PROXY_HOSTS || 'snapmediatoghater.site,
   .map((h) => h.trim().toLowerCase())
   .filter(Boolean);
 
-/** HTTP proxy for Cloudflare-blocked hosts, e.g. '127.0.0.1:1055'. Unset = direct. */
+/** HTTP proxy for provider hosts, e.g. '127.0.0.1:1055'. */
 function getUpstreamProxy() {
   return process.env.UPSTREAM_PROXY || '';
 }
 
-/** Cloudflare Worker base URL that re-fetches the Xtream host. Unset = direct. */
+/** Cloudflare Worker base URL that re-fetches the Xtream host. */
 function getXtreamProxyUrl() {
   return process.env.XTREAM_PROXY_URL || '';
 }
@@ -89,8 +89,7 @@ function isXtreamHost(hostname) {
 /**
  * How a request is carried: 'worker' | 'tunnel' | 'direct' | 'blocked'.
  * Only the Xtream host is ever diverted. The Worker wins when both transports
- * are configured — it needs no always-on hardware, so it is the more reliable
- * of the two; leaving UPSTREAM_PROXY set keeps the tunnel one env var away.
+ * are configured; this is configuration priority, not a reachability guarantee.
  */
 function transportFor(hostname) {
   if (!isXtreamHost(hostname)) return 'direct';
@@ -132,13 +131,12 @@ function proxyAgent() {
  */
 async function upstreamFetch(target, options) {
   let url = target;
-  // forceTunnel lets a diagnostic ask "what does the world see when we go through the tunnel?"
-  // about a host that is not itself on the tunnel list.
-  const { forceTunnel, ...fetchOptions } = options || {};
+  // Diagnostics may measure an unrelated IP-check host through the exact route
+  // selected for the provider. This override is internal, never a URL parameter.
+  const { diagnosticTransport, ...fetchOptions } = options || {};
   for (let hop = 0; hop < 5; hop++) {
     if (isForbiddenHostname(url.hostname)) throw new Error('Redirect to forbidden host');
-    const transport =
-      forceTunnel && getUpstreamProxy() ? 'tunnel' : transportFor(url.hostname);
+    const transport = diagnosticTransport || transportFor(url.hostname);
     if (transport === 'blocked') {
       throw new Error('Provider proxy is not configured on Render; direct cloud-IP requests are disabled. Restore the Tailscale exit node or configure UPSTREAM_PROXY / XTREAM_PROXY_URL.');
     }
@@ -462,6 +460,108 @@ function keyGate(req, res, url) {
     return false;
   }
   return true;
+}
+
+const HEALTH_TIMEOUT_MS = 10_000;
+const HEALTH_CACHE_MS = 15_000;
+let healthCached = null;
+let healthInflight = null;
+let healthRouteKey = '';
+
+/** A fresh login check: no channel/video fetch, list cache or M3U fallback. */
+async function checkProviderHealth(creds, route) {
+  const answer = (status) => ({ status, route, checkedAt: Date.now() });
+  if (!creds) return answer(getM3uSource() ? 'unknown' : 'not_configured');
+  let target;
+  try {
+    target = new URL(`${creds.server}/player_api.php`);
+    if (!['http:', 'https:'].includes(target.protocol) || isForbiddenHostname(target.hostname)) {
+      return answer('not_configured');
+    }
+    target.searchParams.set('username', creds.username);
+    target.searchParams.set('password', creds.password);
+  } catch {
+    return answer('not_configured');
+  }
+  if (route === 'blocked') return answer('not_configured');
+
+  const controller = new AbortController();
+  let timer;
+  const deadline = new Promise((resolve) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      resolve(answer('timeout'));
+    }, HEALTH_TIMEOUT_MS);
+  });
+  const check = (async () => {
+    try {
+      const response = await upstreamFetch(target, {
+        headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' },
+        signal: controller.signal,
+      });
+      if ([401, 403, 429].includes(response.status)) return answer('provider_rejected');
+      if (!response.ok) return answer('unknown');
+      // Keep the deadline alive until JSON is fully read. A 200 response with an
+      // expired account or a challenge page must never turn the UI green.
+      let data;
+      try {
+        data = await response.json();
+      } catch {
+        return answer(controller.signal.aborted ? 'timeout' : 'unknown');
+      }
+      const info = data?.user_info;
+      if (info?.auth === 0 || info?.auth === '0') return answer('provider_rejected');
+      if (info?.auth !== 1 && info?.auth !== '1') return answer('unknown');
+      if (typeof info.status !== 'string' || !info.status.trim()) return answer('unknown');
+      return answer(info.status.trim().toLowerCase() === 'active' ? 'ok' : 'provider_rejected');
+    } catch (error) {
+      if (controller.signal.aborted || error?.name === 'TimeoutError' ||
+          error?.cause?.code === 'UND_ERR_CONNECT_TIMEOUT') return answer('timeout');
+      return answer(route === 'tunnel' || route === 'worker' ? 'proxy_unreachable' : 'unknown');
+    }
+  })();
+  try {
+    return await Promise.race([check, deadline]);
+  } finally {
+    clearTimeout(timer);
+    // Also closes refusal/error bodies that were intentionally not read.
+    controller.abort();
+  }
+}
+
+/** GET /api/health: bounded, coalesced diagnosis safe to show in the player. */
+export async function handleHealth(req, res) {
+  res.on('error', () => {});
+  setCors(res);
+  res.setHeader('Cache-Control', 'no-store');
+  const url = new URL(req.url || '/', 'http://localhost');
+  if (!keyGate(req, res, url)) return;
+  if (req.method !== 'GET') return sendError(res, 405, 'Method not allowed');
+  const creds = getXtreamCreds();
+  let route = 'blocked';
+  try {
+    if (creds) route = transportFor(new URL(creds.server).hostname);
+  } catch { /* invalid configuration is described by the health result */ }
+  // A changed transport must not reuse a diagnosis for the previous path.
+  const routeKey = JSON.stringify([route, getUpstreamProxy(), getXtreamProxyUrl(), process.env.XTREAM_PROXY_TOKEN]);
+  if (routeKey !== healthRouteKey) {
+    healthRouteKey = routeKey;
+    healthCached = null;
+    healthInflight = null;
+  }
+  if (healthCached && Date.now() - healthCached.checkedAt < HEALTH_CACHE_MS) {
+    return sendJsonBody(res, healthCached);
+  }
+  if (!healthInflight) {
+    const pending = checkProviderHealth(creds, route).then((result) => {
+      if (healthRouteKey === routeKey) healthCached = result;
+      return result;
+    }).finally(() => {
+      if (healthInflight === pending) healthInflight = null;
+    });
+    healthInflight = pending;
+  }
+  sendJsonBody(res, await healthInflight);
 }
 
 // The player_api actions that download the whole channel list (as opposed to the
@@ -917,19 +1017,24 @@ export async function handleDiag(req, res) {
   }
   if (quick) {
     out.quick = true;
-    // What address does the provider actually see? The whole point of the tunnel is to leave
-    // from a residential IP, and nothing reported whether that was still true — so an exit node
-    // that quietly started routing through somewhere else (a VPN coming up on that machine, a
-    // changed default route) looked identical to a dead tunnel: requests simply stopped being
-    // answered. This turns that into one line.
+    // Observe an IP-check service through the provider's selected transport.
+    // Worker has priority over tunnel here just as it does for provider traffic.
+    // This is an observed egress address, not proof of residential ownership or
+    // proof that the provider sees the identical route for every redirect.
+    out.egressTransport = out.transport || 'blocked';
     try {
+      if (out.egressTransport === 'blocked') throw new Error('No provider transport is configured');
       const ipRes = await upstreamFetch(new URL('https://api.ipify.org?format=json'), {
         headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' },
         signal: AbortSignal.timeout(10000),
-        forceTunnel: true,
+        diagnosticTransport: out.egressTransport,
       });
+      if (!ipRes.ok) {
+        await ipRes.body?.cancel();
+        throw new Error(`Egress check returned HTTP ${ipRes.status} through ${out.egressTransport}`);
+      }
       const j = await ipRes.json().catch(() => ({}));
-      out.egressIp = j.ip || null;
+      out.egressIp = typeof j.ip === 'string' ? j.ip : null;
     } catch (e) {
       out.egressIp = null;
       out.egressIpError = String(e && e.message ? e.message : e);
@@ -999,7 +1104,7 @@ export async function handleDiag(req, res) {
       : null;
     out.note =
       out.transport === 'tunnel'
-        ? 'All provider traffic is being forced through UPSTREAM_PROXY. If the tunnel or its exit node is down, every request fails here regardless of whether the provider is reachable.'
+        ? 'Known provider hosts use UPSTREAM_PROXY; unlisted redirect hosts may go direct. A selected tunnel and an observed egress IP do not prove residential forwarding or provider acceptance.'
         : out.transport === 'worker'
           ? 'Provider traffic goes through the Cloudflare Worker.'
           : out.transport === 'blocked'

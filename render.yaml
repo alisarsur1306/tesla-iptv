@@ -5,7 +5,8 @@ services:
     plan: free
     # Tailscale static binaries are fetched at build time so the start command can
     # bring up an exit node — the Xtream host blocks Render's datacenter IPs.
-    buildCommand: npm install && npm run build && ./fetch-tailscale.sh
+    buildCommand: npm ci && npm run check && ./fetch-tailscale.sh
+    autoDeployTrigger: checksPass
     startCommand: ./render-start.sh
     envVars:
       - key: NODE_VERSION

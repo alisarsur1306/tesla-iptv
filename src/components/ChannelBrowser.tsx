@@ -1,5 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import CategoryPicker from '@/components/CategoryPicker';
+import ConnectionStatus from '@/components/ConnectionStatus';
+import LanguageSelect from '@/components/LanguageSelect';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import {
@@ -14,19 +16,22 @@ import {
   type XtreamCreds,
   type XtreamLiveStream,
 } from '@/lib/xtream';
-import { Loader2, LogOut, Search, Star, Tv, X } from 'lucide-react';
+import { Clock3, Loader2, LogOut, Play, Search, Star, Tv, X } from 'lucide-react';
+import { useLocale } from '@/lib/locale';
+import { browserStrings } from '@/lib/browserStrings';
+import {
+  ALL_ID, FAVORITES_ID, PAGE_SIZE, RECENT_ID, readBrowserView, resolveBrowserCategory,
+  resolveRecentChannels, writeBrowserView,
+} from '@/lib/browserView';
 
 const FAVORITES_KEY = 'tesla-iptv:favorites';
-const PAGE_SIZE = 120;
-const FAVORITES_ID = '__favorites__';
-const ALL_ID = '__all__';
 
 function loadFavorites(): Set<number> {
   try {
     const raw = localStorage.getItem(FAVORITES_KEY);
     if (!raw) return new Set();
     const arr = JSON.parse(raw) as number[];
-    return new Set(Array.isArray(arr) ? arr : []);
+    return new Set(Array.isArray(arr) ? arr.filter((id) => Number.isSafeInteger(id) && id > 0) : []);
   } catch {
     return new Set();
   }
@@ -39,9 +44,13 @@ interface ChannelBrowserProps {
   onLogout: () => void;
   onNeedKey: () => void;
   retryToken: number;
+  recentIds?: number[];
 }
 
-export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, retryToken }: ChannelBrowserProps) {
+export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, retryToken, recentIds = [] }: ChannelBrowserProps) {
+  const { locale } = useLocale();
+  const t = browserStrings[locale];
+  const direction = locale === 'en' ? 'ltr' : 'rtl';
   const gridRef = useRef<HTMLElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   // Seeded from the browser cache so a repeat visit renders immediately instead of waiting on
@@ -50,14 +59,18 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
   const [categories, setCategories] = useState<XtreamCategory[]>(() => seed?.categories ?? []);
   const [streams, setStreams] = useState<XtreamLiveStream[]>(() => seed?.streams ?? []);
   const [loading, setLoading] = useState(() => !seed);
-  const [error, setError] = useState<string | null>(null);
+  const [catalogueReady, setCatalogueReady] = useState(Boolean(seed));
+  const catalogueLoaded = useRef(Boolean(seed));
+  const [error, setError] = useState(false);
   // Favourites is the right landing tab once there are some, and the wrong one before that:
   // a first run opened on an empty screen saying "No favorites yet" instead of channels.
-  const [activeCategory, setActiveCategory] = useState<string>(() =>
-    loadFavorites().size > 0 ? FAVORITES_ID : ALL_ID,
-  );
-  const [search, setSearch] = useState('');
-  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
+  const [initialView] = useState(() => readBrowserView(loadFavorites().size > 0 ? FAVORITES_ID : ALL_ID));
+  const [selectedCategory, setSelectedCategory] = useState(initialView.category);
+  const [search, setSearch] = useState(initialView.search);
+  const [visibleCount, setVisibleCount] = useState(initialView.visibleCount);
+  const scrollTop = useRef(initialView.scrollTop);
+  const restorePending = useRef(true);
+  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [favorites, setFavorites] = useState<Set<number>>(() => loadFavorites());
   const [brokenIcons, setBrokenIcons] = useState<Set<number>>(new Set());
   // A bare spinner cannot be told apart from a hung one. Counting proves the app is alive and
@@ -84,26 +97,28 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
     return () => clearInterval(id);
   }, [loading, retryToken]);
 
-  const hasCache = Boolean(seed);
+  const activeCategory = resolveBrowserCategory(selectedCategory, categories.map((c) => String(c.category_id)), catalogueReady);
 
   useEffect(() => {
     let cancelled = false;
-    setError(null);
     Promise.all([getLiveCategories(creds), getLiveStreams(creds)])
       .then(([cats, chans]) => {
         if (cancelled) return;
         setCategories(cats);
         setStreams(chans);
         writeChannelCache(cats, chans);
+        catalogueLoaded.current = true;
+        setCatalogueReady(true);
+        setError(false);
         setLoading(false);
       })
       .catch((err) => {
         if (cancelled) return;
         if (err instanceof AccessKeyError) {
-          setError(null);
+          setError(false);
           onNeedKey(); // ask for the key; saving it bumps retryToken and refires this effect
-        } else if (!hasCache) {
-          setError(err instanceof Error ? err.message : 'Failed to load channels.');
+        } else if (!catalogueLoaded.current) {
+          setError(true);
         }
         // With a cached list on screen, a failed refresh is not worth replacing it with an
         // error page — the channels shown are still the real ones, just older.
@@ -112,7 +127,39 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
     return () => {
       cancelled = true;
     };
-  }, [creds, retryToken, onNeedKey, hasCache]);
+  }, [creds, retryToken, onNeedKey]);
+
+  // Restore after the saved number of cards has rendered; do not overwrite the position with
+  // the loading screen's zero-height layout. Native scroll bounds handle a shorter catalogue.
+  useLayoutEffect(() => {
+    const grid = gridRef.current;
+    if (!grid || !catalogueReady || loading || error) return;
+    if (activeCategory !== selectedCategory) grid.scrollTop = 0;
+    else if (restorePending.current) grid.scrollTop = initialView.scrollTop;
+    scrollTop.current = grid.scrollTop;
+    restorePending.current = false;
+  }, [loading, error, catalogueReady, initialView.scrollTop, activeCategory, selectedCategory]);
+
+  const saveView = useCallback(() => {
+    if (!catalogueReady || restorePending.current) return;
+    writeBrowserView({ category: activeCategory, search, visibleCount, scrollTop: scrollTop.current });
+  }, [catalogueReady, activeCategory, search, visibleCount]);
+
+  useEffect(() => {
+    saveView();
+    window.addEventListener('pagehide', saveView);
+    return () => {
+      if (saveTimer.current !== null) clearTimeout(saveTimer.current);
+      window.removeEventListener('pagehide', saveView);
+      saveView();
+    };
+  }, [saveView]);
+
+  function rememberScroll() {
+    scrollTop.current = gridRef.current?.scrollTop ?? 0;
+    if (saveTimer.current !== null) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(saveView, 250);
+  }
 
   function toggleFavorite(id: number) {
     setFavorites((prev) => {
@@ -134,10 +181,15 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
     return m;
   }, [categories]);
 
+  const recent = useMemo(() => resolveRecentChannels(recentIds, streams), [recentIds, streams]);
+  const lastChannel = recent[0];
+
   const filtered = useMemo(() => {
     let list = streams;
     if (activeCategory === FAVORITES_ID) {
       list = list.filter((s) => favorites.has(s.stream_id));
+    } else if (activeCategory === RECENT_ID) {
+      list = recent;
     } else if (activeCategory !== ALL_ID) {
       list = list.filter((s) => String(s.category_id) === activeCategory);
     }
@@ -153,39 +205,44 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
       );
     }
     return list;
-  }, [streams, activeCategory, search, favorites, categoryName]);
+  }, [streams, activeCategory, search, favorites, categoryName, recent]);
 
   const visible = filtered.slice(0, visibleCount);
 
   function selectCategory(id: string) {
-    setActiveCategory(id);
+    setSelectedCategory(id);
     setVisibleCount(PAGE_SIZE);
+    scrollTop.current = 0;
     gridRef.current?.scrollTo({ top: 0 });
   }
 
   function updateSearch(value: string) {
-    setSearch(value);
+    setSearch(value.slice(0, 128));
     setVisibleCount(PAGE_SIZE);
+    scrollTop.current = 0;
     gridRef.current?.scrollTo({ top: 0 });
   }
 
   if (loading) {
     return (
-      <div className="flex h-dvh flex-col items-center justify-center gap-6 bg-zinc-950 p-8 text-zinc-100">
+      <div dir={direction} className="flex h-dvh flex-col items-center justify-center gap-6 bg-zinc-950 p-8 text-zinc-100">
+        <LanguageSelect />
         <Loader2 className="size-16 animate-spin text-red-500" />
-        <p className="text-2xl text-zinc-400">Loading channels… {elapsed}s</p>
+        <p role="status" className="text-2xl text-zinc-400">{t.loading} {elapsed}{t.seconds}</p>
         {/* The channel list is megabytes of JSON pulled through the upstream proxy, so a slow
             first load is normal. Say so before it reads as a hang. */}
         {elapsed >= 10 && (
           <p className="max-w-xl text-pretty text-center text-lg text-zinc-500">
-            The full channel list can take up to a minute on a cold start.
+            {t.coldStart}
           </p>
         )}
         {elapsed >= 45 && (
-          <p className="max-w-xl text-pretty text-center text-lg text-amber-500">
-            Still waiting on the IPTV source. If this fails, open{' '}
-            <span className="font-mono">/api/diag</span> to see which step is failing.
-          </p>
+          <>
+            <p className="max-w-xl text-pretty text-center text-lg text-amber-500">{t.stillWaiting}</p>
+            <Button onClick={() => window.location.reload()} className="h-16 min-w-56 bg-zinc-800 text-xl hover:bg-zinc-700">
+              {t.retry}
+            </Button>
+          </>
         )}
       </div>
     );
@@ -193,56 +250,54 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
 
   if (error) {
     return (
-      <div className="flex h-dvh flex-col items-center justify-center gap-6 bg-zinc-950 p-8 text-zinc-100">
-        <p className="max-w-xl text-pretty text-center text-2xl text-red-400">{error}</p>
+      <div dir={direction} className="flex h-dvh flex-col items-center justify-center gap-6 bg-zinc-950 p-8 text-zinc-100">
+        <LanguageSelect />
+        <p role="alert" className="max-w-xl text-pretty text-center text-2xl text-red-400">{t.failed}</p>
+        <div className="w-full max-w-xl"><ConnectionStatus onNeedKey={onNeedKey} /></div>
         <div className="flex flex-wrap items-center justify-center gap-4">
           <Button
             onClick={() => window.location.reload()}
             className="h-16 min-w-56 bg-red-600 text-xl hover:bg-red-500"
           >
-            Try again
+            {t.retry}
           </Button>
           <Button onClick={onLogout} className="h-16 min-w-56 bg-zinc-800 text-xl hover:bg-zinc-700">
-            <LogOut className="mr-2 size-6" /> Back to login
+            <LogOut className="me-2 size-6" /> {t.backToLogin}
           </Button>
         </div>
-        <a
-          href="/api/diag"
-          className="text-lg text-zinc-500 underline underline-offset-4 hover:text-zinc-300"
-        >
-          Open /api/diag
-        </a>
       </div>
     );
   }
 
   return (
-    <div className="flex h-dvh flex-col bg-zinc-950 text-zinc-100">
+    <div dir={direction} className="flex h-dvh min-w-0 flex-col bg-zinc-950 text-zinc-100">
       {/* Header */}
       <header className="flex shrink-0 flex-wrap items-center gap-3 border-b border-zinc-800 px-4 py-4 sm:px-6">
         <Tv className="size-8 shrink-0 text-red-500" />
         <h1 className="text-2xl font-bold tracking-tight">Tesla IPTV</h1>
+        <LanguageSelect />
         <span className="hidden rounded-full bg-zinc-800 px-3 py-1.5 text-base tabular-nums text-zinc-300 xl:inline">
-          {filtered.length.toLocaleString()} / {streams.length.toLocaleString()}
+          {filtered.length.toLocaleString(locale)} / {streams.length.toLocaleString(locale)}
         </span>
-        <div className="flex w-full items-center gap-3 sm:ml-auto sm:w-auto sm:min-w-0 sm:flex-1 sm:justify-end">
+        <div className="flex w-full items-center gap-3 sm:ms-auto sm:w-auto sm:min-w-0 sm:flex-1 sm:justify-end">
           <form className="relative min-w-0 flex-1 sm:max-w-md" onSubmit={(event) => {
             event.preventDefault();
             searchRef.current?.blur();
           }}>
-            <Search className="absolute left-4 top-1/2 size-6 -translate-y-1/2 text-zinc-500" />
+            <Search className="absolute start-4 top-1/2 size-6 -translate-y-1/2 text-zinc-500" />
             <Input
               ref={searchRef}
-              aria-label="Search channels or groups"
+              aria-label={t.search}
               enterKeyHint="search"
+              maxLength={128}
               value={search}
               onChange={(e) => updateSearch(e.target.value)}
-              placeholder="Search channels or groups…"
-              className="h-16 w-full border-zinc-700 bg-zinc-900 pl-14 pr-16 text-xl md:text-xl"
+              placeholder={t.searchPlaceholder}
+              className="h-16 w-full border-zinc-700 bg-zinc-900 ps-14 pe-16 text-xl md:text-xl"
             />
             {search && (
-              <button type="button" aria-label="Clear search" onClick={() => updateSearch('')}
-                className="absolute right-1 top-1 flex size-14 items-center justify-center rounded-xl text-zinc-300 hover:bg-zinc-800">
+              <button type="button" aria-label={t.clearSearch} onClick={() => updateSearch('')}
+                className="absolute end-1 top-1 flex size-14 items-center justify-center rounded-xl text-zinc-300 hover:bg-zinc-800">
                 <X className="size-7" />
               </button>
             )}
@@ -250,7 +305,7 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
           <Button
             onClick={onLogout}
             variant="outline"
-            aria-label="Log out"
+            aria-label={t.logout}
             className="size-16 shrink-0 border-zinc-700 bg-transparent text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100"
           >
             <LogOut className="size-7" />
@@ -258,32 +313,46 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
         </div>
       </header>
 
+      <ConnectionStatus onNeedKey={onNeedKey} />
+
       {/* Category chips */}
-      <nav aria-label="Channel filters" className="flex shrink-0 flex-wrap gap-3 border-b border-zinc-800 px-4 py-3 sm:px-6">
+      <nav aria-label={t.filters} className="flex shrink-0 flex-wrap gap-3 border-b border-zinc-800 px-4 py-3 sm:px-6">
         <CategoryChip
           active={activeCategory === FAVORITES_ID}
           onClick={() => selectCategory(FAVORITES_ID)}
         >
-          ★ Favorites ({favorites.size})
+          ★ {t.favorites} ({favorites.size})
         </CategoryChip>
         <CategoryChip active={activeCategory === ALL_ID} onClick={() => selectCategory(ALL_ID)}>
-          All
+          {t.all}
+        </CategoryChip>
+        <CategoryChip active={activeCategory === RECENT_ID} onClick={() => selectCategory(RECENT_ID)}>
+          <Clock3 aria-hidden="true" className="size-5" /> {t.recent}
         </CategoryChip>
         <CategoryPicker categories={categories} activeCategory={activeCategory} onSelect={selectCategory} />
       </nav>
 
       {/* Channel grid */}
-      <main ref={gridRef} className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-4 sm:p-6">
+      <main ref={gridRef} onScroll={rememberScroll} className="min-h-0 min-w-0 flex-1 overflow-y-auto overscroll-contain p-4 sm:p-6">
+        {lastChannel && (
+          <button
+            onClick={() => onPlay(lastChannel, streams)}
+            aria-label={`${t.continueWatching}: ${lastChannel.name}`}
+            className="mb-4 flex min-h-16 w-full min-w-0 items-center gap-3 rounded-xl border border-red-700/60 bg-red-950/40 px-4 py-3 text-start hover:bg-red-950/70"
+          >
+            <Play aria-hidden="true" className="size-6 shrink-0 text-red-400" />
+            <span className="min-w-0 text-lg"><span className="text-zinc-400">{t.continueWatching}: </span><bdi className="break-words font-medium">{lastChannel.name}</bdi></span>
+          </button>
+        )}
         {visible.length === 0 ? (
           <div className="mt-24 flex flex-col items-center gap-6 text-center">
             <p className="text-pretty text-2xl text-zinc-500">
-              {search.trim() ? 'No channels match your search in this group.' : activeCategory === FAVORITES_ID
-                ? 'No favorites yet — star a channel to pin it here.'
-                : 'No channels found.'}
+              {search.trim() ? t.noSearch : activeCategory === FAVORITES_ID
+                ? t.noFavorites : activeCategory === RECENT_ID ? t.noRecent : t.noChannels}
             </p>
             {search.trim() && (
               <Button onClick={() => updateSearch('')} className="h-16 min-w-56 bg-zinc-800 text-xl hover:bg-zinc-700">
-                Clear search
+                {t.clearSearch}
               </Button>
             )}
             {activeCategory !== ALL_ID && (
@@ -291,7 +360,7 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
                 onClick={() => selectCategory(ALL_ID)}
                 className="h-16 min-w-64 bg-red-600 text-xl font-semibold hover:bg-red-500"
               >
-                Browse all channels
+                {t.browseAll}
               </Button>
             )}
           </div>
@@ -313,9 +382,9 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
                   >
                     <button
                       onClick={() => onPlay(ch, filtered)}
-                      aria-label={`Play ${ch.name}`}
+                      aria-label={`${t.play} ${ch.name}`}
                       title={ch.name}
-                      className="flex min-h-16 min-w-0 flex-1 items-center gap-3 text-left"
+                      className="flex min-h-16 min-w-0 flex-1 items-center gap-3 text-start"
                     >
                       {icon ? (
                         <img
@@ -344,7 +413,7 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
                         </span>
                         {refused ? (
                           <span className="truncate text-sm text-amber-500">
-                            Not included in your subscription
+                            {t.unavailable}
                           </span>
                         ) : (
                           categoryName.get(String(ch.category_id)) && (
@@ -357,7 +426,8 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
                     </button>
                     <button
                       onClick={() => toggleFavorite(ch.stream_id)}
-                      aria-label={isFav ? 'Remove from favorites' : 'Add to favorites'}
+                      aria-label={isFav ? t.removeFavorite : t.addFavorite}
+                      aria-pressed={isFav}
                       className="flex size-14 shrink-0 items-center justify-center rounded-full hover:bg-zinc-700 active:bg-zinc-700"
                     >
                       <Star
@@ -374,7 +444,7 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
                   onClick={() => setVisibleCount((n) => n + PAGE_SIZE)}
                   className="h-16 min-w-72 bg-zinc-800 text-xl tabular-nums hover:bg-zinc-700"
                 >
-                  Show more ({(filtered.length - visibleCount).toLocaleString()} left)
+                  {t.more} ({(filtered.length - visibleCount).toLocaleString(locale)} {t.remaining})
                 </Button>
               </div>
             )}
@@ -398,7 +468,7 @@ function CategoryChip({
     <button
       onClick={onClick}
       aria-pressed={active}
-      className={`h-16 shrink-0 whitespace-nowrap rounded-full px-5 text-xl font-medium transition-colors ${
+      className={`flex h-16 shrink-0 items-center gap-2 whitespace-nowrap rounded-full px-5 text-xl font-medium transition-colors ${
         active
           ? 'bg-red-600 text-white'
           : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700 hover:text-white'

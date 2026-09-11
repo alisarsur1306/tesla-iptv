@@ -8,8 +8,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 
 const XT_HOST = 'mhd.snapmediatoghater.site:8080';
+// Each process must own its list cache: production temp files or another test
+// suite must not decide whether this suite sees an M3U fallback.
+const cachePrefix = path.join(os.tmpdir(), 'tesla-list-test-');
+const cacheDirectory = await mkdtemp(cachePrefix);
+process.env.CACHE_DIR = cacheDirectory;
 
 // --- stub upstream ---------------------------------------------------------
 let playerApiOk = false; // flipped once the fallback case has run
@@ -85,8 +94,16 @@ test('player_api responses are cached, so a second list costs no upstream call',
   playerApiOk = true;
   playerApiHits.length = 0;
 
-  const first = await (await fetch(`${origin}/api/xt?action=get_live_streams`)).json();
-  assert.deepEqual(first, XT_STREAMS, 'Xtream is healthy again, so its own list wins');
+  // The first retry serves the fallback immediately while a background probe
+  // checks recovery. Wait for that probe, instead of assuming its network
+  // response completes before the fallback response reaches the caller.
+  let first;
+  for (let attempt = 0; attempt < 50; attempt++) {
+    first = await (await fetch(`${origin}/api/xt?action=get_live_streams`)).json();
+    if (first[0]?.stream_id === 77) break;
+    await delay(20);
+  }
+  assert.deepEqual(first, XT_STREAMS, 'the successful background probe restores the Xtream list');
   assert.equal(playerApiHits.length, 1);
 
   const second = await (await fetch(`${origin}/api/xt?action=get_live_streams`)).json();
@@ -110,7 +127,11 @@ test('once Xtream serves the list again, ids resolve as Xtream stream ids', asyn
   assert.deepEqual(otherHits, ['/live/u/p/42.ts']);
 });
 
-test.after(() => {
+test.after(async () => {
+  app.closeAllConnections();
   app.close();
+  upstream.closeAllConnections();
   upstream.close();
+  assert.ok(path.resolve(cacheDirectory).startsWith(path.resolve(cachePrefix)));
+  await rm(cacheDirectory, { recursive: true, force: true });
 });

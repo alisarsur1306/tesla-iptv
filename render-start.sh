@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Render start command. Brings up Tailscale in userspace mode so requests to the
 # Xtream API host can exit via a residential exit node (Cloudflare blocks Render's
-# datacenter IPs), then starts the app. Video segments still go direct — only the
-# Xtream host is routed through the proxy (see proxy/hlsProxy.mjs).
+# datacenter IPs), then starts the app. Unlisted CDN hosts go direct; configured
+# provider hosts take the selected proxy route (see proxy/hlsProxy.mjs).
 #
-# Without TS_AUTHKEY set, this is a no-op passthrough: the app starts normally and
-# talks to upstream directly. That keeps local/other deploys working unchanged.
+# Without TS_AUTHKEY, the app uses any separately configured Worker or HTTP
+# proxy. With neither, known provider hosts are blocked on Render; local mode
+# may connect directly. Startup configuration is not an egress health check.
 set -euo pipefail
 
 if [ -n "${TS_AUTHKEY:-}" ]; then
@@ -39,9 +40,19 @@ if [ -n "${TS_AUTHKEY:-}" ]; then
   ./tailscale --socket="${TS_SOCKET}" status --json > /dev/null \
     || { echo "tailscale failed to come up" >&2; exit 1; }
   export UPSTREAM_PROXY="127.0.0.1:${PROXY_PORT}"
-  echo "Tailscale up; routing Xtream host via exit node ${TS_EXIT_NODE}"
+  echo "Tailscale configured with an exit node; forwarding and provider access still need a health check"
 else
-  echo "TS_AUTHKEY unset — upstream requests go direct (no exit node)"
+  echo "TS_AUTHKEY unset; no Tailscale proxy started"
+fi
+
+if [ -n "${XTREAM_PROXY_URL:-}" ]; then
+  echo "Provider transport: Worker (takes priority over UPSTREAM_PROXY)"
+elif [ -n "${UPSTREAM_PROXY:-}" ]; then
+  echo "Provider transport: HTTP proxy; use /api/health to check provider access"
+elif [ "${RENDER:-}" = "true" ]; then
+  echo "Provider transport: blocked (no Worker or HTTP proxy configured on Render)"
+else
+  echo "Provider transport: direct (local/non-Render mode)"
 fi
 
 exec node server.js

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { AccessKeyError, TimeoutError, getLiveStreams } from './xtream.ts';
+import { AccessKeyError, TimeoutError, getLiveStreams, initAccessKeyFromUrl, getAccessKey, setAccessKey } from './xtream.ts';
 
 const creds = { server: 'managed', username: 'managed', password: 'managed' };
 
@@ -56,4 +56,25 @@ test('an invalid access key retains its distinct error', async (t) => {
 test('upstream error details remain visible', async (t) => {
   t.mock.method(globalThis, 'fetch', async () => Response.json({ error: 'Source offline' }, { status: 502 }));
   await assert.rejects(getLiveStreams(creds), /Request failed \(502\).*Source offline/);
+});
+
+test('URL access key works in memory and is removed from the address even when storage is unavailable', (t) => {
+  const oldWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  const oldStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  let cleaned;
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: {
+    getItem() { throw new Error('storage disabled'); }, setItem() { throw new Error('storage disabled'); }, removeItem() {},
+  } });
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: {
+    location: { search: '?key=preview-only&lang=he', pathname: '/', hash: '#tv' },
+    history: { replaceState(_state, _title, url) { cleaned = url; } },
+  } });
+  t.after(() => {
+    setAccessKey('');
+    if (oldWindow) Object.defineProperty(globalThis, 'window', oldWindow); else delete globalThis.window;
+    if (oldStorage) Object.defineProperty(globalThis, 'localStorage', oldStorage); else delete globalThis.localStorage;
+  });
+  initAccessKeyFromUrl();
+  assert.equal(getAccessKey(), 'preview-only');
+  assert.equal(cleaned, '/?lang=he#tv');
 });

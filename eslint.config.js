@@ -19,5 +19,16 @@ export default defineConfig([
       ecmaVersion: 2020,
       globals: globals.browser,
     },
+    rules: {
+      // Compatibility signatures intentionally retain an unused credentials argument.
+      '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_' }],
+    },
+  },
+  {
+    files: ['src/components/ui/*.tsx'],
+    rules: {
+      // These shadcn primitives deliberately export their styling helpers/hooks.
+      'react-refresh/only-export-components': ['error', { allowConstantExport: true, allowExportNames: ['badgeVariants', 'buttonGroupVariants', 'buttonVariants', 'useFormField', 'navigationMenuTriggerStyle', 'useSidebar', 'toggleVariants'] }],
+    },
   },
 ])

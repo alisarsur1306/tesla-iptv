@@ -1,32 +1,15 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { login, normalizeServer, configUrl, AccessKeyError, type XtreamCreds } from '@/lib/xtream';
+import { loadStoredCreds, storeCreds } from '@/lib/credentials';
+import { requestJson, HttpError } from '@/lib/request';
+import { useLocale } from '@/lib/locale';
+import { appStrings } from '@/lib/appStrings';
+import LanguageSelect from '@/components/LanguageSelect';
 import { Clapperboard, Loader2 } from 'lucide-react';
-
-const STORAGE_KEY = 'tesla-iptv:creds';
-
-export function loadStoredCreds(): XtreamCreds | null {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as XtreamCreds;
-    if (parsed && parsed.server && parsed.username && parsed.password) return parsed;
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-export function storeCreds(creds: XtreamCreds): void {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(creds));
-}
-
-export function clearStoredCreds(): void {
-  localStorage.removeItem(STORAGE_KEY);
-}
 
 interface LoginScreenProps {
   onConnected: (creds: XtreamCreds) => void;
@@ -35,63 +18,64 @@ interface LoginScreenProps {
 }
 
 export default function LoginScreen({ onConnected, onNeedKey, retryToken }: LoginScreenProps) {
-  const [server, setServer] = useState('');
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
+  const { locale } = useLocale();
+  const copy = appStrings[locale];
+  const [stored] = useState(loadStoredCreds);
+  const [server, setServer] = useState(stored?.server ?? '');
+  const [username, setUsername] = useState(stored?.username ?? '');
+  const [password, setPassword] = useState(stored?.password ?? '');
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<'required' | 'needsKey' | 'failed' | null>(null);
+  const activeLogin = useRef<symbol | null>(null);
+  useEffect(() => () => { activeLogin.current = null; }, [retryToken]);
 
   // Prefill: localStorage first, then /config.json (so nothing needs typing in the car).
   useEffect(() => {
-    const stored = loadStoredCreds();
-    if (stored) {
-      setServer(stored.server);
-      setUsername(stored.username);
-      setPassword(stored.password);
-      return;
-    }
-    fetch(configUrl())
-      .then((r) => {
-        if (r.status === 403) {
-          onNeedKey();
-          return null;
-        }
-        return r.ok ? r.json() : null;
-      })
+    if (stored) return;
+    const controller = new AbortController();
+    requestJson<Partial<XtreamCreds>>(configUrl(), { signal: controller.signal })
       .then((cfg) => {
-        if (cfg && cfg.server) {
+        if (!controller.signal.aborted && cfg && cfg.server) {
           setServer(cfg.server);
           setUsername(cfg.username || '');
           setPassword(cfg.password || '');
         }
       })
-      .catch(() => {
-        /* config.json is optional */
+      .catch((err) => {
+        if (!controller.signal.aborted && err instanceof HttpError && err.status === 403) onNeedKey();
       });
+    return () => controller.abort();
     // retryToken refires the prefill after the user enters an access key
-  }, [retryToken, onNeedKey]);
+  }, [retryToken, onNeedKey, stored]);
 
   async function handleConnect() {
     if (!server || !username || !password) {
-      setError('All three fields are required.');
+      setError('required');
       return;
     }
     setBusy(true);
     setError(null);
+    const attempt = Symbol('login');
+    activeLogin.current = attempt;
     const creds: XtreamCreds = { server: normalizeServer(server), username: username.trim(), password: password.trim() };
     try {
       await login(creds);
+      if (activeLogin.current !== attempt) return;
       storeCreds(creds);
       onConnected(creds);
     } catch (err) {
+      if (activeLogin.current !== attempt) return;
       if (err instanceof AccessKeyError) {
-        setError('This deployment requires an access key.');
+        setError('needsKey');
         onNeedKey();
       } else {
-        setError(err instanceof Error ? err.message : 'Connection failed.');
+        setError('failed');
       }
     } finally {
-      setBusy(false);
+      if (activeLogin.current === attempt) {
+        activeLogin.current = null;
+        setBusy(false);
+      }
     }
   }
 
@@ -102,14 +86,15 @@ export default function LoginScreen({ onConnected, onNeedKey, retryToken }: Logi
           <div className="flex items-center gap-4">
             <Clapperboard className="h-12 w-12 text-red-500" />
             <CardTitle className="text-4xl font-bold">Tesla IPTV</CardTitle>
+            <LanguageSelect />
           </div>
           <CardDescription className="text-lg text-zinc-400">
-            Connect your Xtream Codes account. Passenger use only.
+            {copy.title}
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
           <div className="space-y-2">
-            <Label htmlFor="server" className="text-lg">Server</Label>
+            <Label htmlFor="server" className="text-lg">{copy.server}</Label>
             <Input
               id="server"
               value={server}
@@ -118,10 +103,11 @@ export default function LoginScreen({ onConnected, onNeedKey, retryToken }: Logi
               className="h-14 border-zinc-700 bg-zinc-800 text-lg"
               autoComplete="off"
               inputMode="url"
+              dir="ltr"
             />
           </div>
           <div className="space-y-2">
-            <Label htmlFor="username" className="text-lg">Username</Label>
+            <Label htmlFor="username" className="text-lg">{copy.username}</Label>
             <Input
               id="username"
               value={username}
@@ -131,7 +117,7 @@ export default function LoginScreen({ onConnected, onNeedKey, retryToken }: Logi
             />
           </div>
           <div className="space-y-2">
-            <Label htmlFor="password" className="text-lg">Password</Label>
+            <Label htmlFor="password" className="text-lg">{copy.password}</Label>
             <Input
               id="password"
               type="password"
@@ -142,7 +128,7 @@ export default function LoginScreen({ onConnected, onNeedKey, retryToken }: Logi
             />
           </div>
           {error && (
-            <p className="rounded-lg bg-red-950/60 p-4 text-lg text-red-300">{error}</p>
+            <p className="rounded-lg bg-red-950/60 p-4 text-lg text-red-300">{copy[error]}</p>
           )}
           <Button
             onClick={handleConnect}
@@ -150,7 +136,7 @@ export default function LoginScreen({ onConnected, onNeedKey, retryToken }: Logi
             className="h-16 w-full bg-red-600 text-2xl font-bold hover:bg-red-500"
           >
             {busy ? <Loader2 className="mr-3 h-7 w-7 animate-spin" /> : null}
-            {busy ? 'Connecting…' : 'Connect'}
+            {busy ? copy.connecting : copy.connect}
           </Button>
         </CardContent>
       </Card>
