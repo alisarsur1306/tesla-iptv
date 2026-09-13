@@ -83,8 +83,15 @@ export default function PlayerOverlay({ creds, channel, playlist = [], onSelect,
       onUnsupportedVideo: () => setVideoUnsupported(true),
       onVideoStalled: () => setVideoStalled(true),
       onBuffering: (active) => setBuffering(active),
-      onError: (msg) => {
+      onError: (msg, fatal) => {
         if (destroyed) return;
+        // A refusal (403 for a channel that is not on this line, a 404 for an id
+        // this server cannot resolve) answers identically every time, so retrying
+        // it only delays the explanation the server already sent.
+        if (fatal) {
+          setFatalError(msg);
+          return;
+        }
         // `retries` counts CONSECUTIVE failures (reset by onStats above), so a
         // long session isn't killed by three unrelated blips hours apart.
         if (retries < MAX_NETWORK_RETRIES) {

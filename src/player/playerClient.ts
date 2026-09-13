@@ -10,7 +10,8 @@ export interface PlayerStatus {
 
 export interface PlayerCallbacks {
   onReady?: () => void;
-  onError?: (msg: string) => void;
+  /** `fatal` marks an answer that will not change on a retry (e.g. a provider refusal). */
+  onError?: (msg: string, fatal?: boolean) => void;
   onStats?: (s: { frames: number; buffer: number }) => void;
   onLog?: (msg: string, level: string) => void;
   /** Fired with the first PTS so an audio engine can share the clock (later phase). */
@@ -78,13 +79,14 @@ export class CanvasPlayer {
     width?: number;
     height?: number;
     active?: boolean;
+    fatal?: boolean;
   }) {
     switch (m.t) {
       case 'ready':
         this.cb.onReady?.();
         break;
       case 'error':
-        this.cb.onError?.(m.msg || 'unknown error');
+        this.cb.onError?.(m.msg || 'unknown error', Boolean(m.fatal));
         break;
       case 'stats':
         this.cb.onStats?.({ frames: m.frames || 0, buffer: m.buffer || 0 });

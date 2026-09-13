@@ -196,6 +196,34 @@ Read it like this:
 The account is redacted out of every preview, and the endpoint refuses to run
 unless `ACCESS_KEY` is configured.
 
+### When the channels are listed but none of them play
+
+Listing a channel and playing it are different requests — a different URL shape,
+a different id space, and a body that has to be MPEG-TS rather than JSON — so a
+list that loads proves nothing about playback. The `live stream <id>` check
+covers that half. It runs with the rest, on a channel taken from whatever list
+the server already holds; name one explicitly with `&stream=<id>`:
+
+```
+https://<your-app>.onrender.com/api/diag?key=<ACCESS_KEY>&stream=12345
+```
+
+Read it like this:
+
+- `looksLike: "mpeg-ts"` → this channel plays. `servedByHost` says who served the
+  video: the provider host means it rode the tunnel, anything else means it was
+  redirected to a CDN and went direct.
+- `status: 403` → the provider refused it. Either the channel is not on this
+  line, or the request did not leave through the exit node — compare `egressIp`
+  from `?quick=1`. A refusal the server judges genuine (a bare 403, not a block
+  page) is remembered and shown in the grid as "Not included in your
+  subscription"; `/api/unavailable` lists them.
+- `looksLike: "html"` → something upstream answered instead of the provider (a
+  block page or a captive portal), whatever the status says.
+- `idSpace` → which of the two id spaces the id was resolved in. The player is
+  told both, and falls through to the other when the first is refused, so a
+  client holding a cached list from the other source still plays.
+
 ## Making the offline backup
 
 **The exported playlist contains your account.** Every line carries a stream URL with the

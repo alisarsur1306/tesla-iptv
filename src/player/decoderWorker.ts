@@ -233,7 +233,9 @@ async function play(streamUrl: string) {
   try {
     await runStream(streamUrl);
   } catch (e) {
-    if ((e as Error)?.name !== 'AbortError') post({ t: 'error', msg: (e as Error)?.message || 'stream error' });
+    if ((e as Error)?.name !== 'AbortError') {
+      post({ t: 'error', msg: (e as Error)?.message || 'stream error', fatal: Boolean((e as StreamError)?.fatal) });
+    }
   }
 }
 
@@ -290,6 +292,9 @@ async function runStream(url: string) {
       log(`stream ended — reconnecting (${attempt}/${MAX_RECONNECTS})`, 'warn');
     } catch (e) {
       if (!playing || (e as Error)?.name === 'AbortError') return;
+      // A refusal answers the same way every time; report it now instead of
+      // spending five reconnects to arrive at "stream lost".
+      if ((e as StreamError)?.fatal) throw e;
       attempt++;
       log(`stream error: ${(e as Error).message} — reconnecting (${attempt}/${MAX_RECONNECTS})`, 'warn');
     }
@@ -358,16 +363,48 @@ async function runHlsSegments(playlistUrl: string) {
   }
 }
 
+/** An error carrying whether retrying it could ever help. */
+interface StreamError extends Error {
+  fatal?: boolean;
+}
+
+/**
+ * Turn a failed response into an error worth showing.
+ *
+ * /api/stream answers a refusal with a JSON explanation (which channel, which
+ * host, which transport, and what it answered). Throwing a bare "HTTP 403"
+ * discarded exactly the sentence that says what to do about it, and then five
+ * reconnects turned it into "stream lost" — the shape of "the channels are
+ * listed but nothing plays". A 4xx is a decision, not a blip, so it also stops
+ * the reconnect loop instead of being retried five times.
+ */
+async function describeFailure(r: Response): Promise<StreamError> {
+  let detail = '';
+  let retryable: boolean | undefined;
+  try {
+    const body = (await r.json()) as { error?: string; retryable?: boolean };
+    if (body && typeof body.error === 'string') detail = body.error;
+    if (body && typeof body.retryable === 'boolean') retryable = body.retryable;
+  } catch {
+    /* not JSON — the status is all there is */
+  }
+  const err: StreamError = new Error(detail || `HTTP ${r.status}`);
+  // The proxy says outright whether another attempt could answer differently; a 4xx it did not
+  // annotate (a bad id, a missing key) is settled by the status alone.
+  err.fatal = retryable === false || (retryable === undefined && r.status >= 400 && r.status < 500);
+  return err;
+}
+
 async function fetchText(url: string): Promise<string> {
   const r = await fetch(url, { signal: abort!.signal });
-  if (!r.ok) throw new Error('HTTP ' + r.status);
+  if (!r.ok) throw await describeFailure(r);
   return r.text();
 }
 
 /** Read one segment fully into the demuxer, with the same backpressure rules. */
 async function streamSegmentInto(url: string) {
   const r = await fetch(url, { signal: abort!.signal });
-  if (!r.ok) throw new Error('HTTP ' + r.status);
+  if (!r.ok) throw await describeFailure(r);
   const reader = r.body!.getReader();
   while (playing) {
     const { value, done } = await reader.read();
@@ -383,7 +420,7 @@ async function streamSegmentInto(url: string) {
 
 async function streamOnce(url: string) {
   const r = await fetch(url, { signal: abort!.signal });
-  if (!r.ok) throw new Error('HTTP ' + r.status);
+  if (!r.ok) throw await describeFailure(r);
   if (!r.body) throw new Error('no response body');
   post({ t: 'ready' });
 

@@ -8,6 +8,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { useIsolatedCacheDir } from './testCacheDir.mjs';
 
 const XT_HOST = 'mhd.snapmediatoghater.site:8080';
 
@@ -45,6 +46,7 @@ const upstream = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'video/mp2t' }).end(`BYTES:${path}`);
 });
 await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
+useIsolatedCacheDir();
 process.env.UPSTREAM_PROXY = `127.0.0.1:${upstream.address().port}`;
 
 // Credentials are read once, on first use — set them before importing.
@@ -81,17 +83,23 @@ test('ids from a fallback list stream from the M3U, not as Xtream ids', async ()
   assert.equal(await res.text(), 'BYTES:/ch1.ts');
 });
 
-test('player_api responses are cached, so a second list costs no upstream call', async () => {
+test('a recovered provider takes back over, and its list is then cached', async () => {
   playerApiOk = true;
   playerApiHits.length = 0;
 
-  const first = await (await fetch(`${origin}/api/xt?action=get_live_streams`)).json();
-  assert.deepEqual(first, XT_STREAMS, 'Xtream is healthy again, so its own list wins');
-  assert.equal(playerApiHits.length, 1);
+  // The cooldown from the failure above is still running, so this request is answered from
+  // the backup while a background probe goes and finds the provider healthy again.
+  await (await fetch(`${origin}/api/xt?action=get_live_streams`)).json();
+  for (let i = 0; i < 100 && playerApiHits.length === 0; i++) await new Promise((r) => setTimeout(r, 20));
+  assert.ok(playerApiHits.length > 0, 'the probe must actually try the provider');
 
+  const fresh = await (await fetch(`${origin}/api/xt?action=get_live_streams`)).json();
+  assert.deepEqual(fresh, XT_STREAMS, 'once the probe succeeds, the provider list wins again');
+
+  const hits = playerApiHits.length;
   const second = await (await fetch(`${origin}/api/xt?action=get_live_streams`)).json();
   assert.deepEqual(second, XT_STREAMS);
-  assert.equal(playerApiHits.length, 1, 'the cached list must not re-hit player_api');
+  assert.equal(playerApiHits.length, hits, 'the cached list must not re-hit player_api');
 });
 
 test('parallel cold requests for one action share a single upstream download', async () => {

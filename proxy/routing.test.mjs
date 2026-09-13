@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { useIsolatedCacheDir } from './testCacheDir.mjs';
 
 const provider = 'http://changed-provider.example:8080';
+useIsolatedCacheDir();
 process.env.XTREAM_SERVER = provider;
 process.env.XTREAM_USERNAME = 'test-user';
 process.env.XTREAM_PASSWORD = 'test-password';
