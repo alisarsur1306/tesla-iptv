@@ -873,14 +873,21 @@ async function firstKnownStreamId(justDownloaded) {
 async function probeStream(id, creds) {
   const name = `live stream ${id}`;
   const started = Date.now();
-  const { targets, playlistError } = await resolveStreamTargets(id);
-  if (!targets.length) return { name, ok: false, error: playlistError || `no stream URL resolves for id ${id}` };
+  const targets = streamTargets(id);
+  if (!targets.length) return { name, ok: false, error: 'this server has no IPTV source configured' };
   const target = targets[0];
   let url;
   try {
-    url = new URL(target.url);
-  } catch {
-    return { name, ok: false, error: 'the resolved stream URL is not absolute' };
+    const raw = await targetUrl(target, LIST_TIMEOUT_MS);
+    if (!raw) return { name, ok: false, idSpace: target.source, error: `no stream URL resolves for id ${id}` };
+    url = new URL(raw);
+  } catch (err) {
+    return {
+      name,
+      ok: false,
+      idSpace: target.source,
+      error: redact(String(err && err.message ? err.message : err), creds),
+    };
   }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 15_000);
@@ -1249,66 +1256,73 @@ export function buildM3u(channels) {
   return lines.join('\n') + '\n';
 }
 
-/**
- * The upstream URLs that could serve channel `id`, likeliest first.
- *
- * There are two id spaces — an Xtream stream_id, and the id carried in the backup
- * playlist's URLs — and the client can be holding a list from either: its
- * localStorage copy outlives a server restart, and the server switches source
- * whenever the provider stalls. `liveListSource` records which list this server
- * served last, which is a good guess and not a guarantee — and a guess that was
- * only ever tried once is exactly what "the channels are all listed but none of
- * them play" looked like. So both are resolved and the caller falls through to
- * the second when the first is refused.
- */
-async function resolveStreamTargets(id) {
+/** The backup playlist's URL for channel `id`, or null when it has no such channel. */
+async function m3uTargetUrl(id) {
   const wanted = Number(id);
-  const targets = [];
-  let playlistError = null;
+  const channels = await getM3uChannels();
+  // Match the id carried in the URL first; fall back to the array position for playlists whose
+  // URLs have no id. Resolving by id means a stream request works whichever list the client
+  // happens to be holding.
+  const chan =
+    channels?.find((c) => streamIdFromUrl(c.url) === wanted) ??
+    (Number.isInteger(wanted) && wanted >= 0 && wanted < (channels?.length ?? 0)
+      ? channels[wanted]
+      : null);
+  if (!chan) return null;
+  // The player decodes one continuous MPEG-TS response; it is not an HLS client. An Xtream
+  // panel serves the same channel either way, so a playlist written with .m3u8 URLs would
+  // otherwise hand the decoder a manifest and stall until the connect timeout. Normalise the
+  // Xtream stream shape to .ts and leave every other URL exactly as the playlist gave it.
+  return String(chan.url).replace(
+    /^(https?:\/\/[^/]+\/(?:[^/?#]+\/){2}\d+)\.m3u8(\?|$)/i,
+    '$1.ts$2',
+  );
+}
 
+/**
+ * The upstream targets that could serve channel `id`, likeliest first.
+ *
+ * There are two id spaces — an Xtream stream_id, and the id carried in the backup playlist's
+ * URLs — and the client can be holding a list from either: its localStorage copy outlives a
+ * server restart, and the server switches source whenever the provider stalls. `liveListSource`
+ * records which list this server served last, which is a good guess and not a guarantee — and a
+ * guess that was only ever tried once is exactly what "the channels are all listed but none of
+ * them play" looked like. So both are offered, and the caller falls through to the second when
+ * the first is refused.
+ *
+ * The Xtream target is a plain string: building it costs nothing. The backup's is a THUNK,
+ * because resolving it means downloading the playlist, which on a cold container takes as long
+ * as the list timeout allows. Resolving both up front made every single channel tap wait on the
+ * backup before the provider was even asked — a spinner that outlasts anyone's patience. It is
+ * therefore resolved only when it is the source the client is actually holding, or when the
+ * provider has already refused.
+ */
+function streamTargets(id) {
   const creds = getXtreamCreds();
-  if (creds) {
-    targets.push({
-      source: 'xtream',
-      url: `${creds.server}/live/${encodeURIComponent(creds.username)}/${encodeURIComponent(creds.password)}/${id}.ts`,
-    });
-  }
+  const xtream = creds
+    ? {
+        source: 'xtream',
+        url: `${creds.server}/live/${encodeURIComponent(creds.username)}/${encodeURIComponent(creds.password)}/${id}.ts`,
+      }
+    : null;
+  const backup = getM3uSource() ? { source: 'm3u', resolve: () => m3uTargetUrl(id) } : null;
+  const preferBackup = getSourceType() === 'm3u' || liveListSource === 'm3u';
+  return (preferBackup ? [backup, xtream] : [xtream, backup]).filter(Boolean);
+}
 
-  if (getM3uSource()) {
-    let channels = null;
-    try {
-      channels = await getM3uChannels();
-    } catch (err) {
-      // The backup being unreachable must not cost the Xtream target, so it is
-      // remembered and only reported when nothing at all resolved.
-      playlistError = `Playlist load failed: ${String(err && err.message ? err.message : err)}`;
-    }
-    // Match the id carried in the URL first; fall back to the array position for playlists
-    // whose URLs have no id. Resolving by id means a stream request works whichever list the
-    // client happens to be holding.
-    const chan =
-      channels?.find((c) => streamIdFromUrl(c.url) === wanted) ??
-      (Number.isInteger(wanted) && wanted >= 0 && wanted < (channels?.length ?? 0)
-        ? channels[wanted]
-        : null);
-    if (chan) {
-      // The player decodes one continuous MPEG-TS response; it is not an HLS client. An Xtream
-      // panel serves the same channel either way, so a playlist written with .m3u8 URLs would
-      // otherwise hand the decoder a manifest and stall until the connect timeout. Normalise the
-      // Xtream stream shape to .ts and leave every other URL exactly as the playlist gave it.
-      targets.push({
-        source: 'm3u',
-        url: String(chan.url).replace(
-          /^(https?:\/\/[^/]+\/(?:[^/?#]+\/){2}\d+)\.m3u8(\?|$)/i,
-          '$1.ts$2',
-        ),
-      });
-    }
-  }
-
-  // The list the client is most likely holding decides which id space to believe first.
-  if (getSourceType() === 'm3u' || liveListSource === 'm3u') targets.reverse();
-  return { targets, playlistError };
+/**
+ * A target's URL, resolving the backup's thunk if that is what it is.
+ *
+ * `budgetMs` bounds that resolution: falling back to the backup must not turn an instant
+ * refusal into a minute of silence, so a playlist that is slow to arrive is simply reported as
+ * one more thing that did not answer.
+ */
+async function targetUrl(target, budgetMs) {
+  if (target.url) return target.url;
+  const raced = await raceDeadline(target.resolve(), budgetMs);
+  if (raced.timedOut) throw new Error(`the backup playlist did not load within ${Math.round(budgetMs / 1000)}s`);
+  if (raced.error) throw raced.error;
+  return raced.value;
 }
 
 /**
@@ -1321,14 +1335,19 @@ async function resolveStreamTargets(id) {
  * time, and the channels it hid would be working ones.
  */
 async function isGenuineRefusal(resp) {
-  let body = '';
-  try {
-    body = (await resp.text()).slice(0, 512);
-  } catch {
-    /* nothing readable — treat it as unexplained rather than as a refusal */
+  // Bounded: the connect timer is long cleared by now, so a body that never finishes arriving
+  // would hold the viewer's request open with no deadline left to stop it. A refusal that
+  // cannot even deliver its own explanation is not one we are willing to record.
+  const raced = await raceDeadline(resp.text(), 3000);
+  if (raced.value === undefined) {
+    try {
+      await resp.body?.cancel();
+    } catch {
+      /* nothing left to release */
+    }
     return false;
   }
-  return !/<html|<!doctype|cloudflare|attention required|access denied/i.test(body);
+  return !/<html|<!doctype|cloudflare|attention required|access denied/i.test(raced.value.slice(0, 512));
 }
 
 /**
@@ -1372,8 +1391,33 @@ export async function handleStream(req, res) {
   const source = getSourceType();
   if (!source) return sendError(res, 503, 'Server has no IPTV source configured');
 
-  const { targets, playlistError } = await resolveStreamTargets(id);
-  if (!targets.length) return sendError(res, playlistError ? 502 : 404, playlistError || 'Unknown channel');
+  const targets = streamTargets(id);
+  if (!targets.length) return sendError(res, 503, 'Server has no IPTV source configured');
+
+  // Only the first target has to be concrete here — it is the URL the proxy is asked for. When
+  // that first target is the backup (because the backup is what the client is holding) this
+  // loads the playlist, exactly as it always did; when it is the provider, nothing is
+  // downloaded at all and the channel starts immediately.
+  // A cold container has to download the playlist before it can resolve a backup id, and that
+  // is allowed the full list budget only when the backup is the ONLY source — otherwise there
+  // is a provider URL sitting right there, and making someone watch a spinner for a minute
+  // rather than try it is the wrong trade.
+  const firstBudget = targets.length > 1 ? FAST_FAIL_MS : LIST_TIMEOUT_MS;
+  let firstUrl;
+  try {
+    firstUrl = await targetUrl(targets[0], firstBudget);
+  } catch (err) {
+    if (targets.length === 1) {
+      return sendError(res, 502, `Playlist load failed: ${String(err && err.message ? err.message : err)}`);
+    }
+    firstUrl = null; // the other id space is still worth trying
+  }
+  if (!firstUrl) {
+    targets.shift(); // nothing in the backup for this id
+    firstUrl = targets[0]?.url;
+    if (!firstUrl) return sendError(res, 404, 'Unknown channel');
+  }
+  targets[0] = { source: targets[0].source, url: firstUrl }; // don't resolve it twice
 
   // Read back by handleProxy: the id names what to mark on a refusal, and the
   // targets are the second opinion it is allowed to ask for.
@@ -1384,7 +1428,7 @@ export async function handleStream(req, res) {
   // The stream URL (which may embed the account) lives only here, on the server —
   // the client's request was /api/stream?id=N and its response is the bytes.
   const key = url.searchParams.get('key') || '';
-  req.url = `/api/proxy?u=${encodeURIComponent(targets[0].url)}${key ? `&key=${encodeURIComponent(key)}` : ''}`;
+  req.url = `/api/proxy?u=${encodeURIComponent(firstUrl)}${key ? `&key=${encodeURIComponent(key)}` : ''}`;
   return handleProxy(req, res);
 }
 
@@ -1442,7 +1486,7 @@ export async function handleProxy(req, res) {
   const headers = { 'User-Agent': USER_AGENT, Accept: '*/*' };
   if (req.headers.range) headers.Range = req.headers.range;
 
-  // A stream request carries the other id space with it (see resolveStreamTargets),
+  // A stream request carries the other id space with it (see streamTargets),
   // so a refusal on the first candidate is a reason to ask the second rather than
   // to hand the decoder a 403 page. Every other proxied request — a logo, a
   // playlist — keeps exactly one candidate and passes its status through untouched.
@@ -1475,9 +1519,20 @@ export async function handleProxy(req, res) {
     if (clientGone) return;
     let candidateUrl;
     try {
-      candidateUrl = new URL(candidate.url);
-    } catch {
-      attempts.push({ source: candidate.source, host: '(invalid url)', detail: 'not an absolute URL' });
+      // FAST_FAIL_MS, not the list timeout: a fallback that arrives after the viewer has given
+      // up is worth nothing, and the first target has already had its full budget.
+      const raw = await targetUrl(candidate, FAST_FAIL_MS);
+      if (!raw) {
+        attempts.push({ source: candidate.source, host: '(unresolved)', detail: 'no channel with this id' });
+        continue;
+      }
+      candidateUrl = new URL(raw);
+    } catch (err) {
+      attempts.push({
+        source: candidate.source,
+        host: '(unresolved)',
+        detail: String(err && err.message ? err.message : err),
+      });
       continue;
     }
     if (isForbiddenHostname(candidateUrl.hostname)) {

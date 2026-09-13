@@ -67,6 +67,19 @@ const origin = `http://127.0.0.1:${app.address().port}`;
 
 const unavailableIds = async () => (await (await fetch(`${origin}/api/unavailable`)).json()).ids;
 
+// FIRST: nothing has loaded the playlist yet, which is the whole point of this one.
+test('a channel the provider serves never waits on the backup playlist', async () => {
+  hits.length = 0;
+  const res = await fetch(`${origin}/api/stream?id=900`);
+  assert.equal(res.status, 200);
+  assert.equal(await res.text(), 'BYTES:/live/u/p/900.ts');
+  assert.ok(
+    !hits.includes('/playlist.m3u'),
+    'resolving the backup means downloading it, and on a cold container that is a minute of ' +
+      'spinner before the provider is even asked — so it must not happen to play a provider channel',
+  );
+});
+
 test('a channel one source refuses is played from the other', async () => {
   hits.length = 0;
   const res = await fetch(`${origin}/api/stream?id=777`);

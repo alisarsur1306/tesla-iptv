@@ -60,3 +60,32 @@ This is a synthetic provider on localhost. It does not reproduce the user's prod
 failure, and does not establish which cause is behind it — it establishes that the cause will
 now be visible in `/api/diag` and in the player, and that two of the ways a listed channel
 could fail to play are gone.
+
+
+## Follow-up: the fix above made it load forever (same day)
+
+Reported immediately after deploying the change above: the spinner never ends.
+
+That was this change's own regression. `resolveStreamTargets()` resolved BOTH id spaces up
+front, and resolving the backup's means downloading the playlist — up to `LIST_TIMEOUT_MS`
+(90s) on a container that has not fetched it yet. So every `/api/stream` request waited on the
+backup before the provider was even asked, which on a cold Render instance is a minute of
+"Loading…" per channel tap. It only bites a deployment with `M3U_URL` set, which is why the
+local run that checked the refusal path (no backup configured) never saw it.
+
+- The provider's URL is a plain string — building it costs nothing — while the backup's is now
+  a thunk, resolved only when the backup is the source the client is actually holding, or when
+  the provider has already refused.
+- Every resolution is bounded. Falling back gets `FAST_FAIL_MS`, because a fallback that
+  arrives after the viewer has given up is worth nothing. The first target gets the full list
+  budget only when the backup is the sole source; with a provider URL available it gets
+  `FAST_FAIL_MS` too, and then the provider is tried.
+- `isGenuineRefusal()` read the 403's body with no deadline, long after the connect timer was
+  cleared. A body that never finished arriving would have held the request open with nothing
+  left to stop it. It is bounded now, and an unreadable refusal is not recorded.
+
+Measured against a synthetic provider with a deliberately 20-second backup playlist: a channel
+the provider serves answers in 0.03s and never touches the playlist (it took ~20s before the
+fix); a refused channel falls through to the backup and reports within the 8s bound instead of
+hanging. `proxy/stream.test.mjs` now fails on the previous commit and passes on this one.
+Suite: 67 passed, 0 failed. Build clean; lint unchanged at 17 pre-existing errors.
