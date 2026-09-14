@@ -1,8 +1,10 @@
 import { useState } from 'react';
-import { LayoutGrid } from 'lucide-react';
+import { LayoutGrid, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle, SheetTrigger } from '@/components/ui/sheet';
+import { Sheet, SheetClose, SheetContent, SheetDescription, SheetHeader, SheetTitle, SheetTrigger } from '@/components/ui/sheet';
 import type { XtreamCategory } from '@/lib/xtream';
+import { useLocale } from '@/lib/locale';
+import { browserStrings } from '@/lib/browserStrings';
 
 export default function CategoryPicker({ categories, activeCategory, onSelect }: {
   categories: XtreamCategory[];
@@ -10,25 +12,35 @@ export default function CategoryPicker({ categories, activeCategory, onSelect }:
   onSelect: (id: string) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const { locale } = useLocale();
+  const t = browserStrings[locale];
+  const rtl = locale !== 'en';
   const selected = categories.find((c) => String(c.category_id) === activeCategory);
 
   return (
     <Sheet open={open} onOpenChange={setOpen}>
       <SheetTrigger asChild>
         <Button
-          aria-label="Choose channel group"
+          aria-label={t.chooseGroup}
           className={`h-16 min-w-0 flex-1 px-5 text-xl sm:max-w-sm ${selected ? 'bg-red-600 hover:bg-red-500' : 'bg-zinc-800 hover:bg-zinc-700'} text-white`}
         >
           <LayoutGrid className="size-6" />
-          <span dir="auto" className="truncate">{selected?.category_name || 'Groups'}</span>
+          <span dir="auto" className="truncate">{selected?.category_name || t.groups}</span>
         </Button>
       </SheetTrigger>
       <SheetContent
-        className="w-full gap-0 border-zinc-800 bg-zinc-950 text-zinc-100 sm:max-w-2xl [&>button]:flex [&>button]:size-14 [&>button]:items-center [&>button]:justify-center [&>button]:rounded-xl [&>button]:bg-zinc-800 [&>button>svg]:size-7"
+        side={rtl ? 'left' : 'right'}
+        dir={rtl ? 'rtl' : 'ltr'}
+        className="w-full gap-0 border-zinc-800 bg-zinc-950 text-zinc-100 sm:max-w-2xl [&>button:last-child]:hidden"
       >
-        <SheetHeader className="shrink-0 border-b border-zinc-800 p-6 pr-24">
-          <SheetTitle className="text-2xl text-white">Channel groups</SheetTitle>
-          <SheetDescription className="text-base text-zinc-400">Choose a group to browse its channels.</SheetDescription>
+        <SheetHeader className="relative shrink-0 border-b border-zinc-800 p-6 pe-24">
+          <SheetTitle className="text-2xl text-white">{t.groupTitle}</SheetTitle>
+          <SheetDescription className="text-base text-zinc-400">{t.groupDescription}</SheetDescription>
+          <SheetClose asChild>
+            <button aria-label={t.close} className="absolute end-4 top-4 flex size-14 items-center justify-center rounded-xl bg-zinc-800 hover:bg-zinc-700">
+              <X className="size-7" />
+            </button>
+          </SheetClose>
         </SheetHeader>
         <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-4">
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">

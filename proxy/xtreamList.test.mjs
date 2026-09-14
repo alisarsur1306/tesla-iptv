@@ -8,9 +8,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { useIsolatedCacheDir } from './testCacheDir.mjs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 
 const XT_HOST = 'mhd.snapmediatoghater.site:8080';
+// Each process must own its list cache: production temp files or another test
+// suite must not decide whether this suite sees an M3U fallback.
+const cachePrefix = path.join(os.tmpdir(), 'tesla-list-test-');
+const cacheDirectory = await mkdtemp(cachePrefix);
+process.env.CACHE_DIR = cacheDirectory;
 
 // --- stub upstream ---------------------------------------------------------
 let playerApiOk = false; // flipped once the fallback case has run
@@ -46,7 +54,6 @@ const upstream = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'video/mp2t' }).end(`BYTES:${path}`);
 });
 await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
-useIsolatedCacheDir();
 process.env.UPSTREAM_PROXY = `127.0.0.1:${upstream.address().port}`;
 
 // Credentials are read once, on first use — set them before importing.
@@ -87,11 +94,17 @@ test('a recovered provider takes back over, and its list is then cached', async 
   playerApiOk = true;
   playerApiHits.length = 0;
 
-  // The cooldown from the failure above is still running, so this request is answered from
-  // the backup while a background probe goes and finds the provider healthy again.
-  await (await fetch(`${origin}/api/xt?action=get_live_streams`)).json();
-  for (let i = 0; i < 100 && playerApiHits.length === 0; i++) await new Promise((r) => setTimeout(r, 20));
-  assert.ok(playerApiHits.length > 0, 'the probe must actually try the provider');
+  // The first retry serves the fallback immediately while a background probe
+  // checks recovery. Wait for that probe, instead of assuming its network
+  // response completes before the fallback response reaches the caller.
+  let first;
+  for (let attempt = 0; attempt < 50; attempt++) {
+    first = await (await fetch(`${origin}/api/xt?action=get_live_streams`)).json();
+    if (first[0]?.stream_id === 77) break;
+    await delay(20);
+  }
+  assert.deepEqual(first, XT_STREAMS, 'the successful background probe restores the Xtream list');
+  assert.equal(playerApiHits.length, 1);
 
   const fresh = await (await fetch(`${origin}/api/xt?action=get_live_streams`)).json();
   assert.deepEqual(fresh, XT_STREAMS, 'once the probe succeeds, the provider list wins again');
@@ -118,7 +131,11 @@ test('once Xtream serves the list again, ids resolve as Xtream stream ids', asyn
   assert.deepEqual(otherHits, ['/live/u/p/42.ts']);
 });
 
-test.after(() => {
+test.after(async () => {
+  app.closeAllConnections();
   app.close();
+  upstream.closeAllConnections();
   upstream.close();
+  assert.ok(path.resolve(cacheDirectory).startsWith(path.resolve(cachePrefix)));
+  await rm(cacheDirectory, { recursive: true, force: true });
 });

@@ -10,26 +10,24 @@
 // can share this clock.
 
 import { TsDemuxer } from '../lib/tsDemux';
+import { openStream, StreamResponseError } from './streamRequest';
+import { STREAM_START_TIMEOUT_MS } from './timing';
 import { parsePlaylist, parseMediaPlaylist, diffNewSegments, type MediaPlaylist } from '../lib/hlsPlaylist';
 import { splitNALs, toAVCC, nalType, avccDescription, codecString, isValidSps, NAL_SPS, NAL_PPS, NAL_IDR, NAL_NON_IDR } from '../lib/h264';
 import { hevcNalType, isHevcKeySlice, isHevcSlice, looksLikeHevc, toAnnexB, HEVC_VPS, HEVC_SPS, HEVC_PPS, HEVC_MAIN_CODEC, HEVC_MAIN10_CODEC } from '../lib/hevc';
 
 type InMsg =
   | { t: 'init'; canvas: OffscreenCanvas }
-  | { t: 'play'; url: string }
+  | { t: 'play'; url: string; sessionId: number }
   | { t: 'stop' }
   // Audio is the master clock: `mediaMs` reaches the speakers at `epochMs`
   // (absolute epoch — a Worker's performance.now() origin differs from the page's).
-  | { t: 'anchor'; mediaMs: number; epochMs: number };
+  | { t: 'anchor'; mediaMs: number; epochMs: number; sessionId: number };
 
 /** Video PES to inspect before declaring the codec unsupported. */
 const UNSUPPORTED_PES_THRESHOLD = 120;
 /** Segments back from the live edge when falling back to HLS segment mode. */
 const HLS_EDGE_SEGMENTS = 3;
-/** Reconnect attempts before giving up on a dropped continuous stream. */
-const MAX_RECONNECTS = 5;
-/** Pause before reconnecting a dropped stream. */
-const RECONNECT_DELAY_MS = 800;
 /**
  * How long presentation may go without drawing a frame before we conclude the
  * clock itself is wrong (rather than the head frame simply being early).
@@ -67,7 +65,7 @@ const MAX_BUFFERING_MS = 4000;
 const NETWORK_STARVE_BYTES = 128 * 1024;
 /** No decoded frame within this long after the decoder configured → it's
  *  silently failing (typical of iOS Safari WebCodecs). Report, don't hang. */
-const FIRST_FRAME_TIMEOUT_MS = 10_000;
+const FIRST_FRAME_TIMEOUT_MS = STREAM_START_TIMEOUT_MS;
 /** Smooth playback for this long resets the adaptive cushion back toward near-live. */
 const REBUFFER_DECAY_MS = 20_000;
 /**
@@ -78,12 +76,15 @@ const REBUFFER_DECAY_MS = 20_000;
  * wedge intake forever (the re-anchor in tryPresentOne is the real guard).
  */
 const MAX_BACKPRESSURE_MS = 30_000;
+/** Do not discard buffered media at EOF, but never wait forever for a decoder. */
+const MAX_DRAIN_MS = 30_000;
 
 let canvas: OffscreenCanvas | null = null;
 let ctx: OffscreenCanvasRenderingContext2D | null = null;
 
 let playing = false;
 let abort: AbortController | null = null;
+let sessionId = 0;
 
 // Encoded-byte reserve between the network and the decoder. The reader fills it
 // as fast as bytes arrive (capturing the stream's front-loaded backlog); the
@@ -92,6 +93,7 @@ let abort: AbortController | null = null;
 // freezing the picture — decoded frames hold GPU memory, encoded bytes are ~free.
 let encodedChunks: Uint8Array[] = [];
 let encodedBytes = 0;
+let feeding = false;
 
 // demux + decode state
 let demux: TsDemuxer | null = null;
@@ -147,7 +149,7 @@ let rebufferCount = 0;
 let lastRebufferAt = 0;
 
 function post(m: unknown, transfer?: Transferable[]) {
-  (self as unknown as Worker).postMessage(m, transfer || []);
+  (self as unknown as Worker).postMessage({ ...(m as object), sessionId }, transfer || []);
 }
 function log(msg: string, level: 'info' | 'success' | 'warn' | 'error' = 'info') {
   post({ t: 'log', msg, level });
@@ -160,10 +162,10 @@ self.onmessage = (e: MessageEvent<InMsg>) => {
     canvas = d.canvas;
     ctx = canvas.getContext('2d', { alpha: false });
   } else if (d.t === 'play') {
-    void play(d.url);
+    void play(d.url, d.sessionId);
   } else if (d.t === 'stop') {
     stop();
-  } else if (d.t === 'anchor') {
+  } else if (d.t === 'anchor' && d.sessionId === sessionId) {
     audioAnchorMediaMs = d.mediaMs;
     audioAnchorEpochMs = d.epochMs;
   }
@@ -214,29 +216,58 @@ function reset() {
   lastRebufferAt = 0;
   encodedChunks = [];
   encodedBytes = 0;
+  feeding = false;
   demux = new TsDemuxer(onPes);
 }
 
-async function play(streamUrl: string) {
+async function play(streamUrl: string, id: number) {
   stop();
   reset();
+  sessionId = id;
   playing = true;
   // Start the stall clock now: if the very first frames are already misaligned,
   // "nothing presented yet" must still be able to trigger a re-anchor rather
   // than waiting forever. PRESENT_STALL_MS is comfortably above the audio
   // start lead, so normal startup buffering never trips it.
   lastPresentAt = nowEpochMs();
-  abort = new AbortController();
+  const session = new AbortController();
+  abort = session;
   post({ t: 'audioReset' });
   schedulePresent();
-  void feedLoop(); // drains the encoded reserve into the decoder for the session
+  void feedLoop(session.signal).catch((error: Error) => {
+    if (!session.signal.aborted && abort === session) {
+      post({ t: 'error', msg: error.message || 'STREAM_FAILED' });
+      stop();
+    }
+  }); // each session owns its own cancellable feeder
   try {
-    await runStream(streamUrl);
+    await streamOnce(streamUrl, session.signal);
+    await drainAtEnd(session.signal);
+    if (!session.signal.aborted) throw new Error('STREAM_ENDED');
   } catch (e) {
-    if ((e as Error)?.name !== 'AbortError') {
-      post({ t: 'error', msg: (e as Error)?.message || 'stream error', fatal: Boolean((e as StreamError)?.fatal) });
+    if (!session.signal.aborted && abort === session) {
+      post({ t: 'error', msg: (e as Error)?.message || 'STREAM_FAILED', fatal: e instanceof StreamResponseError && !e.retryable });
+      stop();
     }
   }
+}
+
+/** A burst response may end before the feeder even wakes for the first time. */
+async function drainAtEnd(signal: AbortSignal) {
+  const until = nowEpochMs() + MAX_DRAIN_MS;
+  const active = () => !signal.aborted && nowEpochMs() < until;
+  while (active() && (encodedChunks.length > 0 || feeding)) await sleep(20);
+  if (!active()) return;
+
+  // The final PES has no following PES to trigger demux emission. WebCodecs can
+  // also retain reordered frames until flush, even when decodeQueueSize is zero.
+  demux?.flush();
+  if (dec?.state === 'configured') {
+    let flushed = false;
+    void dec.flush().catch(() => {}).finally(() => { flushed = true; });
+    while (active() && !flushed) await sleep(20);
+  }
+  while (active() && queue.length > 0) await sleep(20);
 }
 
 function stop() {
@@ -276,32 +307,9 @@ function stop() {
  * a backlog), which is also what a single-concurrent-connection account wants:
  * one connection held open instead of a new request per segment.
  *
- * The connection can still drop (upstream restart, network blip), so a drop is
- * treated as normal and reconnected. The demuxer resyncs on the next PES and a
- * PTS discontinuity rebases the timeline, so a reconnect is not user-visible
- * beyond a brief pause.
+ * The main-thread recovery controller owns the reconnect budget. Keeping it in
+ * one place makes pause, leave, and channel changes cancel every retry.
  */
-async function runStream(url: string) {
-  let attempt = 0;
-  while (playing) {
-    try {
-      await streamOnce(url);
-      if (!playing) return;
-      // Ended cleanly but we still want to play → upstream closed the stream.
-      attempt++;
-      log(`stream ended — reconnecting (${attempt}/${MAX_RECONNECTS})`, 'warn');
-    } catch (e) {
-      if (!playing || (e as Error)?.name === 'AbortError') return;
-      // A refusal answers the same way every time; report it now instead of
-      // spending five reconnects to arrive at "stream lost".
-      if ((e as StreamError)?.fatal) throw e;
-      attempt++;
-      log(`stream error: ${(e as Error).message} — reconnecting (${attempt}/${MAX_RECONNECTS})`, 'warn');
-    }
-    if (attempt >= MAX_RECONNECTS) throw new Error('stream lost');
-    await sleep(RECONNECT_DELAY_MS);
-  }
-}
 
 /** Is this response an HLS playlist rather than raw MPEG-TS? */
 function looksLikePlaylist(contentType: string | null, first: Uint8Array): boolean {
@@ -318,15 +326,15 @@ function looksLikePlaylist(contentType: string | null, first: Uint8Array): boole
  * even from the .ts URL). Continuous TS remains the default because it buffers
  * far better; this exists so those channels work at all.
  */
-async function runHlsSegments(playlistUrl: string) {
+async function runHlsSegments(playlistUrl: string, signal: AbortSignal) {
   let mediaUrl = playlistUrl;
-  const parsed = parsePlaylist(await fetchText(playlistUrl));
+  const parsed = parsePlaylist(await fetchText(playlistUrl, signal));
   if (parsed.kind === 'master') {
     if (!parsed.variants.length) throw new Error('empty master playlist');
     mediaUrl = parsed.variants[0].url;
   }
   let media: MediaPlaylist =
-    parsed.kind === 'media' ? parsed : parseMediaPlaylist(await fetchText(mediaUrl));
+    parsed.kind === 'media' ? parsed : parseMediaPlaylist(await fetchText(mediaUrl, signal));
 
   // Join a little back from the live edge so there is something to buffer.
   let lastSeq = -1;
@@ -334,102 +342,91 @@ async function runHlsSegments(playlistUrl: string) {
     lastSeq = media.segments[media.segments.length - 1 - HLS_EDGE_SEGMENTS].seq;
   }
   let emptyPolls = 0;
+  let segmentFailures = 0;
+  let playlistFailures = 0;
 
-  while (playing) {
+  while (!signal.aborted) {
     for (const seg of diffNewSegments(media, lastSeq)) {
-      if (!playing) return;
+      if (signal.aborted) return;
       try {
-        await streamSegmentInto(seg.url);
+        await streamSegmentInto(seg.url, signal);
+        segmentFailures = 0;
       } catch (e) {
-        if ((e as Error)?.name === 'AbortError') return;
+        if (signal.aborted) return;
+        if (e instanceof StreamResponseError && !e.retryable) throw e;
+        if (++segmentFailures >= 3) throw e;
         log(`segment failed: ${(e as Error).message}`, 'warn');
       }
       lastSeq = seg.seq;
     }
     if (!media.live) return;
     await sleep(Math.min(2000, Math.max(500, (media.targetDuration || 4) * 500)));
-    if (!playing) return;
+    if (signal.aborted) return;
     try {
-      const next = parseMediaPlaylist(await fetchText(mediaUrl));
+      const next = parseMediaPlaylist(await fetchText(mediaUrl, signal));
+      playlistFailures = 0;
       // An encoder restart rewinds media-sequence; rejoin instead of stalling.
       if (next.segments.length && next.mediaSequence < media.mediaSequence) lastSeq = -1;
       emptyPolls = diffNewSegments(next, lastSeq).length ? 0 : emptyPolls + 1;
       if (emptyPolls >= 10) throw new Error('playlist stopped updating');
       media = next;
     } catch (e) {
+      if (signal.aborted) return;
+      if (e instanceof StreamResponseError && !e.retryable) throw e;
       if ((e as Error)?.message === 'playlist stopped updating') throw e;
+      if (++playlistFailures >= 3) throw e;
       /* transient playlist error — retry next poll */
     }
   }
 }
 
-/** An error carrying whether retrying it could ever help. */
-interface StreamError extends Error {
-  fatal?: boolean;
-}
-
-/**
- * Turn a failed response into an error worth showing.
- *
- * /api/stream answers a refusal with a JSON explanation (which channel, which
- * host, which transport, and what it answered). Throwing a bare "HTTP 403"
- * discarded exactly the sentence that says what to do about it, and then five
- * reconnects turned it into "stream lost" — the shape of "the channels are
- * listed but nothing plays". A 4xx is a decision, not a blip, so it also stops
- * the reconnect loop instead of being retried five times.
- */
-async function describeFailure(r: Response): Promise<StreamError> {
-  let detail = '';
-  let retryable: boolean | undefined;
+async function fetchText(url: string, signal: AbortSignal): Promise<string> {
+  const stream = await openStream(url, signal);
+  const decoder = new TextDecoder();
+  let text = '';
   try {
-    const body = (await r.json()) as { error?: string; retryable?: boolean };
-    if (body && typeof body.error === 'string') detail = body.error;
-    if (body && typeof body.retryable === 'boolean') retryable = body.retryable;
-  } catch {
-    /* not JSON — the status is all there is */
+    while (!signal.aborted) {
+      const { value, done } = await stream.read();
+      if (done) return text + decoder.decode();
+      text += decoder.decode(value, { stream: true });
+      if (text.length > 2 * 1024 * 1024) throw new Error('PLAYLIST_TOO_LARGE');
+    }
+    signal.throwIfAborted();
+    return text;
+  } finally {
+    stream.cancel();
   }
-  const err: StreamError = new Error(detail || `HTTP ${r.status}`);
-  // The proxy says outright whether another attempt could answer differently; a 4xx it did not
-  // annotate (a bad id, a missing key) is settled by the status alone.
-  err.fatal = retryable === false || (retryable === undefined && r.status >= 400 && r.status < 500);
-  return err;
-}
-
-async function fetchText(url: string): Promise<string> {
-  const r = await fetch(url, { signal: abort!.signal });
-  if (!r.ok) throw await describeFailure(r);
-  return r.text();
 }
 
 /** Read one segment fully into the demuxer, with the same backpressure rules. */
-async function streamSegmentInto(url: string) {
-  const r = await fetch(url, { signal: abort!.signal });
-  if (!r.ok) throw await describeFailure(r);
-  const reader = r.body!.getReader();
-  while (playing) {
-    const { value, done } = await reader.read();
-    if (done) return;
-    pushEncoded(value);
-    let waited = 0;
-    while (playing && encodedBytes >= MAX_ENCODED_BYTES && waited < MAX_BACKPRESSURE_MS) {
-      await sleep(15);
-      waited += 15;
+async function streamSegmentInto(url: string, signal: AbortSignal) {
+  const stream = await openStream(url, signal);
+  try {
+    while (!signal.aborted) {
+      const { value, done } = await stream.read();
+      if (done || signal.aborted) return;
+      pushEncoded(value);
+      let waited = 0;
+      while (!signal.aborted && encodedBytes >= MAX_ENCODED_BYTES && waited < MAX_BACKPRESSURE_MS) {
+        await sleep(15);
+        waited += 15;
+      }
     }
+  } finally {
+    stream.cancel();
   }
 }
 
-async function streamOnce(url: string) {
-  const r = await fetch(url, { signal: abort!.signal });
-  if (!r.ok) throw await describeFailure(r);
-  if (!r.body) throw new Error('no response body');
+async function streamOnce(url: string, signal: AbortSignal) {
+  const stream = await openStream(url, signal);
+  signal.throwIfAborted();
   post({ t: 'ready' });
 
-  const reader = r.body.getReader();
   let sniffed = false;
   try {
-    while (playing) {
-      const { value, done } = await reader.read();
-      if (done) return; // upstream closed → caller reconnects
+    while (!signal.aborted) {
+      const { value, done } = await stream.read();
+      if (done || signal.aborted) return; // upstream closed → main thread reconnects
 
       // Some channels ignore the .ts extension and serve an HLS PLAYLIST anyway
       // (their upstream is an external HLS CDN that the panel just relays).
@@ -437,14 +434,10 @@ async function streamOnce(url: string) {
       // the first bytes and switch to segment mode for this channel.
       if (!sniffed) {
         sniffed = true;
-        if (looksLikePlaylist(r.headers.get('content-type'), value)) {
+        if (looksLikePlaylist(stream.response.headers.get('content-type'), value)) {
           log('server returned an HLS playlist — switching to segment mode', 'warn');
-          try {
-            await reader.cancel();
-          } catch {
-            /* ignore */
-          }
-          await runHlsSegments(url);
+          stream.cancel();
+          await runHlsSegments(url, signal);
           return;
         }
       }
@@ -454,17 +447,13 @@ async function streamOnce(url: string) {
       // backlog) until the reserve is deep, then pause. The feeder decodes at
       // its own pace, so a network stall drains the reserve rather than freezing.
       let waited = 0;
-      while (playing && encodedBytes >= MAX_ENCODED_BYTES && waited < MAX_BACKPRESSURE_MS) {
+      while (!signal.aborted && encodedBytes >= MAX_ENCODED_BYTES && waited < MAX_BACKPRESSURE_MS) {
         await sleep(15);
         waited += 15;
       }
     }
   } finally {
-    try {
-      await reader.cancel();
-    } catch {
-      /* ignore */
-    }
+    stream.cancel();
   }
 }
 
@@ -479,21 +468,27 @@ function pushEncoded(chunk: Uint8Array): void {
  * ~DECODE_TARGET_FRAMES decoded. Surplus stays as cheap encoded bytes. Runs for
  * the whole session alongside the reader.
  */
-async function feedLoop(): Promise<void> {
+async function feedLoop(signal: AbortSignal): Promise<void> {
   const CH = 48 * 1024;
-  while (playing) {
+  while (!signal.aborted) {
     const wantMore = queue.length < DECODE_TARGET_FRAMES && (!dec || dec.decodeQueueSize < 16);
     if (wantMore && encodedChunks.length) {
       const chunk = encodedChunks.shift()!;
       encodedBytes -= chunk.length;
-      // Split a large chunk so a single push never blocks the loop for long.
-      if (chunk.length > CH) {
-        for (let p = 0; p < chunk.length && playing; p += CH) {
-          demux!.push(chunk.subarray(p, Math.min(chunk.length, p + CH)));
-          await sleep(0);
+      feeding = true;
+      try {
+        // Split a large chunk so a single push never blocks the loop for long.
+        if (chunk.length > CH) {
+          for (let p = 0; p < chunk.length && !signal.aborted; p += CH) {
+            demux!.push(chunk.subarray(p, Math.min(chunk.length, p + CH)));
+            await sleep(0);
+          }
+        } else {
+          demux!.push(chunk);
         }
-      } else {
-        demux!.push(chunk);
+      } finally {
+        // A cancelled old feeder must not change the new session's state.
+        if (!signal.aborted) feeding = false;
       }
     } else {
       // Either the decoder is satisfied or the reserve is empty (network stall).
@@ -686,9 +681,11 @@ function initHevcDecoder() {
   } catch {
     /* ignore */
   }
+  const id = sessionId;
   dec = new VideoDecoder({
-    output: onDecodedFrame,
+    output: (frame) => { if (playing && id === sessionId) onDecodedFrame(frame); else frame.close(); },
     error: (e) => {
+      if (!playing || id !== sessionId) return;
       // Runtime feature-detection: a platform without an HEVC decoder errors here.
       log('HEVC VideoDecoder error: ' + e.message, 'error');
       if (!unsupportedVideoReported) {
@@ -725,9 +722,11 @@ function initDecoder() {
   }
   const codec = codecString(sps!);
   const description = avccDescription(sps!, pps!);
+  const id = sessionId;
   dec = new VideoDecoder({
-    output: onDecodedFrame,
+    output: (frame) => { if (playing && id === sessionId) onDecodedFrame(frame); else frame.close(); },
     error: (e) => {
+      if (!playing || id !== sessionId) return;
       log('VideoDecoder error: ' + e.message, 'error');
       gotIDR = false;
       ready = false;
@@ -747,7 +746,6 @@ function initDecoder() {
 /** Shared decoder output: queue the frame, cap the queue, drive presentation. */
 function onDecodedFrame(frame: VideoFrame) {
   producedFrame = true; // the decoder is alive — clears the first-frame watchdog
-  frameCount++;
   queue.push({ frame, pts: frame.timestamp / 1000 });
   while (queue.length > MAX_QUEUE_FRAMES) {
     try {
@@ -757,8 +755,6 @@ function onDecodedFrame(frame: VideoFrame) {
     }
   }
   if (!presentPending) schedulePresent();
-  if ((frameCount & 15) === 0)
-    post({ t: 'stats', frames: frameCount, buffer: queue.length, reserveKB: Math.round(encodedBytes / 1024) });
 }
 
 // --- presentation (wall clock anchored at first frame; setTimeout paced) ---
@@ -957,4 +953,8 @@ function draw(frame: VideoFrame) {
     post({ t: 'canvasResize', width: w, height: h });
   }
   ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+  frameCount++;
+  // Readiness and retry reset reflect visible frames, not merely decoded ones.
+  if (frameCount === 1 || (frameCount & 15) === 0)
+    post({ t: 'stats', frames: frameCount, buffer: queue.length, reserveKB: Math.round(encodedBytes / 1024) });
 }

@@ -14,10 +14,10 @@
 //   /api/proxy?u=... URL (segments, sub-playlists, EXT-X-KEY URIs).
 // - Two optional transports exist for the Xtream API host, which Cloudflare
 //   refuses to serve to datacenter IPs. Either one carries ONLY that host's
-//   small API/redirect requests; video segments always go direct. See DEPLOY.md.
+//   API/redirect requests; unlisted CDN hosts go direct. See DEPLOY.md.
 //     * XTREAM_PROXY_URL — a Cloudflare Worker that re-fetches the host from
-//       Cloudflare's own network (which the origin does not block). Needs no
-//       always-on hardware, so it wins when both are set.
+//       Cloudflare's own network. Acceptance depends on the provider's rules;
+//       this route wins when both transports are set.
 //     * UPSTREAM_PROXY — an HTTP proxy (a Tailscale exit node, or a commercial
 //       residential proxy) that borrows a non-datacenter IP.
 
@@ -37,6 +37,95 @@ import { gzip } from 'node:zlib';
 // Connect timeout for a streaming request: it covers the handshake only and is
 // cleared once the headers arrive, because a live channel's body never ends.
 const TIMEOUT_MS = 25_000;
+// The browser allows 75s for a stream to start. All server-side discovery,
+// candidates, and first bytes/complete manifest share this smaller budget.
+const STREAM_START_TIMEOUT_MS = 60_000;
+const STREAM_IDLE_TIMEOUT_MS = 20_000;
+const MAX_PLAYLIST_BYTES = 2 * 1024 * 1024;
+
+function streamTimeout() {
+  const error = new Error('The stream did not respond in time.');
+  error.name = 'TimeoutError';
+  error.code = 'STREAM_TIMEOUT';
+  return error;
+}
+
+function waitForAbort(promise, signal) {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    Promise.resolve(promise).then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+  });
+}
+
+async function withinDeadline(run, controller, ms) {
+  if (ms <= 0) controller.abort(streamTimeout());
+  controller.signal.throwIfAborted();
+  const timer = setTimeout(() => controller.abort(streamTimeout()), ms);
+  try {
+    return await waitForAbort(run(), controller.signal);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function streamContext(req, res) {
+  if (req.streamContext) return req.streamContext;
+  const controller = new AbortController();
+  const deadlineAt = Date.now() + STREAM_START_TIMEOUT_MS;
+  const timer = setTimeout(() => controller.abort(streamTimeout()), STREAM_START_TIMEOUT_MS);
+  const onClose = () => controller.abort(new DOMException('Client disconnected', 'AbortError'));
+  res.once('close', onClose);
+  const context = {
+    controller,
+    remaining: () => Math.max(0, deadlineAt - Date.now()),
+    started: () => clearTimeout(timer),
+    dispose() {
+      clearTimeout(timer);
+      res.removeListener('close', onClose);
+      controller.abort();
+    },
+  };
+  if (res.destroyed) onClose();
+  req.streamContext = context;
+  return context;
+}
+
+async function readNonempty(reader, signal) {
+  while (true) {
+    signal.throwIfAborted();
+    const chunk = await waitForAbort(reader.read(), signal);
+    if (chunk.done || chunk.value.byteLength) return chunk;
+  }
+}
+
+async function waitForDrain(res, signal) {
+  if (!res.writableNeedDrain) return;
+  let onDrain;
+  const drained = new Promise((resolve) => { onDrain = resolve; res.once('drain', onDrain); });
+  try {
+    await waitForAbort(drained, signal);
+  } finally {
+    res.removeListener('drain', onDrain);
+  }
+}
+
+async function readManifest(reader, first, controller) {
+  const chunks = first.done ? [] : [first.value];
+  let bytes = first.value?.byteLength || 0;
+  while (!first.done) {
+    if (bytes > MAX_PLAYLIST_BYTES) throw Object.assign(new Error('Invalid playlist response.'), { code: 'STREAM_INVALID_RESPONSE' });
+    const chunk = await withinDeadline(() => readNonempty(reader, controller.signal), controller, STREAM_IDLE_TIMEOUT_MS);
+    if (chunk.done) break;
+    bytes += chunk.value.byteLength;
+    chunks.push(chunk.value);
+  }
+  if (bytes > MAX_PLAYLIST_BYTES) throw Object.assign(new Error('Invalid playlist response.'), { code: 'STREAM_INVALID_RESPONSE' });
+  const text = Buffer.concat(chunks, bytes).toString('utf8');
+  if (!text.trimStart().startsWith('#EXTM3U')) throw Object.assign(new Error('Invalid playlist response.'), { code: 'STREAM_INVALID_RESPONSE' });
+  return text;
+}
 // Whole-response timeout for a bulk list download (the Xtream player_api channel
 // lists and the M3U playlist). Those are megabytes of JSON pulled through the
 // upstream proxy in one shot, so the streaming budget was routinely too short and
@@ -49,8 +138,8 @@ const USER_AGENT =
 // Hosts reached through UPSTREAM_PROXY when it is set. Only the Xtream API host
 // belongs here: it sits behind Cloudflare, which blocks datacenter IPs, so on a
 // cloud deployment those requests must exit via a residential IP (see DEPLOY.md).
-// Segments redirect to a CDN that does NOT block datacenter IPs and whose tokens
-// are not IP-bound, so they go direct — keeping the video off the tunnel.
+// Unlisted CDN hosts go direct to keep video off the tunnel. Whether a given
+// CDN accepts this path and its tokens work across IPs must be verified.
 // Hosts that Cloudflare refuses from a datacenter IP, and which therefore have to leave through
 // the tunnel. The channel logos live on a different domain from the API, and only the API was
 // listed — so every logo went out directly and came back 403, filling the console and leaving
@@ -63,12 +152,12 @@ const PROXY_HOST_SUFFIXES = (process.env.PROXY_HOSTS || 'snapmediatoghater.site,
   .map((h) => h.trim().toLowerCase())
   .filter(Boolean);
 
-/** HTTP proxy for Cloudflare-blocked hosts, e.g. '127.0.0.1:1055'. Unset = direct. */
+/** HTTP proxy for provider hosts, e.g. '127.0.0.1:1055'. */
 function getUpstreamProxy() {
   return process.env.UPSTREAM_PROXY || '';
 }
 
-/** Cloudflare Worker base URL that re-fetches the Xtream host. Unset = direct. */
+/** Cloudflare Worker base URL that re-fetches the Xtream host. */
 function getXtreamProxyUrl() {
   return process.env.XTREAM_PROXY_URL || '';
 }
@@ -89,8 +178,7 @@ function isXtreamHost(hostname) {
 /**
  * How a request is carried: 'worker' | 'tunnel' | 'direct' | 'blocked'.
  * Only the Xtream host is ever diverted. The Worker wins when both transports
- * are configured — it needs no always-on hardware, so it is the more reliable
- * of the two; leaving UPSTREAM_PROXY set keeps the tunnel one env var away.
+ * are configured; this is configuration priority, not a reachability guarantee.
  */
 function transportFor(hostname) {
   if (!isXtreamHost(hostname)) return 'direct';
@@ -132,13 +220,12 @@ function proxyAgent() {
  */
 async function upstreamFetch(target, options) {
   let url = target;
-  // forceTunnel lets a diagnostic ask "what does the world see when we go through the tunnel?"
-  // about a host that is not itself on the tunnel list.
-  const { forceTunnel, ...fetchOptions } = options || {};
+  // Diagnostics may measure an unrelated IP-check host through the exact route
+  // selected for the provider. This override is internal, never a URL parameter.
+  const { diagnosticTransport, ...fetchOptions } = options || {};
   for (let hop = 0; hop < 5; hop++) {
     if (isForbiddenHostname(url.hostname)) throw new Error('Redirect to forbidden host');
-    const transport =
-      forceTunnel && getUpstreamProxy() ? 'tunnel' : transportFor(url.hostname);
+    const transport = diagnosticTransport || transportFor(url.hostname);
     if (transport === 'blocked') {
       throw new Error('Provider proxy is not configured on Render; direct cloud-IP requests are disabled. Restore the Tailscale exit node or configure UPSTREAM_PROXY / XTREAM_PROXY_URL.');
     }
@@ -367,7 +454,7 @@ export function parseM3u(text) {
 }
 
 /** Fetch + parse the configured M3U (cached). Null when no M3U source is set. */
-async function getM3uChannels() {
+async function getM3uChannels(options = {}) {
   const src = getM3uSource();
   if (!src) return null;
   if (m3uCache && Date.now() - m3uCacheAt < M3U_TTL_MS) return m3uCache;
@@ -378,7 +465,7 @@ async function getM3uChannels() {
     const resp = await upstreamFetch(new URL(src.value), {
       redirect: 'follow',
       headers: m3uHeaders(),
-      signal: AbortSignal.timeout(LIST_TIMEOUT_MS),
+      signal: options.signal || AbortSignal.timeout(LIST_TIMEOUT_MS),
     });
     if (!resp.ok) {
       // 401/404 on a private host almost always means the token, not the file: GitHub returns
@@ -462,6 +549,108 @@ function keyGate(req, res, url) {
     return false;
   }
   return true;
+}
+
+const HEALTH_TIMEOUT_MS = 10_000;
+const HEALTH_CACHE_MS = 15_000;
+let healthCached = null;
+let healthInflight = null;
+let healthRouteKey = '';
+
+/** A fresh login check: no channel/video fetch, list cache or M3U fallback. */
+async function checkProviderHealth(creds, route) {
+  const answer = (status) => ({ status, route, checkedAt: Date.now() });
+  if (!creds) return answer(getM3uSource() ? 'unknown' : 'not_configured');
+  let target;
+  try {
+    target = new URL(`${creds.server}/player_api.php`);
+    if (!['http:', 'https:'].includes(target.protocol) || isForbiddenHostname(target.hostname)) {
+      return answer('not_configured');
+    }
+    target.searchParams.set('username', creds.username);
+    target.searchParams.set('password', creds.password);
+  } catch {
+    return answer('not_configured');
+  }
+  if (route === 'blocked') return answer('not_configured');
+
+  const controller = new AbortController();
+  let timer;
+  const deadline = new Promise((resolve) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      resolve(answer('timeout'));
+    }, HEALTH_TIMEOUT_MS);
+  });
+  const check = (async () => {
+    try {
+      const response = await upstreamFetch(target, {
+        headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' },
+        signal: controller.signal,
+      });
+      if ([401, 403, 429].includes(response.status)) return answer('provider_rejected');
+      if (!response.ok) return answer('unknown');
+      // Keep the deadline alive until JSON is fully read. A 200 response with an
+      // expired account or a challenge page must never turn the UI green.
+      let data;
+      try {
+        data = await response.json();
+      } catch {
+        return answer(controller.signal.aborted ? 'timeout' : 'unknown');
+      }
+      const info = data?.user_info;
+      if (info?.auth === 0 || info?.auth === '0') return answer('provider_rejected');
+      if (info?.auth !== 1 && info?.auth !== '1') return answer('unknown');
+      if (typeof info.status !== 'string' || !info.status.trim()) return answer('unknown');
+      return answer(info.status.trim().toLowerCase() === 'active' ? 'ok' : 'provider_rejected');
+    } catch (error) {
+      if (controller.signal.aborted || error?.name === 'TimeoutError' ||
+          error?.cause?.code === 'UND_ERR_CONNECT_TIMEOUT') return answer('timeout');
+      return answer(route === 'tunnel' || route === 'worker' ? 'proxy_unreachable' : 'unknown');
+    }
+  })();
+  try {
+    return await Promise.race([check, deadline]);
+  } finally {
+    clearTimeout(timer);
+    // Also closes refusal/error bodies that were intentionally not read.
+    controller.abort();
+  }
+}
+
+/** GET /api/health: bounded, coalesced diagnosis safe to show in the player. */
+export async function handleHealth(req, res) {
+  res.on('error', () => {});
+  setCors(res);
+  res.setHeader('Cache-Control', 'no-store');
+  const url = new URL(req.url || '/', 'http://localhost');
+  if (!keyGate(req, res, url)) return;
+  if (req.method !== 'GET') return sendError(res, 405, 'Method not allowed');
+  const creds = getXtreamCreds();
+  let route = 'blocked';
+  try {
+    if (creds) route = transportFor(new URL(creds.server).hostname);
+  } catch { /* invalid configuration is described by the health result */ }
+  // A changed transport must not reuse a diagnosis for the previous path.
+  const routeKey = JSON.stringify([route, getUpstreamProxy(), getXtreamProxyUrl(), process.env.XTREAM_PROXY_TOKEN]);
+  if (routeKey !== healthRouteKey) {
+    healthRouteKey = routeKey;
+    healthCached = null;
+    healthInflight = null;
+  }
+  if (healthCached && Date.now() - healthCached.checkedAt < HEALTH_CACHE_MS) {
+    return sendJsonBody(res, healthCached);
+  }
+  if (!healthInflight) {
+    const pending = checkProviderHealth(creds, route).then((result) => {
+      if (healthRouteKey === routeKey) healthCached = result;
+      return result;
+    }).finally(() => {
+      if (healthInflight === pending) healthInflight = null;
+    });
+    healthInflight = pending;
+  }
+  sendJsonBody(res, await healthInflight);
 }
 
 // The player_api actions that download the whole channel list (as opposed to the
@@ -861,7 +1050,7 @@ async function firstKnownStreamId(justDownloaded) {
 }
 
 /**
- * Can this deployment actually PLAY a channel?
+ * Can this deployment obtain the initial bytes of one candidate stream?
  *
  * Every other check here is a list check — a different URL shape, a different id
  * space, and a JSON body — which is why a deployment whose channels all refused
@@ -870,18 +1059,24 @@ async function firstKnownStreamId(justDownloaded) {
  * the status, which host actually served it (the provider itself, or the CDN it
  * redirects to), and whether those bytes are MPEG-TS, a playlist, or a block page.
  */
-async function probeStream(id, creds) {
+async function probeStream(id, creds, budgetMs = 15_000) {
   const name = `live stream ${id}`;
   const started = Date.now();
   const targets = streamTargets(id);
   if (!targets.length) return { name, ok: false, error: 'this server has no IPTV source configured' };
   const target = targets[0];
+  // The diagnostic deadline starts before resolving a cold backup, not after
+  // an unbounded playlist wait. It is a first-bytes probe, not a playback test.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(streamTimeout()), budgetMs);
   let url;
   try {
-    const raw = await targetUrl(target, LIST_TIMEOUT_MS);
-    if (!raw) return { name, ok: false, idSpace: target.source, error: `no stream URL resolves for id ${id}` };
+    const raw = await targetUrl(target, Math.min(FAST_FAIL_MS, budgetMs), controller.signal);
+    if (!raw) throw new Error('No stream URL resolves for this channel');
     url = new URL(raw);
   } catch (err) {
+    clearTimeout(timer);
+    controller.abort();
     return {
       name,
       ok: false,
@@ -889,28 +1084,23 @@ async function probeStream(id, creds) {
       error: redact(String(err && err.message ? err.message : err), creds),
     };
   }
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15_000);
   try {
-    const resp = await upstreamFetch(url, {
+    const resp = await waitForAbort(upstreamFetch(url, {
       redirect: 'follow',
       headers: { 'User-Agent': USER_AGENT, Accept: '*/*' },
       signal: controller.signal,
-    });
+    }), controller.signal);
     // One chunk is enough to identify the body, and a live stream never ends, so
     // the rest is cancelled rather than downloaded.
     let head = new Uint8Array();
     const reader = resp.body?.getReader();
     if (reader) {
       try {
-        const { value } = await reader.read();
+        const { value } = await readNonempty(reader, controller.signal);
         if (value) head = value.subarray(0, 512);
       } finally {
-        try {
-          await reader.cancel();
-        } catch {
-          /* already gone */
-        }
+        controller.abort();
+        void reader.cancel().catch(() => {});
       }
     }
     const text = Buffer.from(head).toString('latin1');
@@ -951,8 +1141,8 @@ async function probeStream(id, creds) {
             ? 'An HTML body means something upstream answered instead of the provider (a block page or a portal).'
             : resp.ok && looksLike === 'mpeg-ts'
               ? servedBy && servedBy !== url.host
-                ? `Plays. The video is served by ${servedBy}, not through the provider host.`
-                : 'Plays. The video comes straight from the provider host.'
+                ? `Received initial stream bytes from ${servedBy}; decoded playback has not been verified.`
+                : 'Received initial stream bytes from the provider; decoded playback has not been verified.'
               : resp.ok && looksLike === 'hls playlist'
                 ? 'The provider returns a playlist for this channel; the player switches to segment mode.'
                 : null,
@@ -969,6 +1159,7 @@ async function probeStream(id, creds) {
     };
   } finally {
     clearTimeout(timer);
+    controller.abort();
   }
 }
 
@@ -1034,6 +1225,13 @@ export async function handleDiag(req, res) {
   // LIST_TIMEOUT_MS each against an unresponsive provider — long enough that the diagnostic
   // itself times out in most clients, exactly when it is most needed.
   const quick = url.searchParams.get('quick') === '1';
+  const quickDeadlineAt = Date.now() + 30_000;
+  const quickBudget = (ms) => Math.max(0, Math.min(ms, quickDeadlineAt - Date.now()));
+  const quickSignal = (ms) => {
+    const budget = quickBudget(ms);
+    if (!budget) throw streamTimeout();
+    return AbortSignal.timeout(budget);
+  };
 
   if (creds) {
     out.xtreamHost = new URL(creds.server).host;
@@ -1066,24 +1264,29 @@ export async function handleDiag(req, res) {
   // ?quick=1 is the mode people actually reach for, and this probe is one short
   // request rather than a list download.
   const probeId = url.searchParams.get('stream') || (await firstKnownStreamId(listProbeBody));
-  if (probeId && /^\d+$/.test(probeId)) out.checks.push(await probeStream(probeId, creds));
+  if (probeId && /^\d+$/.test(probeId)) out.checks.push(await probeStream(probeId, creds, quick ? quickBudget(15_000) : 15_000));
   else out.streamProbe = 'No channel id available to test playback with — retry as /api/diag?stream=<id>.';
 
   if (quick) {
     out.quick = true;
-    // What address does the provider actually see? The whole point of the tunnel is to leave
-    // from a residential IP, and nothing reported whether that was still true — so an exit node
-    // that quietly started routing through somewhere else (a VPN coming up on that machine, a
-    // changed default route) looked identical to a dead tunnel: requests simply stopped being
-    // answered. This turns that into one line.
+    // Observe an IP-check service through the provider's selected transport.
+    // Worker has priority over tunnel here just as it does for provider traffic.
+    // This is an observed egress address, not proof of residential ownership or
+    // proof that the provider sees the identical route for every redirect.
+    out.egressTransport = out.transport || 'blocked';
     try {
+      if (out.egressTransport === 'blocked') throw new Error('No provider transport is configured');
       const ipRes = await upstreamFetch(new URL('https://api.ipify.org?format=json'), {
         headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' },
-        signal: AbortSignal.timeout(10000),
-        forceTunnel: true,
+        signal: quickSignal(10000),
+        diagnosticTransport: out.egressTransport,
       });
-      const j = await ipRes.json().catch(() => ({}));
-      out.egressIp = j.ip || null;
+      if (!ipRes.ok) {
+        await ipRes.body?.cancel();
+        throw new Error(`Egress check returned HTTP ${ipRes.status} through ${out.egressTransport}`);
+      }
+      const j = await ipRes.json();
+      out.egressIp = typeof j.ip === 'string' ? j.ip : null;
     } catch (e) {
       out.egressIp = null;
       out.egressIpError = String(e && e.message ? e.message : e);
@@ -1111,9 +1314,9 @@ export async function handleDiag(req, res) {
         try {
           const who = await upstreamFetch(new URL('https://api.github.com/user'), {
             headers: m3uHeaders(),
-            signal: AbortSignal.timeout(15000),
+            signal: quickSignal(15000),
           });
-          const body = await who.json().catch(() => ({}));
+          const body = await who.json();
           out.m3uAuthIdentity = who.ok
             ? { login: body.login, status: who.status }
             : { status: who.status, message: body.message || null };
@@ -1125,7 +1328,7 @@ export async function handleDiag(req, res) {
         const r = await upstreamFetch(new URL(process.env.M3U_URL), {
           redirect: 'follow',
           headers: m3uHeaders(),
-          signal: AbortSignal.timeout(20000),
+          signal: quickSignal(20000),
         });
         const head = (await r.text()).slice(0, 120);
         out.m3uCheck = {
@@ -1153,7 +1356,7 @@ export async function handleDiag(req, res) {
       : null;
     out.note =
       out.transport === 'tunnel'
-        ? 'All provider traffic is being forced through UPSTREAM_PROXY. If the tunnel or its exit node is down, every request fails here regardless of whether the provider is reachable.'
+        ? 'Known provider hosts use UPSTREAM_PROXY; unlisted redirect hosts may go direct. A selected tunnel and an observed egress IP do not prove residential forwarding or provider acceptance.'
         : out.transport === 'worker'
           ? 'Provider traffic goes through the Cloudflare Worker.'
           : out.transport === 'blocked'
@@ -1257,9 +1460,9 @@ export function buildM3u(channels) {
 }
 
 /** The backup playlist's URL for channel `id`, or null when it has no such channel. */
-async function m3uTargetUrl(id) {
+async function m3uTargetUrl(id, options) {
   const wanted = Number(id);
-  const channels = await getM3uChannels();
+  const channels = await getM3uChannels(options);
   // Match the id carried in the URL first; fall back to the array position for playlists whose
   // URLs have no id. Resolving by id means a stream request works whichever list the client
   // happens to be holding.
@@ -1305,7 +1508,7 @@ function streamTargets(id) {
         url: `${creds.server}/live/${encodeURIComponent(creds.username)}/${encodeURIComponent(creds.password)}/${id}.ts`,
       }
     : null;
-  const backup = getM3uSource() ? { source: 'm3u', resolve: () => m3uTargetUrl(id) } : null;
+  const backup = getM3uSource() ? { source: 'm3u', resolve: (options) => m3uTargetUrl(id, options) } : null;
   const preferBackup = getSourceType() === 'm3u' || liveListSource === 'm3u';
   return (preferBackup ? [backup, xtream] : [xtream, backup]).filter(Boolean);
 }
@@ -1317,12 +1520,18 @@ function streamTargets(id) {
  * refusal into a minute of silence, so a playlist that is slow to arrive is simply reported as
  * one more thing that did not answer.
  */
-async function targetUrl(target, budgetMs) {
+async function targetUrl(target, budgetMs, signal) {
+  signal?.throwIfAborted();
   if (target.url) return target.url;
-  const raced = await raceDeadline(target.resolve(), budgetMs);
-  if (raced.timedOut) throw new Error(`the backup playlist did not load within ${Math.round(budgetMs / 1000)}s`);
-  if (raced.error) throw raced.error;
-  return raced.value;
+  const controller = new AbortController();
+  const onAbort = () => controller.abort(signal.reason);
+  signal?.addEventListener('abort', onAbort, { once: true });
+  try {
+    return await withinDeadline(() => target.resolve({ signal: controller.signal }), controller, budgetMs);
+  } finally {
+    signal?.removeEventListener('abort', onAbort);
+    controller.abort();
+  }
 }
 
 /**
@@ -1334,20 +1543,30 @@ async function targetUrl(target, budgetMs) {
  * — must never be written down: that would erase the catalogue one tap at a
  * time, and the channels it hid would be working ones.
  */
-async function isGenuineRefusal(resp) {
-  // Bounded: the connect timer is long cleared by now, so a body that never finishes arriving
-  // would hold the viewer's request open with no deadline left to stop it. A refusal that
-  // cannot even deliver its own explanation is not one we are willing to record.
-  const raced = await raceDeadline(resp.text(), 3000);
-  if (raced.value === undefined) {
-    try {
-      await resp.body?.cancel();
-    } catch {
-      /* nothing left to release */
-    }
+async function isGenuineRefusal(resp, controller) {
+  const reader = resp.body?.getReader();
+  if (!reader) return true;
+  try {
+    return await withinDeadline(async () => {
+      const chunks = [];
+      let bytes = 0;
+      while (bytes < 512) {
+        const chunk = await readNonempty(reader, controller.signal);
+        if (chunk.done) break;
+        const part = chunk.value.subarray(0, 512 - bytes);
+        bytes += part.byteLength;
+        chunks.push(part);
+      }
+      const text = Buffer.concat(chunks, bytes).toString('utf8');
+      return !/<html|<!doctype|cloudflare|attention required|access denied/i.test(text);
+    }, controller, 3000);
+  } catch {
     return false;
+  } finally {
+    // Cancelling resp.body while reader/text owns its lock does not work.
+    controller.abort();
+    void reader.cancel().catch(() => {});
   }
-  return !/<html|<!doctype|cloudflare|attention required|access denied/i.test(raced.value.slice(0, 512));
 }
 
 /**
@@ -1357,22 +1576,35 @@ async function isGenuineRefusal(resp) {
  * which for a stream carries the account. Every free-form part is redacted, as the diagnostics
  * already do with upstream previews.
  */
-function describeStreamFailure(id, attempts) {
-  if (!attempts.length) return `Channel ${id} could not be resolved to a stream URL.`;
-  const creds = getXtreamCreds();
-  const where = (a) => `${a.source || 'upstream'} (${a.host}${a.transport ? ` via ${a.transport}` : ''})`;
-  const parts = attempts.map((a) =>
-    a.status ? `${where(a)} answered ${a.status}` : `${where(a)}: ${redact(a.detail, creds)}`,
-  );
-  const refused = attempts.some((a) => a.status === 403);
-  return (
-    `Channel ${id} would not play — ${parts.join('; ')}. ` +
-    (refused
-      ? 'A 403 is the provider refusing this channel for this account: either it is not included ' +
-        'in your subscription, or the request did not leave through the exit node. ' +
-        '/api/diag?quick=1 reports the egress address.'
-      : 'See /api/diag for the provider and transport state.')
-  );
+function streamFailure(attempts) {
+  if (attempts.some((a) => a.timeout)) return {
+    status: 504, code: 'STREAM_TIMEOUT', retryable: true,
+    error: 'The stream did not respond in time. Try again or check the connection.',
+  };
+  if (attempts.some((a) => a.blocked)) return {
+    status: 503, code: 'STREAM_NOT_CONFIGURED', retryable: false,
+    error: 'The provider connection is not configured.',
+  };
+  if (attempts.some((a) => a.invalid)) return {
+    status: 502, code: 'STREAM_INVALID_RESPONSE', retryable: true,
+    error: 'The provider did not return a usable stream.',
+  };
+  if (attempts.some((a) => a.network && ['tunnel', 'worker'].includes(a.transport))) return {
+    status: 502, code: 'STREAM_PROXY_UNAVAILABLE', retryable: true,
+    error: 'The connection to the provider is unavailable. Check the configured connection.',
+  };
+  const retryable = !attempts.length || attempts.some((a) => a.network || a.status >= 500 ||
+    a.status === 429 || (a.status === 403 && !a.genuine) || (a.status === undefined && !a.missing));
+  if (!retryable && attempts.some((a) => a.status === 401 || a.status === 403)) return {
+    status: 502, code: 'STREAM_REJECTED', retryable: false,
+    error: 'The upstream service refused this channel. Check account access and connection settings.',
+  };
+  return { status: 502, code: 'STREAM_UNAVAILABLE', retryable, error: 'This channel is currently unavailable.' };
+}
+
+function sendStreamFailure(res, attempts) {
+  const failure = streamFailure(attempts);
+  sendError(res, failure.status, failure.error, { code: failure.code, retryable: failure.retryable });
 }
 
 /**
@@ -1388,48 +1620,39 @@ export async function handleStream(req, res) {
   const id = url.searchParams.get('id') || '';
   if (!/^\d+$/.test(id)) return sendError(res, 400, 'Invalid channel id');
 
-  const source = getSourceType();
-  if (!source) return sendError(res, 503, 'Server has no IPTV source configured');
-
-  const targets = streamTargets(id);
-  if (!targets.length) return sendError(res, 503, 'Server has no IPTV source configured');
-
-  // Only the first target has to be concrete here — it is the URL the proxy is asked for. When
-  // that first target is the backup (because the backup is what the client is holding) this
-  // loads the playlist, exactly as it always did; when it is the provider, nothing is
-  // downloaded at all and the channel starts immediately.
-  // A cold container has to download the playlist before it can resolve a backup id, and that
-  // is allowed the full list budget only when the backup is the ONLY source — otherwise there
-  // is a provider URL sitting right there, and making someone watch a spinner for a minute
-  // rather than try it is the wrong trade.
-  const firstBudget = targets.length > 1 ? FAST_FAIL_MS : LIST_TIMEOUT_MS;
-  let firstUrl;
+  if (!getSourceType()) return sendStreamFailure(res, [{ blocked: true }]);
+  const context = streamContext(req, res);
   try {
-    firstUrl = await targetUrl(targets[0], firstBudget);
-  } catch (err) {
-    if (targets.length === 1) {
-      return sendError(res, 502, `Playlist load failed: ${String(err && err.message ? err.message : err)}`);
+    const targets = streamTargets(id);
+    if (!targets.length) return sendStreamFailure(res, [{ blocked: true }]);
+    const firstBudget = Math.min(context.remaining(), targets.length > 1 ? FAST_FAIL_MS : STREAM_START_TIMEOUT_MS);
+    let firstUrl;
+    try {
+      firstUrl = await targetUrl(targets[0], firstBudget, context.controller.signal);
+    } catch (error) {
+      if (res.destroyed) return;
+      if (targets.length === 1 || context.controller.signal.aborted) {
+        return sendStreamFailure(res, [{ timeout: error?.name === 'TimeoutError', network: true }]);
+      }
+      firstUrl = null;
     }
-    firstUrl = null; // the other id space is still worth trying
+    if (!firstUrl) {
+      targets.shift();
+      firstUrl = targets[0]?.url;
+      if (!firstUrl) return sendError(res, 404, 'Unknown channel', { code: 'STREAM_UNAVAILABLE', retryable: false });
+    }
+    context.controller.signal.throwIfAborted();
+    targets[0] = { source: targets[0].source, url: firstUrl };
+    req.streamId = id;
+    req.streamTargets = targets;
+    const key = url.searchParams.get('key') || '';
+    req.url = `/api/proxy?u=${encodeURIComponent(firstUrl)}${key ? `&key=${encodeURIComponent(key)}` : ''}`;
+    return await handleProxy(req, res);
+  } catch (error) {
+    if (!res.destroyed) sendStreamFailure(res, [{ timeout: error?.name === 'TimeoutError', network: true }]);
+  } finally {
+    context.dispose();
   }
-  if (!firstUrl) {
-    targets.shift(); // nothing in the backup for this id
-    firstUrl = targets[0]?.url;
-    if (!firstUrl) return sendError(res, 404, 'Unknown channel');
-  }
-  targets[0] = { source: targets[0].source, url: firstUrl }; // don't resolve it twice
-
-  // Read back by handleProxy: the id names what to mark on a refusal, and the
-  // targets are the second opinion it is allowed to ask for.
-  req.streamId = id;
-  req.streamTargets = targets;
-
-  // Delegate to the existing proxy by rewriting the request to its internal form.
-  // The stream URL (which may embed the account) lives only here, on the server —
-  // the client's request was /api/stream?id=N and its response is the bytes.
-  const key = url.searchParams.get('key') || '';
-  req.url = `/api/proxy?u=${encodeURIComponent(firstUrl)}${key ? `&key=${encodeURIComponent(key)}` : ''}`;
-  return handleProxy(req, res);
 }
 
 export async function handleProxy(req, res) {
@@ -1496,162 +1719,117 @@ export async function handleProxy(req, res) {
       ? req.streamTargets
       : [{ source: null, url: target.toString() }];
 
-  // The timeout must cover CONNECTING only, not the response body. A live
-  // channel is one continuous MPEG-TS response that never ends, so a whole-
-  // request timeout would tear playback down every TIMEOUT_MS. The timer is
-  // therefore cleared as soon as the headers arrive.
-  // The controller is also aborted when the client goes away, so an abandoned
-  // stream releases the upstream connection immediately — this matters on
-  // accounts limited to a single concurrent connection. Each candidate gets its
-  // own controller (a spent connect timeout must not abort the next attempt
-  // before it starts), and the one that wins keeps streaming under `active`.
-  let clientGone = false;
-  let active = null;
-  res.on('close', () => {
-    clientGone = true;
-    active?.abort();
-  });
-
-  let upstream = null;
-  let refused = false;
+  // One start deadline spans all candidates. After the first bytes, only a
+  // pending network read has an idle deadline; downstream backpressure does not.
+  const context = streamContext(req, res);
   const attempts = [];
-  for (const candidate of candidates) {
-    if (clientGone) return;
-    let candidateUrl;
-    try {
-      // FAST_FAIL_MS, not the list timeout: a fallback that arrives after the viewer has given
-      // up is worth nothing, and the first target has already had its full budget.
-      const raw = await targetUrl(candidate, FAST_FAIL_MS);
-      if (!raw) {
-        attempts.push({ source: candidate.source, host: '(unresolved)', detail: 'no channel with this id' });
+  let refused = false;
+  try {
+    for (const candidate of candidates) {
+      if (res.destroyed) return;
+      if (context.controller.signal.aborted) {
+        attempts.push({ timeout: context.controller.signal.reason?.name === 'TimeoutError' });
+        break;
+      }
+      let candidateUrl;
+      try {
+        const raw = await targetUrl(candidate, Math.min(FAST_FAIL_MS, context.remaining()), context.controller.signal);
+        if (!raw) { attempts.push({ missing: true }); continue; }
+        candidateUrl = new URL(raw);
+        if (!['http:', 'https:'].includes(candidateUrl.protocol) || isForbiddenHostname(candidateUrl.hostname)) {
+          attempts.push({ invalid: true });
+          continue;
+        }
+      } catch (error) {
+        attempts.push({ timeout: error?.name === 'TimeoutError', network: true });
         continue;
       }
-      candidateUrl = new URL(raw);
-    } catch (err) {
-      attempts.push({
-        source: candidate.source,
-        host: '(unresolved)',
-        detail: String(err && err.message ? err.message : err),
-      });
-      continue;
-    }
-    if (isForbiddenHostname(candidateUrl.hostname)) {
-      attempts.push({ source: candidate.source, host: candidateUrl.host, detail: 'forbidden target host' });
-      continue;
-    }
-    const transport = transportFor(candidateUrl.hostname);
-    const controller = new AbortController();
-    active = controller;
-    const connectTimer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-    let resp;
-    try {
-      resp = await upstreamFetch(candidateUrl, {
-        redirect: 'follow',
-        headers,
-        signal: controller.signal,
-      });
-    } catch (err) {
-      const isTimeout = Boolean(err) && (err.name === 'TimeoutError' || err.name === 'AbortError');
-      attempts.push({
-        source: candidate.source,
-        host: candidateUrl.host,
-        transport,
-        timeout: isTimeout,
-        detail: isTimeout
-          ? `no answer within ${Math.round(TIMEOUT_MS / 1000)}s`
-          : String(err && err.message ? err.message : err),
-      });
-      continue;
-    } finally {
-      clearTimeout(connectTimer); // headers are in (or the attempt is over)
-    }
-    if (resp.ok || !streamId) {
-      upstream = resp; // the body may now stream forever
-      break;
-    }
-    attempts.push({ source: candidate.source, host: candidateUrl.host, transport, status: resp.status });
-    if (resp.status === 403) refused = refused || (await isGenuineRefusal(resp));
-    else {
+      const transport = transportFor(candidateUrl.hostname);
+      if (transport === 'blocked') { attempts.push({ blocked: true }); continue; }
+      const controller = new AbortController();
+      const onAbort = () => controller.abort(context.controller.signal.reason);
+      context.controller.signal.addEventListener('abort', onAbort, { once: true });
+      if (context.controller.signal.aborted) onAbort();
+      let reader;
+      let response;
       try {
-        await resp.body?.cancel();
-      } catch {
-        /* nothing left to release */
+        response = await withinDeadline(() => upstreamFetch(candidateUrl, {
+          redirect: 'follow', headers, signal: controller.signal,
+        }), controller, Math.min(TIMEOUT_MS, context.remaining()));
+        if (!response.ok && streamId) {
+          const genuine = response.status === 403 ? await isGenuineRefusal(response, controller) : false;
+          refused = genuine || refused;
+          attempts.push({ status: response.status, genuine, transport });
+          continue;
+        }
+        const finalUrl = response.realUrl || response.url || candidateUrl.toString();
+        const upstreamType = response.headers.get('content-type') || '';
+        const playlistType = /\.m3u8($|\?)/i.test(finalUrl) || /mpegurl/i.test(upstreamType);
+        if (streamId && /text\/html|application\/json/i.test(upstreamType)) {
+          attempts.push({ invalid: true });
+          continue;
+        }
+        reader = response.body?.getReader();
+        const first = reader ? await readNonempty(reader, controller.signal) : { done: true };
+        if (first.done && streamId) { attempts.push({ invalid: true }); continue; }
+        const playlist = playlistType || (!first.done && Buffer.from(first.value.subarray(0, 16)).toString().startsWith('#EXTM3U'));
+        if (playlist) {
+          const text = await readManifest(reader, first, controller);
+          context.controller.signal.throwIfAborted();
+          const body = Buffer.from(rewritePlaylist(text, finalUrl, keyParam), 'utf8');
+          context.started();
+          res.writeHead(response.status, {
+            'Content-Type': 'application/vnd.apple.mpegurl', 'Content-Length': body.length, 'Cache-Control': 'no-store',
+          });
+          res.end(body);
+          return;
+        }
+        context.controller.signal.throwIfAborted();
+        const responseType = upstreamType || (/\.ts($|\?)/i.test(finalUrl) ? 'video/mp2t' : 'application/octet-stream');
+        const responseHeaders = {
+          'Content-Type': responseType,
+          'Cache-Control': /^image\//i.test(responseType) ? 'public, max-age=604800, immutable' : 'no-store',
+        };
+        for (const name of ['content-length', 'content-range', 'accept-ranges']) {
+          const value = response.headers.get(name);
+          if (value) responseHeaders[name] = value;
+        }
+        context.started();
+        res.writeHead(response.status, responseHeaders);
+        if (first.done) { res.end(); return; }
+        async function* body() {
+          yield first.value;
+          while (true) {
+            await waitForDrain(res, controller.signal);
+            const chunk = await withinDeadline(() => readNonempty(reader, controller.signal), controller, STREAM_IDLE_TIMEOUT_MS);
+            if (chunk.done) return;
+            yield chunk.value;
+          }
+        }
+        try {
+          await pipeline(Readable.from(body(), { objectMode: false }), res);
+        } catch {
+          res.destroy(); // An incomplete stream must end, not contain JSON after headers.
+        }
+        return;
+      } catch (error) {
+        if (res.destroyed) return;
+        attempts.push({
+          transport, timeout: error?.name === 'TimeoutError',
+          invalid: error?.code === 'STREAM_INVALID_RESPONSE', network: true,
+        });
+      } finally {
+        context.controller.signal.removeEventListener('abort', onAbort);
+        // Release every unsuccessful candidate before its fallback is opened.
+        controller.abort();
+        if (reader) void reader.cancel().catch(() => {});
+        else if (response?.body) void response.body.cancel().catch(() => {});
       }
     }
-  }
-
-  if (!upstream) {
-    if (clientGone) return;
-    // Only now: a channel one source refuses and the other serves is a watchable
-    // channel, and marking it would dim a working entry in the grid forever.
-    if (refused) noteUnavailable(streamId);
-    const first = attempts[0];
-    // A refusal answers the same way every time, so the player is told not to spend its
-    // reconnects arriving at "stream lost". Anything that timed out or never connected stays
-    // retryable: that one can come back on its own.
-    const retryable = !attempts.length || attempts.some((a) => a.timeout || a.status === undefined);
-    sendError(
-      res,
-      attempts.some((a) => a.timeout) ? 504 : 502,
-      streamId
-        ? describeStreamFailure(streamId, attempts)
-        : `Upstream fetch failed: ${first ? redact(first.detail || `HTTP ${first.status}`, getXtreamCreds()) : 'no usable target'}`,
-      streamId ? { retryable } : undefined,
-    );
-    return;
-  }
-
-  const upstreamType = upstream.headers.get('content-type') || '';
-  const finalUrl = upstream.realUrl || upstream.url || target.toString();
-  const isPlaylist =
-    /\.m3u8($|\?)/i.test(finalUrl) ||
-    /\.m3u8($|\?)/i.test(target.toString()) ||
-    /mpegurl/i.test(upstreamType);
-
-  try {
-    if (isPlaylist) {
-      const text = await upstream.text();
-      const rewritten = rewritePlaylist(text, finalUrl, keyParam);
-      const body = Buffer.from(rewritten, 'utf-8');
-      res.writeHead(upstream.status, {
-        'Content-Type': 'application/vnd.apple.mpegurl',
-        'Content-Length': body.length,
-        'Cache-Control': 'no-store',
-      });
-      res.end(body);
-      return;
-    }
-
-    // Binary passthrough (.ts segments, icons, ...) — stream it.
-    const responseType = upstreamType || (finalUrl.endsWith('.ts') ? 'video/mp2t' : 'application/octet-stream');
-    // Channel logos never change, so let the browser cache them — otherwise the
-    // grid re-downloads every icon on each visit and scroll (costly on the
-    // phone/car). Video and everything else stays uncacheable.
-    const isImage = /^image\//i.test(responseType);
-    const responseHeaders = {
-      'Content-Type': responseType,
-      'Cache-Control': isImage ? 'public, max-age=604800, immutable' : 'no-store',
-    };
-    const contentLength = upstream.headers.get('content-length');
-    if (contentLength) responseHeaders['Content-Length'] = contentLength;
-    const contentRange = upstream.headers.get('content-range');
-    if (contentRange) responseHeaders['Content-Range'] = contentRange;
-    const acceptRanges = upstream.headers.get('accept-ranges');
-    if (acceptRanges) responseHeaders['Accept-Ranges'] = acceptRanges;
-
-    res.writeHead(upstream.status, responseHeaders);
-    if (!upstream.body) {
-      res.end();
-      return;
-    }
-    // pipeline (unlike pipe) propagates errors in BOTH directions and rejects
-    // instead of leaving an unhandled 'error' event to crash the process.
-    try {
-      await pipeline(Readable.fromWeb(upstream.body), res);
-    } catch {
-      res.destroy();
-    }
-  } catch (err) {
-    sendError(res, 502, `Proxy error: ${String(err && err.message ? err.message : err)}`);
+    if (res.destroyed) return;
+    if (refused && !streamFailure(attempts).retryable) noteUnavailable(streamId);
+    sendStreamFailure(res, attempts);
+  } finally {
+    context.dispose();
   }
 }

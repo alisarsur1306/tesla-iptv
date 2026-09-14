@@ -10,7 +10,7 @@ export interface PlayerStatus {
 
 export interface PlayerCallbacks {
   onReady?: () => void;
-  /** `fatal` marks an answer that will not change on a retry (e.g. a provider refusal). */
+  /** A settled service refusal should be shown without automatic retries. */
   onError?: (msg: string, fatal?: boolean) => void;
   onStats?: (s: { frames: number; buffer: number }) => void;
   onLog?: (msg: string, level: string) => void;
@@ -35,6 +35,8 @@ export interface PlayerCallbacks {
 export class CanvasPlayer {
   private worker: Worker;
   private cb: PlayerCallbacks;
+  private sessionId = 0;
+  private active = false;
 
   /** Transfers `canvas` control to the worker. The canvas must not have had a
    *  2D/WebGL context obtained on the main thread already. */
@@ -42,24 +44,32 @@ export class CanvasPlayer {
     this.cb = cb;
     this.worker = new Worker(new URL('./decoderWorker.ts', import.meta.url), { type: 'module' });
     this.worker.onmessage = (e: MessageEvent) => this.onMessage(e.data);
+    this.worker.onerror = () => {
+      if (this.active) this.cb.onError?.('PLAYER_WORKER_FAILED');
+    };
     const offscreen = canvas.transferControlToOffscreen();
     this.worker.postMessage({ t: 'init', canvas: offscreen }, [offscreen]);
   }
 
   play(m3u8Url: string): void {
-    this.worker.postMessage({ t: 'play', url: m3u8Url });
+    this.active = true;
+    this.worker.postMessage({ t: 'play', url: m3u8Url, sessionId: ++this.sessionId });
   }
 
   /** Tell the worker when `mediaMs` reaches the speakers, so video syncs to audio. */
   setAudioAnchor(mediaMs: number, epochMs: number): void {
-    this.worker.postMessage({ t: 'anchor', mediaMs, epochMs });
+    if (this.active) this.worker.postMessage({ t: 'anchor', mediaMs, epochMs, sessionId: this.sessionId });
   }
 
   stop(): void {
+    this.active = false;
     this.worker.postMessage({ t: 'stop' });
   }
 
   destroy(): void {
+    this.active = false;
+    this.worker.onmessage = null;
+    this.worker.onerror = null;
     try {
       this.worker.postMessage({ t: 'stop' });
     } catch {
@@ -79,14 +89,16 @@ export class CanvasPlayer {
     width?: number;
     height?: number;
     active?: boolean;
+    sessionId?: number;
     fatal?: boolean;
   }) {
+    if (!this.active || m.sessionId !== this.sessionId) return;
     switch (m.t) {
       case 'ready':
         this.cb.onReady?.();
         break;
       case 'error':
-        this.cb.onError?.(m.msg || 'unknown error', Boolean(m.fatal));
+        this.cb.onError?.(m.msg || 'STREAM_FAILED', Boolean(m.fatal));
         break;
       case 'stats':
         this.cb.onStats?.({ frames: m.frames || 0, buffer: m.buffer || 0 });

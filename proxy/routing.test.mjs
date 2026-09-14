@@ -53,8 +53,8 @@ test('Render refuses a provider request without a proxy instead of using its clo
   process.env.RENDER = 'true';
   const direct = t.mock.method(globalThis, 'fetch', async () => Response.json({ via: 'direct' }));
   const res = await request(`${provider}/player_api.php`);
-  assert.equal(res.status, 502);
-  assert.match((await res.json()).error, /proxy.*not configured/i);
+  assert.equal(res.status, 503);
+  assert.equal((await res.json()).code, 'STREAM_NOT_CONFIGURED');
   assert.equal(direct.mock.callCount(), 0);
 });
 

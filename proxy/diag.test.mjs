@@ -35,6 +35,7 @@ process.env.XTREAM_PASSWORD = PASSWORD;
 process.env.M3U_URL = `http://${XT_HOST}/playlist.m3u`;
 delete process.env.XTREAM_PROXY_URL;
 delete process.env.ACCESS_KEY;
+delete process.env.M3U_AUTH;
 
 const { handleDiag } = await import('./hlsProxy.mjs');
 const app = http.createServer(handleDiag);

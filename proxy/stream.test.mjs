@@ -96,9 +96,9 @@ test('a refusal with no second source reports what the provider answered', async
   const res = await fetch(`${origin}/api/stream?id=800`);
   assert.equal(res.status, 502);
   const body = await res.json();
-  assert.match(body.error, /Channel 800 would not play/);
-  assert.match(body.error, /answered 403/);
-  assert.match(body.error, /via tunnel/, 'the transport is named, so a tunnel fault is visible');
+  assert.equal(body.code, 'STREAM_REJECTED');
+  assert.equal(body.retryable, false);
+  assert.doesNotMatch(JSON.stringify(body), /snapmediatoghater|\/live\/|\/u\/p\//);
 });
 
 test('a genuine refusal is remembered so the grid can mark it', async () => {

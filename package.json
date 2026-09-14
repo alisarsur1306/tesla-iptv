@@ -11,7 +11,8 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "start": "node server.js",
-    "test": "node proxy/hlsProxy.test.mjs",
+    "test": "node scripts/test.mjs",
+    "check": "npm run lint && npm test && npm run build",
     "preview": "node server.js"
   },
   "dependencies": {

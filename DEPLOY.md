@@ -16,7 +16,11 @@ credentials and the access key are environment variables.
    - `XTREAM_PASSWORD` — your Xtream password
    - `ACCESS_KEY` — any secret string you invent; it gates the proxy so
      strangers can't use your deployment (or your 1-connection account).
-5. Deploy. Render runs `npm install && npm run build`, then `node server.js`.
+5. Deploy. Render runs `npm ci && npm run check && ./fetch-tailscale.sh`,
+   then `./render-start.sh` to configure Tailscale when requested and start Node.
+   `npm run check` runs lint, all isolated tests and the production build. GitHub Actions
+   repeats this on pull requests and main. Set Auto-Deploy to **After CI Checks Pass**
+   in an existing Render service (new Blueprints use `autoDeployTrigger: checksPass`).
 
 ## Reaching the Xtream host from a datacenter
 
@@ -27,8 +31,8 @@ give it a non-blocked path; the app supports all three and picks in this order:
 
 | Env var | Route | Needs |
 | --- | --- | --- |
-| `XTREAM_PROXY_URL` | A Cloudflare Worker re-fetches the host from Cloudflare's own network, which the origin does not block | A free Cloudflare account. No hardware. |
-| `UPSTREAM_PROXY` | An HTTP proxy borrows a non-datacenter IP — a Tailscale exit node at home, or a commercial residential proxy | An always-on device, or a few $/month |
+| `XTREAM_PROXY_URL` | A Cloudflare Worker re-fetches the host; provider acceptance must be verified | A Cloudflare account with the Worker deployed. No home hardware. |
+| `UPSTREAM_PROXY` | An HTTP proxy, such as a Tailscale exit node at home or a commercial residential proxy; verify its actual egress and provider access | An always-on device, or a few $/month |
 | *(neither set)* | Provider requests blocked on Render; direct in local development | Configure a proxy on Render |
 
 `XTREAM_PROXY_URL` wins when both are set, so you can leave the Tailscale vars
@@ -60,20 +64,23 @@ A configured proxy that fails is not retried directly. This guard does not check
 where the proxy itself exits; a VPN on the home device still requires separate
 diagnosis below. Unlisted CDN hosts continue to use direct transport.
 
-Segments redirect to a CDN that
-does *not* block datacenter IPs, and its tokens are not IP-bound, so video
-streams direct from Render — the detour carries metadata, never the video.
+Unlisted CDN hosts are fetched directly from Render. This depends on those
+hosts accepting cloud requests and their stream tokens working across IPs;
+the app cannot guarantee either property for a changed provider or redirect.
+Add a provider-owned hostname to `PROXY_HOSTS` if it must also take the proxy
+route, bearing in mind that this may route video through the home connection.
 
 ## Option: a Tailscale exit node
 
-This routes the Xtream host out through a device at home, so the requests leave
-from a residential IP. Measured: ~3 KB per playlist refresh over the tunnel
-versus ~2 MB per segment direct — the exit node carries metadata, never the
-video. Skip this section if you are using `XTREAM_PROXY_URL` or a commercial
-residential proxy instead.
+This routes requests for configured provider hosts through a device at home.
+They use that device's forwarding path, whose actual egress must be verified.
+The tunnel can carry both metadata and video: a continuous MPEG-TS response
+served by a routed provider host stays on the tunnel. Each redirect selects
+its route again; an unlisted CDN host uses direct transport. Skip this section
+if you are using `XTREAM_PROXY_URL` or a commercial residential proxy instead.
 
-1. Install Tailscale on a device that is always on at home (an Android TV, Pi, or
-   NAS all work — it only handles a few KB per refresh).
+1. Install Tailscale on a device that is always on at home, with forwarding
+   capacity and home upload bandwidth for any video sent through it.
 2. Advertise it as an exit node, and approve it in the Tailscale admin console
    under **Machines → … → Edit route settings → Use as exit node**.
 3. Generate a **reusable, ephemeral** auth key (Settings → Keys). Ephemeral means
@@ -83,14 +90,15 @@ residential proxy instead.
    - `TS_AUTHKEY` — the auth key from step 3
    - `TS_EXIT_NODE` — the exit node's tailnet name or IP, e.g. `android-tv`
 
-Auth keys expire after at most 90 days. When yours does, the service will start
-but log `tailscale failed to come up` and upstream requests will be blocked again
-— generate a new key and update `TS_AUTHKEY`. Use an OAuth client with a tag if
-you want something that doesn't expire.
+An expired or invalid auth key makes `tailscale up` fail. The startup script
+exits before starting Node, so a new deployment cannot become healthy. Renew
+the configured authentication as appropriate in Tailscale and update
+`TS_AUTHKEY`; do not treat a previous live instance as proof the new one started.
 
-Leaving `TS_AUTHKEY` unset skips the whole mechanism: no Tailscale download at
-build time, and the app talks to upstream directly. That's the right setting for
-local use, where `car-tv-on.bat` already runs from a residential IP.
+Leaving `TS_AUTHKEY` unset skips starting Tailscale. Binaries are still downloaded
+at build time so enabling it later does not require another build. The app then
+uses a configured Worker or `UPSTREAM_PROXY`; with neither, provider requests
+are blocked on Render and may go direct in local development.
 
 ### Troubleshooting the exit node
 
@@ -112,27 +120,31 @@ Two traps worth stating explicitly:
   node** in the admin console (Machines → ⋯ → Edit route settings). A machine
   never lists *itself* in `tailscale exit-node list`, so check from another
   machine or the console.
-- **An offline exit node fails silently.** Tailscale accepts a dead node and
-  blackholes through it, and the log line `Tailscale up; routing Xtream host via
-  exit node …` is only this script echoing what it *requested* — not proof the
-  route works. Trust `tailscale exit-node list`, not that line.
+- **Startup is not a forwarding test.** Tailscale may accept the requested
+  configuration while the exit node cannot forward traffic. Both Render and
+  the home device can appear connected in Tailscale while forwarded requests
+  time out. The startup log says the node is configured, not that its egress
+  was verified. Check `/api/health` and the selected-route diagnostic probes
+  alongside the exit node's online/routing state.
 
 ## When the channel list is slow or Xtream is down
 
-The channel list is the one big download the app makes (megabytes of JSON,
-pulled through the exit node). Three things keep it from stranding the car:
+The channel list is a large metadata download (megabytes of JSON, fetched
+through the selected provider route). Three things keep it from stranding the car:
 
 - **Cached for 30 minutes.** The first request pays for the download; every
   page load inside that window is answered from memory, and concurrent requests
   share a single upstream fetch instead of each starting their own.
-- **A 90 s budget.** List downloads get their own timeout, separate from the
-  25 s connect timeout used for playback, because a slow list is still a usable
-  list. Streaming behaviour is unchanged.
+- **A 90 s budget.** List downloads keep their own timeout. Playback has a
+  separate 60-second startup budget that includes backup discovery, all provider
+  attempts and the first bytes or complete HLS manifest; each connect attempt
+  gets at most 25 seconds within that total.
 - **A playlist fallback.** When Xtream fails outright, the last list it served
   is reused; if there isn't one, the app serves an M3U channel list instead —
   `M3U_URL` if set, else `public/playlist.m3u`. Channels then play from the
-  playlist's own URLs, so a fallback list is playable, not just visible. To get
-  that safety net on Render, set `M3U_URL`: `public/playlist.m3u` is untracked
+  playlist's own URLs; the backup preserves the catalogue and playback targets,
+  but does not establish that those URLs are reachable. To configure that
+  fallback on Render, set `M3U_URL`: `public/playlist.m3u` is untracked
   (like `config.json`), so it only exists in local dev. With no M3U source at
   all, a hard Xtream failure still returns an error.
 
@@ -153,15 +165,76 @@ The symptom is a timeout with no refusal and no reset — indistinguishable, fro
 from a dead exit node, an asleep machine, or an exhausted connection limit. All of those were
 investigated before the VPN was.
 
-`GET /api/diag?key=<ACCESS_KEY>&quick=1` reports `egressIp`, fetched through the tunnel itself.
-That is the one measurement that settles it:
+`GET /api/diag?key=<ACCESS_KEY>&quick=1` reports `egressTransport` and `egressIp`.
+The IP-check request uses the provider's selected transport: Worker takes
+priority over tunnel, direct mode stays direct, and blocked mode makes no
+IP-check request. It never substitutes a tunnel measurement for a Worker route.
 
-- a residential address — the route is doing its job
-- a cloud provider's address — something on the exit node is re-routing the traffic
-- `null` with `egressIpError` — forwarding is broken rather than redirected
+Compare a tunnel result with the expected home connection and check the exit
+node's VPN/routing state. An address alone does not establish residential
+ownership, provider acceptance or the path used for another hostname.
+`null` with `egressIpError` means the measurement failed, not necessarily that
+forwarding is down: the supplied Worker restricts target hosts and does not
+allow `api.ipify.org`, for example. The live login check below tests provider
+acceptance independently.
 
-So: if streams stop and `egressIp` is not the home connection, check what else is running on the
-exit node before touching anything here.
+## Connection check in the player
+
+`GET /api/health?key=<ACCESS_KEY>` performs one small Xtream login request, with
+a 10-second deadline that includes reading the response body. Parallel checks
+share the same request and its result is cached for 15 seconds. It does not
+download video or channel lists and does not use a successful cached list as
+evidence that the provider is reachable now.
+
+The response is only `{ status, route, checkedAt }`. It contains no account,
+upstream URL, body, or IP. It follows the `/config.json` access-key rule: a
+configured key is required; open local mode remains available. The player
+interprets these states:
+
+- `ok`: a complete login reply has `auth: 1` and `status: "Active"`.
+- `provider_rejected`: the upstream path returned 401, 403 or 429, or the
+  account reply refused authentication/reported an inactive account. This
+  does not identify whether an HTTP refusal was an IP rule or a proxy gate.
+- `proxy_unreachable`: a request through the configured proxy failed before
+  a usable response; check both the proxy and its onward connection.
+- `timeout`: the whole check exceeded its deadline or the connection timed out.
+- `not_configured`: account settings are missing/invalid or Render has no
+  configured transport for the provider.
+- `unknown`: a response cannot validate login, the upstream returned another
+  error, a direct request failed, or only an M3U source is configured.
+
+`route` describes the selected provider transport, not proof of home egress.
+An `ok` login does not prove that a specific channel plays or that redirects
+use the same network path. `/api/health` is a user-triggered provider diagnosis;
+use a static app endpoint for hosting liveness checks to avoid coupling process
+restarts to a provider outage.
+
+### Playback deadlines and failures
+
+After startup, a pending upstream read times out after 20 seconds without
+nonempty data. A healthy continuous stream has no fixed duration limit, and
+downstream backpressure does not spend the network inactivity budget. Failed
+attempts, timed-out refusal bodies and abandoned backup lookups are aborted
+before another candidate starts. HLS manifests are limited to 2 MiB.
+
+`/api/stream` startup errors return a fixed safe sentence with `code` and
+`retryable`, never a raw upstream URL or error body. `STREAM_TIMEOUT` uses HTTP
+504; `STREAM_NOT_CONFIGURED` uses 503; `STREAM_PROXY_UNAVAILABLE`,
+`STREAM_REJECTED`, `STREAM_UNAVAILABLE` and `STREAM_INVALID_RESPONSE` use 502.
+The client uses `retryable` to distinguish recovery from an action the user
+needs to take. Once streaming headers are sent, inactivity closes the stream;
+error JSON is never inserted into media bytes.
+
+The browser allows 75 seconds for startup and 20 seconds for subsequent byte
+reads. This leaves time for the server's complete startup result to arrive.
+These bounds prevent silent loading; they do not restore an offline exit node.
+
+The stream probe in `/api/diag` has a 15-second budget that starts before
+resolving a backup, and cold backup resolution gets at most 8 seconds. Quick
+diagnostics share a 30-second budget across probes. A recognized first chunk
+is reported as initial stream bytes, not proof of decoded playback. The probe
+opens a real stream, so avoid running it concurrently with playback on a
+single-connection account.
 
 ## When it fails: find out why in one request
 
@@ -210,19 +283,24 @@ https://<your-app>.onrender.com/api/diag?key=<ACCESS_KEY>&stream=12345
 
 Read it like this:
 
-- `looksLike: "mpeg-ts"` → this channel plays. `servedByHost` says who served the
-  video: the provider host means it rode the tunnel, anything else means it was
-  redirected to a CDN and went direct.
-- `status: 403` → the provider refused it. Either the channel is not on this
-  line, or the request did not leave through the exit node — compare `egressIp`
-  from `?quick=1`. A refusal the server judges genuine (a bare 403, not a block
-  page) is remembered and shown in the grid as "Not included in your
-  subscription"; `/api/unavailable` lists them.
+- `looksLike: "mpeg-ts"` → the probe received initial MPEG-TS bytes; it did not
+  verify decoding or sustained playback. `servedByHost` identifies the final
+  response host, while `transport` describes the requested host's selected
+  route. A hostname alone does not prove tunnel use or residential egress:
+  Worker priority and routing checks on redirects still apply.
+- `status: 403` → access was refused; this can be an account, provider or proxy
+  rule. Compare the selected-route probes and expected egress rather than
+  inferring the path from the status. A refusal the server judges genuine is
+  remembered only after the available candidates fail without a retryable
+  outcome. The grid says "Source previously refused this channel";
+  `/api/unavailable` lists those records. This is not proof that the channel
+  is excluded from the subscription.
 - `looksLike: "html"` → something upstream answered instead of the provider (a
   block page or a captive portal), whatever the status says.
 - `idSpace` → which of the two id spaces the id was resolved in. The player is
-  told both, and falls through to the other when the first is refused, so a
-  client holding a cached list from the other source still plays.
+  served by the backend, which can try an alternate target when the first
+  fails. This supports cached IDs from either source; the selected target
+  still needs to accept the request and deliver playable media.
 
 ## Making the offline backup
 
@@ -255,9 +333,10 @@ Refresh the backup by re-running step 1 and committing the new file whenever you
 lineup changes.
 
 
-The caches above live in memory, and the free tier sleeps after ~15 min idle —
-so a cold start begins with nothing cached. A backup that survives that has to
-live outside the process, which is what `M3U_URL` is for.
+Lists also persist in `CACHE_DIR` (the system temp directory by default).
+Those files can survive a process restart, but are not guaranteed to survive
+a new Render container or deployment. A privately hosted `M3U_URL` remains
+the backup for a container without a usable saved list.
 
 The server can now produce that file itself (it reaches Xtream through the exit
 node), so no second machine is involved:

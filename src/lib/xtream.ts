@@ -23,7 +23,8 @@ export function initAccessKeyFromUrl(): void {
     const params = new URLSearchParams(window.location.search);
     const fromUrl = params.get('key');
     if (fromUrl) {
-      localStorage.setItem(KEY_STORAGE, fromUrl);
+      cachedKey = fromUrl;
+      try { localStorage.setItem(KEY_STORAGE, fromUrl); } catch { /* Keep the in-memory key. */ }
       params.delete('key');
       const qs = params.toString();
       window.history.replaceState(
@@ -31,8 +32,9 @@ export function initAccessKeyFromUrl(): void {
         '',
         window.location.pathname + (qs ? `?${qs}` : '') + window.location.hash,
       );
+    } else {
+      cachedKey = localStorage.getItem(KEY_STORAGE);
     }
-    cachedKey = localStorage.getItem(KEY_STORAGE);
   } catch {
     /* private mode etc. — fall back to in-memory key */
   }

@@ -1,0 +1,40 @@
+const en = {
+  loading: 'Loading channels…', seconds: 's', coldStart: 'The full channel list can take up to a minute on a cold start.',
+  stillWaiting: 'The TV source is taking longer than usual. You can retry if loading does not finish.',
+  failed: 'Could not load channels.', retry: 'Try again', logout: 'Log out', backToLogin: 'Back to login',
+  search: 'Search channels or groups', searchPlaceholder: 'Search channels or groups…', clearSearch: 'Clear search',
+  filters: 'Channel filters', favorites: 'Favorites', all: 'All', recent: 'Recent', continueWatching: 'Continue',
+  noSearch: 'No channels match your search in this group.', noFavorites: 'No favorites yet. Star a channel to pin it here.',
+  noRecent: 'Recently watched channels will appear here.', noChannels: 'No channels found.', browseAll: 'Browse all channels',
+  play: 'Play', unavailable: 'Source previously refused this channel', removeFavorite: 'Remove from favorites', addFavorite: 'Add to favorites',
+  more: 'Show more', remaining: 'remaining', chooseGroup: 'Choose channel group', groups: 'Groups',
+  groupTitle: 'Channel groups', groupDescription: 'Choose a group to browse its channels.', close: 'Close', language: 'Language',
+};
+
+export const browserStrings: Record<'en' | 'he' | 'ar', typeof en> = {
+  en,
+  he: {
+    loading: 'טוען ערוצים…', seconds: 'ש׳', coldStart: 'טעינת רשימת הערוצים המלאה עשויה להימשך עד דקה בהפעלה ראשונית.',
+    stillWaiting: 'מקור השידור מגיב לאט מהרגיל. אפשר לנסות שוב אם הטעינה לא מסתיימת.',
+    failed: 'לא ניתן לטעון את הערוצים.', retry: 'נסה שוב', logout: 'התנתקות', backToLogin: 'חזרה להתחברות',
+    search: 'חיפוש ערוצים או קבוצות', searchPlaceholder: 'חיפוש ערוצים או קבוצות…', clearSearch: 'ניקוי חיפוש',
+    filters: 'סינון ערוצים', favorites: 'מועדפים', all: 'הכול', recent: 'אחרונים', continueWatching: 'המשך צפייה',
+    noSearch: 'לא נמצאו ערוצים שמתאימים לחיפוש בקבוצה הזאת.', noFavorites: 'עדיין אין מועדפים. לחיצה על הכוכב תשמור כאן ערוץ.',
+    noRecent: 'ערוצים שצפית בהם לאחרונה יופיעו כאן.', noChannels: 'לא נמצאו ערוצים.', browseAll: 'כל הערוצים',
+    play: 'נגן', unavailable: 'מקור השידור סירב לערוץ הזה בעבר', removeFavorite: 'הסרה מהמועדפים', addFavorite: 'הוספה למועדפים',
+    more: 'הצג עוד', remaining: 'נותרו', chooseGroup: 'בחירת קבוצת ערוצים', groups: 'קבוצות',
+    groupTitle: 'קבוצות ערוצים', groupDescription: 'בחר קבוצה כדי לצפות בערוצים שלה.', close: 'סגירה', language: 'שפה',
+  },
+  ar: {
+    loading: 'جارٍ تحميل القنوات…', seconds: 'ث', coldStart: 'قد يستغرق تحميل قائمة القنوات الكاملة دقيقة عند بدء التشغيل.',
+    stillWaiting: 'مصدر البث أبطأ من المعتاد. يمكنك المحاولة مجددًا إذا لم يكتمل التحميل.',
+    failed: 'تعذّر تحميل القنوات.', retry: 'حاول مجددًا', logout: 'تسجيل الخروج', backToLogin: 'العودة لتسجيل الدخول',
+    search: 'البحث عن قنوات أو مجموعات', searchPlaceholder: 'البحث عن قنوات أو مجموعات…', clearSearch: 'مسح البحث',
+    filters: 'تصفية القنوات', favorites: 'المفضلة', all: 'الكل', recent: 'الأخيرة', continueWatching: 'متابعة المشاهدة',
+    noSearch: 'لا توجد قنوات تطابق البحث في هذه المجموعة.', noFavorites: 'لا توجد مفضلة بعد. اضغط على النجمة لحفظ قناة هنا.',
+    noRecent: 'ستظهر هنا القنوات التي شاهدتها مؤخرًا.', noChannels: 'لم يتم العثور على قنوات.', browseAll: 'تصفّح جميع القنوات',
+    play: 'تشغيل', unavailable: 'رفض مصدر البث هذه القناة سابقًا', removeFavorite: 'إزالة من المفضلة', addFavorite: 'إضافة إلى المفضلة',
+    more: 'عرض المزيد', remaining: 'متبقية', chooseGroup: 'اختيار مجموعة قنوات', groups: 'المجموعات',
+    groupTitle: 'مجموعات القنوات', groupDescription: 'اختر مجموعة لتصفّح قنواتها.', close: 'إغلاق', language: 'اللغة',
+  },
+};
