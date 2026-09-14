@@ -102,6 +102,22 @@ are blocked on Render and may go direct in local development.
 
 ### Troubleshooting the exit node
 
+After Tailscale starts, `render-start.sh` launches best-effort `[tunnel-check]`
+probes in the background while Node starts: one TSMP ping (hard limit 5 seconds), numeric IPv4
+HTTP through the configured local proxy (10 seconds), then an HTTP hostname
+probe (10 seconds) only if the numeric request received an HTTP response.
+These checks do not delay cold starts. Failures never trigger a direct request. Logs contain
+only fixed outcome labels, HTTP status and command exit codes; bodies, egress IP,
+credentials and full Tailscale output are suppressed.
+
+`tsmp=reachable` confirms WireGuard peer communication, not exit forwarding.
+If numeric HTTP has no response, destination DNS was not needed for that failed
+request. If numeric HTTP responds but hostname HTTP does not, DNS or dual-stack
+dialing becomes a candidate alongside destination-specific failure. HTTP errors
+also count as responses and may come from the proxy; neither probe proves home
+egress or working IPTV. See [Tailscale ping types](https://tailscale.com/kb/1465/ping-types)
+and the [curl timeout/proxy options](https://curl.se/docs/manpage.html).
+
 Distinguish a provider refusal (403) from a tunnel connection failure or timeout.
 A configured tunnel has no automatic direct retry. A missing proxy is now
 explicitly blocked on Render rather than silently using its IP. Check in this order:

@@ -41,6 +41,10 @@ if [ -n "${TS_AUTHKEY:-}" ]; then
     || { echo "tailscale failed to come up" >&2; exit 1; }
   export UPSTREAM_PROXY="127.0.0.1:${PROXY_PORT}"
   echo "Tailscale configured with an exit node; forwarding and provider access still need a health check"
+  # The probes have their own deadlines and log after boot if necessary. Do not
+  # add their wait to a user's cold start on the free Render service.
+  (bash ./proxy/startupDiagnostics.sh "$TS_SOCKET" "$TS_EXIT_NODE" "$UPSTREAM_PROXY" \
+    || echo '[tunnel-check] probes_unavailable; continuing app startup') &
 else
   echo "TS_AUTHKEY unset; no Tailscale proxy started"
 fi

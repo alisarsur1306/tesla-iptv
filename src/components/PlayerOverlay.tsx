@@ -201,8 +201,9 @@ function PlayerSession({ creds, channel, playlist = [], onSelect, onBack }: Play
     : /HTTP_40[13]/.test(playback.error ?? '') ? t.forbidden
     : /HTTP_404|HTTP_410/.test(playback.error ?? '') ? t.unavailable
     : /HTTP_50[234]|fetch/i.test(playback.error ?? '') ? t.connection : t.failed;
+  const reconnecting = playback.phase === 'retrying' || (playback.phase === 'starting' && playback.attempt > 0);
   const status = offline ? t.offline : paused ? t.paused
-    : playback.phase === 'retrying' ? `${t.retrying} (${playback.attempt}/3)…`
+    : reconnecting ? `${t.retrying} (${playback.attempt}/3)…`
     : playback.phase === 'starting' ? `${t.loading}…` : '';
   const visibleStyle = { visibility: controlsVisible ? 'visible' as const : 'hidden' as const };
 
@@ -255,7 +256,7 @@ function PlayerSession({ creds, channel, playlist = [], onSelect, onBack }: Play
       {!firstFrame && !fatal && !videoUnsupported && !videoStalled && !paused && (
         <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-6">
           <Loader2 className="size-14 animate-spin text-red-500" />
-          <span dir="auto" className="text-center text-2xl font-medium text-zinc-200">{t.loading} {channel.name}…</span>
+          <span dir="auto" className="text-center text-2xl font-medium text-zinc-200">{reconnecting ? status : `${t.loading} ${channel.name}…`}</span>
         </div>
       )}
       {firstFrame && buffering && !fatal && !paused && !videoUnsupported && !videoStalled && (
