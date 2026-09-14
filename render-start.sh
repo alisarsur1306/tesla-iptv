@@ -40,6 +40,9 @@ if [ -n "${TS_AUTHKEY:-}" ]; then
   ./tailscale --socket="${TS_SOCKET}" status --json > /dev/null \
     || { echo "tailscale failed to come up" >&2; exit 1; }
   export UPSTREAM_PROXY="127.0.0.1:${PROXY_PORT}"
+  # Resolve provider names on Render, while the numeric connection still uses
+  # the exit node. This works even when the Mac's DNS forwarding is unavailable.
+  export UPSTREAM_PROXY_LOCAL_DNS="${UPSTREAM_PROXY_LOCAL_DNS:-1}"
   echo "Tailscale configured with an exit node; forwarding and provider access still need a health check"
   # The probes have their own deadlines and log after boot if necessary. Do not
   # add their wait to a user's cold start on the free Render service.

@@ -15,7 +15,7 @@ let dependenciesLinked = false;
 
 // This list follows hlsProxy.mjs, server.js and the Render/Tailscale startup
 // scripts. Prefixes cover future account/transport options in the same family.
-const deploymentVariable = /^(?:XTREAM_|M3U_|TS_|RENDER(?:_|$))|^(?:ACCESS_KEY|UPSTREAM_PROXY|PROXY_HOSTS|PROXY_TOKEN|CACHE_DIR|HOST|PORT)$/i;
+const deploymentVariable = /^(?:XTREAM_|M3U_|TS_|UPSTREAM_PROXY_|RENDER(?:_|$))|^(?:ACCESS_KEY|UPSTREAM_PROXY|PROXY_HOSTS|PROXY_TOKEN|CACHE_DIR|HOST|PORT)$/i;
 const proxyVariable = /^(?:NODE_USE_ENV_PROXY|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY)$/i;
 const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
   !deploymentVariable.test(key) && !proxyVariable.test(key)));
