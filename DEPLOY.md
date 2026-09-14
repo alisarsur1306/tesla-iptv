@@ -100,12 +100,20 @@ at build time so enabling it later does not require another build. The app then
 uses a configured Worker or `UPSTREAM_PROXY`; with neither, provider requests
 are blocked on Render and may go direct in local development.
 
+The build pins Tailscale 1.102.4. This includes the 1.102.1 fix for userspace
+connections to dual-stack names through an IPv4-only exit node; see the
+[official changelog](https://tailscale.com/changelog#2026-08-03).
+`TS_VERSION` overrides the build pin when a rollback is needed and requires a
+new build. Updating the client does not prove the exit node's DNS works.
+
 ### Troubleshooting the exit node
 
 After Tailscale starts, `render-start.sh` launches best-effort `[tunnel-check]`
 probes in the background while Node starts: one TSMP ping (hard limit 5 seconds), numeric IPv4
 HTTP through the configured local proxy (10 seconds), then an HTTP hostname
 probe (10 seconds) only if the numeric request received an HTTP response.
+It then reads and parses private node status (3 seconds) and queries the selected exit
+node's numeric PeerAPI DNS endpoint through the same proxy (8 seconds).
 These checks do not delay cold starts. Failures never trigger a direct request. Logs contain
 only fixed outcome labels, HTTP status and command exit codes; bodies, egress IP,
 credentials and full Tailscale output are suppressed.
@@ -117,6 +125,17 @@ dialing becomes a candidate alongside destination-specific failure. HTTP errors
 also count as responses and may come from the proxy; neither probe proves home
 egress or working IPTV. See [Tailscale ping types](https://tailscale.com/kb/1465/ping-types)
 and the [curl timeout/proxy options](https://curl.se/docs/manpage.html).
+
+`peer_dns=response http=500` points toward the exit node's DNS handler failing
+to resolve the test name; `peer_dns=no_response` points toward its listener or
+network path. A 200 is only an HTTP response, not proof of a valid DNS answer.
+Missing or invalid peer metadata skips this probe. On macOS, the exit-node DNS
+handler reads the first nameserver in `/etc/resolv.conf` and forwards over TCP.
+Check that resolver after disconnecting another VPN; do not assume that an
+earlier VPN session caused the failure. Render's `--accept-dns=false` does not
+bypass this exit-node DNS path. See the
+[exit-node resolver implementation](https://github.com/tailscale/tailscale/blob/v1.102.3/net/dns/resolver/tsdns.go#L443-L505)
+and [PeerAPI handler](https://github.com/tailscale/tailscale/blob/v1.102.3/ipn/ipnlocal/peerapi.go#L708-L765).
 
 Distinguish a provider refusal (403) from a tunnel connection failure or timeout.
 A configured tunnel has no automatic direct retry. A missing proxy is now
