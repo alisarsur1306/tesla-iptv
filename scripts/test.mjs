@@ -42,6 +42,8 @@ try {
   // ignored public/config.json or playlist.m3u from being used as a fallback.
   // Tests read the installed dependencies through a link; they are not copied.
   await copyFile(path.join(project, 'package.json'), path.join(snapshot, 'package.json'));
+  await mkdir(path.join(snapshot, 'public'));
+  await copyFile(path.join(project, 'public', 'sw.js'), path.join(snapshot, 'public', 'sw.js'));
   for (const directory of ['proxy', 'src']) {
     await cp(path.join(project, directory), path.join(snapshot, directory), { recursive: true });
   }

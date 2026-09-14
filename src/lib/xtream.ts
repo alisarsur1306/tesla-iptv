@@ -148,14 +148,20 @@ export class TimeoutError extends Error {
 
 const LIST_ACTIONS = new Set(['get_live_streams', 'get_live_categories']);
 
-async function fetchXtJson<T>(action?: string): Promise<T> {
+class CatalogueChangedError extends Error {}
+
+async function fetchXtJson<T>(action?: string, options: { params?: URLSearchParams; onHeaders?: (headers: Headers) => void; signal?: AbortSignal } = {}): Promise<T> {
   const budget = action && LIST_ACTIONS.has(action) ? LIST_BUDGET_MS : DEFAULT_BUDGET_MS;
   const controller = new AbortController();
+  const abort = () => controller.abort(options.signal?.reason);
+  options.signal?.addEventListener('abort', abort, { once: true });
+  if (options.signal?.aborted) abort();
   const timer = setTimeout(() => controller.abort(), budget);
   try {
     let res: Response;
     try {
-      res = await fetch(xtApiUrl(action), { signal: controller.signal });
+      const url = xtApiUrl(action);
+      res = await fetch(options.params ? `${url}${url.includes('?') ? '&' : '?'}${options.params}` : url, { signal: controller.signal });
     } catch (err) {
       throw new Error(
         `Could not reach the server${action ? ` for ${action}` : ''}: ` +
@@ -163,6 +169,7 @@ async function fetchXtJson<T>(action?: string): Promise<T> {
       );
     }
     if (res.status === 403) throw new AccessKeyError();
+    if (res.status === 409 && options.params) throw new CatalogueChangedError('Catalogue changed during loading');
     if (!res.ok) {
       let detail = '';
       try {
@@ -175,12 +182,14 @@ async function fetchXtJson<T>(action?: string): Promise<T> {
       throw new Error(`Request failed (${res.status})${detail}`);
     }
     // fetch resolves at the headers; keep the deadline through body consumption too.
+    options.onHeaders?.(res.headers);
     return (await res.json()) as T;
   } catch (err) {
     if (controller.signal.aborted) throw new TimeoutError(budget);
     throw err;
   } finally {
     clearTimeout(timer);
+    options.signal?.removeEventListener('abort', abort);
   }
 }
 
@@ -201,7 +210,8 @@ export async function getLiveCategories(_creds: XtreamCreds): Promise<XtreamCate
 
 export async function getLiveStreams(_creds: XtreamCreds): Promise<XtreamLiveStream[]> {
   const data = await fetchXtJson<XtreamLiveStream[]>('get_live_streams');
-  return Array.isArray(data) ? data : [];
+  if (!Array.isArray(data) || !data.length) throw new Error('Channel list is empty; keeping the last saved list.');
+  return data;
 }
 
 /**
@@ -229,12 +239,62 @@ export function liveStreamUrl(_creds: XtreamCreds, streamId: number): string {
 // server being cold, asleep, or unreachable. The fresh list is fetched underneath and swapped
 // in when it arrives.
 const LIST_CACHE_KEY = 'tesla-iptv:channelCache';
-const LIST_CACHE_VERSION = 1;
+const LIST_CACHE_VERSION = 2;
+const MANAGED_CACHE_KEY = 'tesla-iptv:managedSession';
+
+export function rememberManagedSession(managed: boolean): void {
+  try { localStorage.setItem(MANAGED_CACHE_KEY, JSON.stringify({ managed, key: getAccessKey() })); } catch { /* Cache is optional. */ }
+}
+
+export async function getLiveCatalogue(_creds: XtreamCreds, options: {
+  cached?: ChannelCache | null;
+  onPage?: (streams: XtreamLiveStream[]) => void;
+  signal?: AbortSignal;
+} = {}): Promise<{ streams: XtreamLiveStream[]; revision?: string }> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const streams: XtreamLiveStream[] = [];
+    let revision: string | undefined;
+    let total: number | undefined;
+    try {
+      do {
+        const params = new URLSearchParams({ offset: String(streams.length), limit: '200' });
+        if (revision) params.set('revision', revision);
+        else if (options.cached?.revision) params.set('if_revision', options.cached.revision);
+        let headers = new Headers();
+        const page = await fetchXtJson<XtreamLiveStream[]>('get_live_streams', { params, signal: options.signal, onHeaders: value => { headers = value; } });
+        if (headers.get('x-catalogue-unchanged') === 'true' && options.cached?.revision === headers.get('x-catalogue-revision')) return { streams: options.cached.streams, revision: options.cached.revision };
+        if (!Array.isArray(page) || !page.length) throw new Error('Incomplete or empty channel catalogue');
+        const currentRevision = headers.get('x-catalogue-revision');
+        if (!currentRevision) return { streams: page }; // Older servers return the full list.
+        const currentTotal = Number(headers.get('x-catalogue-total'));
+        if (!Number.isInteger(currentTotal) || currentTotal < 1 || currentTotal > 10000 || (revision && (currentRevision !== revision || total !== currentTotal))) throw new CatalogueChangedError('Catalogue changed during loading');
+        revision = currentRevision;
+        total = currentTotal;
+        streams.push(...page);
+        if (streams.length > total || new Set(streams.map(s => s.stream_id)).size !== streams.length) throw new Error('Invalid catalogue page');
+        options.onPage?.([...streams]);
+      } while (streams.length < (total || 0));
+      return { streams, revision };
+    } catch (error) {
+      if (error instanceof CatalogueChangedError && attempt === 0) continue;
+      throw error;
+    }
+  }
+  throw new Error('Catalogue changed repeatedly; keeping the saved list');
+}
+
+export function hasCachedManagedSession(): boolean {
+  try {
+    const session = JSON.parse(localStorage.getItem(MANAGED_CACHE_KEY) || 'null');
+    return session?.managed === true && session.key === getAccessKey() && readChannelCache() !== null;
+  } catch { return false; }
+}
 
 export interface ChannelCache {
   categories: XtreamCategory[];
   streams: XtreamLiveStream[];
   at: number;
+  revision?: string;
 }
 
 /** Only the fields the UI reads — a full Xtream row is several times larger, and localStorage
@@ -253,30 +313,30 @@ export function readChannelCache(): ChannelCache | null {
   try {
     const raw = localStorage.getItem(LIST_CACHE_KEY);
     if (!raw) return null;
-    const parsed = JSON.parse(raw) as ChannelCache & { v?: number };
-    if (parsed.v !== LIST_CACHE_VERSION) return null;
+    const parsed = JSON.parse(raw) as ChannelCache & { v?: number; key?: string };
+    if (parsed.v !== LIST_CACHE_VERSION || parsed.key !== getAccessKey()) return null;
     if (!Array.isArray(parsed.categories) || !Array.isArray(parsed.streams)) return null;
     if (!parsed.streams.length) return null;
-    return { categories: parsed.categories, streams: parsed.streams, at: parsed.at || 0 };
+    if (parsed.streams.some(s => !s || !Number.isFinite(s.stream_id) || typeof s.name !== 'string' || typeof s.category_id !== 'string')) return null;
+    if (parsed.categories.some(c => !c || typeof c.category_id !== 'string' || typeof c.category_name !== 'string')) return null;
+    return { categories: parsed.categories, streams: parsed.streams, at: parsed.at || 0, ...(typeof parsed.revision === 'string' ? { revision: parsed.revision } : {}) };
   } catch {
     return null;
   }
 }
 
-export function writeChannelCache(categories: XtreamCategory[], streams: XtreamLiveStream[]): void {
+export function writeChannelCache(categories: XtreamCategory[], streams: XtreamLiveStream[], revision?: string): void {
+  if (!streams.length) return;
   try {
+    const compact = trim(streams);
+    const previous = readChannelCache();
+    if (previous && previous.revision === revision && JSON.stringify(previous.categories) === JSON.stringify(categories) && JSON.stringify(previous.streams) === JSON.stringify(compact)) return;
     localStorage.setItem(
       LIST_CACHE_KEY,
-      JSON.stringify({ v: LIST_CACHE_VERSION, categories, streams: trim(streams), at: Date.now() }),
+      JSON.stringify({ v: LIST_CACHE_VERSION, key: getAccessKey(), categories, streams: compact, at: Date.now(), revision }),
     );
   } catch {
-    // Over quota, or private mode. A missing cache only costs speed, so drop any half-written
-    // entry and carry on rather than failing the load.
-    try {
-      localStorage.removeItem(LIST_CACHE_KEY);
-    } catch {
-      /* nothing more to do */
-    }
+    // localStorage.setItem is atomic. On quota failure retain the previous list.
   }
 }
 

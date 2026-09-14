@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { AccessKeyError, TimeoutError, getLiveStreams, initAccessKeyFromUrl, getAccessKey, setAccessKey } from './xtream.ts';
+import { AccessKeyError, TimeoutError, getLiveStreams, getLiveCatalogue, initAccessKeyFromUrl, getAccessKey, setAccessKey, readChannelCache, writeChannelCache, rememberManagedSession, hasCachedManagedSession } from './xtream.ts';
 
 const creds = { server: 'managed', username: 'managed', password: 'managed' };
 
@@ -56,6 +56,67 @@ test('an invalid access key retains its distinct error', async (t) => {
 test('upstream error details remain visible', async (t) => {
   t.mock.method(globalThis, 'fetch', async () => Response.json({ error: 'Source offline' }, { status: 502 }));
   await assert.rejects(getLiveStreams(creds), /Request failed \(502\).*Source offline/);
+});
+
+test('an empty refresh is rejected so it cannot replace the last visible channel list', async t => {
+  t.mock.method(globalThis, 'fetch', async () => Response.json([]));
+  await assert.rejects(getLiveStreams(creds), /empty/i);
+});
+
+test('browser cache skips identical writes, retains the old copy on quota errors, and follows the access key', t => {
+  const records = new Map();
+  let writes = 0;
+  let quota = false;
+  const old = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: {
+    getItem: key => records.get(key) || null,
+    setItem: (key, value) => { if (quota) throw new Error('quota'); records.set(key, value); writes++; },
+    removeItem: key => records.delete(key),
+  } });
+  t.after(() => { setAccessKey(''); if (old) Object.defineProperty(globalThis, 'localStorage', old); else delete globalThis.localStorage; });
+  setAccessKey('cache-test');
+  const cats = [{ category_id: '1', category_name: 'News' }];
+  const rows = [{ stream_id: 1, name: 'Channel 1', category_id: '1', stream_icon: '' }];
+  writeChannelCache(cats, rows);
+  const first = readChannelCache();
+  rememberManagedSession(true);
+  assert.equal(hasCachedManagedSession(), true);
+  const firstWrites = writes;
+  writeChannelCache(cats, rows);
+  assert.equal(writes, firstWrites);
+  quota = true;
+  writeChannelCache(cats, [{ ...rows[0], name: 'Changed' }]);
+  assert.deepEqual(readChannelCache(), first);
+  setAccessKey('another-key');
+  assert.equal(readChannelCache(), null);
+  assert.equal(hasCachedManagedSession(), false);
+});
+
+test('catalogue pagination exposes the first page before fetching the rest, then reuses an unchanged revision', async t => {
+  let calls = 0;
+  let firstVisible = false;
+  const rows = Array.from({ length: 230 }, (_, i) => ({ stream_id: i + 1, name: `Channel ${i}` }));
+  t.mock.method(globalThis, 'fetch', async url => {
+    calls++;
+    const params = new URL(url, 'https://app.example').searchParams;
+    assert.equal(params.get('limit'), '200');
+    if (params.has('if_revision')) return Response.json([], { headers: { 'X-Catalogue-Revision': 'v1', 'X-Catalogue-Total': '230', 'X-Catalogue-Unchanged': 'true' } });
+    const offset = Number(params.get('offset'));
+    if (offset > 0) { assert.equal(firstVisible, true); assert.equal(params.get('revision'), 'v1'); }
+    return Response.json(rows.slice(offset, offset + 200), { headers: { 'X-Catalogue-Revision': 'v1', 'X-Catalogue-Total': '230' } });
+  });
+  const result = await getLiveCatalogue(creds, { onPage: page => { if (!firstVisible) assert.equal(page.length, 200); firstVisible = true; } });
+  assert.equal(result.streams.length, 230);
+  assert.equal(result.revision, 'v1');
+  assert.equal(calls, 2);
+  const cached = { ...result, categories: [], at: Date.now() };
+  assert.deepEqual(await getLiveCatalogue(creds, { cached }), result);
+  assert.equal(calls, 3);
+});
+
+test('incomplete pagination rejects the refresh instead of returning a truncated catalogue', async t => {
+  t.mock.method(globalThis, 'fetch', async url => Response.json(new URL(url, 'https://app.example').searchParams.get('offset') === '0' ? [{ stream_id: 1 }] : [], { headers: { 'X-Catalogue-Revision': 'v1', 'X-Catalogue-Total': '2' } }));
+  await assert.rejects(getLiveCatalogue(creds), /incomplete/i);
 });
 
 test('URL access key works in memory and is removed from the address even when storage is unavailable', (t) => {

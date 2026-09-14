@@ -7,7 +7,7 @@ import { Input } from '@/components/ui/input';
 import {
   AccessKeyError,
   getLiveCategories,
-  getLiveStreams,
+  getLiveCatalogue,
   getUnavailableIds,
   proxiedIcon,
   readChannelCache,
@@ -62,6 +62,9 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
   const [catalogueReady, setCatalogueReady] = useState(Boolean(seed));
   const catalogueLoaded = useRef(Boolean(seed));
   const [error, setError] = useState(false);
+  const [refreshing, setRefreshing] = useState(true);
+  const [refreshFailed, setRefreshFailed] = useState(false);
+  const [refreshAttempt, setRefreshAttempt] = useState(0);
   // Favourites is the right landing tab once there are some, and the wrong one before that:
   // a first run opened on an empty screen saying "No favorites yet" instead of channels.
   const [initialView] = useState(() => readBrowserView(loadFavorites().size > 0 ? FAVORITES_ID : ALL_ID));
@@ -101,16 +104,27 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
 
   useEffect(() => {
     let cancelled = false;
-    Promise.all([getLiveCategories(creds), getLiveStreams(creds)])
-      .then(([cats, chans]) => {
+    const controller = new AbortController();
+    const cached = readChannelCache();
+    Promise.all([getLiveCategories(creds).then(cats => {
+      if (!cancelled && !seed) setCategories(cats);
+      return cats;
+    }), getLiveCatalogue(creds, { cached, signal: controller.signal, onPage: partial => {
+      if (cancelled || cached) return;
+      setStreams(partial);
+      catalogueLoaded.current = true;
+      setLoading(false);
+    } })])
+      .then(([cats, catalogue]) => {
         if (cancelled) return;
         setCategories(cats);
-        setStreams(chans);
-        writeChannelCache(cats, chans);
+        setStreams(catalogue.streams);
+        writeChannelCache(cats, catalogue.streams, catalogue.revision);
         catalogueLoaded.current = true;
         setCatalogueReady(true);
         setError(false);
         setLoading(false);
+        setRefreshFailed(false);
       })
       .catch((err) => {
         if (cancelled) return;
@@ -120,14 +134,16 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
         } else if (!catalogueLoaded.current) {
           setError(true);
         }
+        setRefreshFailed(true);
         // With a cached list on screen, a failed refresh is not worth replacing it with an
         // error page — the channels shown are still the real ones, just older.
         setLoading(false);
-      });
+      }).finally(() => { if (!cancelled) setRefreshing(false); });
     return () => {
       cancelled = true;
+      controller.abort();
     };
-  }, [creds, retryToken, onNeedKey]);
+  }, [creds, retryToken, onNeedKey, seed, refreshAttempt]);
 
   // Restore after the saved number of cards has rendered; do not overwrite the position with
   // the loading screen's zero-height layout. Native scroll bounds handle a shorter catalogue.
@@ -312,6 +328,12 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
           </Button>
         </div>
       </header>
+
+      {refreshing && !seed && <p role="status" className="px-6 py-2 text-sm text-zinc-400">{t.loadingMore}</p>}
+      {refreshFailed && <div className="flex items-center gap-3 px-6 py-2 text-sm text-zinc-400">
+        <span role="status">{t.refreshFailed}</span>
+        <Button variant="outline" className="min-h-11" onClick={() => { setRefreshing(true); setRefreshFailed(false); setRefreshAttempt(n => n + 1); }}>{t.retry}</Button>
+      </div>}
 
       <ConnectionStatus onNeedKey={onNeedKey} />
 

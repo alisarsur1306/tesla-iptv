@@ -73,6 +73,7 @@ export class SavedStreams {
       if (!row) continue;
       const current = this.entries.get(row.id);
       if (current && (current.savedAt > row.savedAt || (current.url === row.url && current.failedAt >= row.savedAt))) continue;
+      if (current && JSON.stringify(current) === JSON.stringify(row)) continue;
       this.entries.set(row.id, row);
       accepted++;
     }
@@ -144,11 +145,12 @@ export class SavedStreams {
 
 // Reuse the existing read-only backup credential only inside its own HTTPS
 // GitHub Contents directory. Never forward that credential through a redirect.
-export function sidecarSource(env = process.env) {
+export function sidecarSource(env = process.env, fileName = 'resolved-streams.json') {
   try {
+    if (!['resolved-streams.json', 'catalogue-snapshot.json'].includes(fileName)) return null;
     const url = new URL(env.M3U_URL);
     if (url.origin !== 'https://api.github.com' || !/^\/repos\/[^/]+\/[^/]+\/contents\/.+/.test(url.pathname) || url.username || url.password) return null;
-    url.pathname = url.pathname.replace(/[^/]+$/, 'resolved-streams.json');
+    url.pathname = url.pathname.replace(/[^/]+$/, fileName);
     const headers = { Accept: 'application/vnd.github.raw+json' };
     if (env.M3U_AUTH) headers.Authorization = env.M3U_AUTH;
     return { url: url.href, headers };
