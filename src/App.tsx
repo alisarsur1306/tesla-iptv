@@ -4,7 +4,7 @@ import { clearStoredCreds, loadStoredCreds } from '@/lib/credentials';
 import ChannelBrowser from '@/components/ChannelBrowser';
 import PlayerOverlay from '@/components/PlayerOverlay';
 import KeyPrompt from '@/components/KeyPrompt';
-import { configUrl, setAccessKey, type XtreamCreds, type XtreamLiveStream } from '@/lib/xtream';
+import { configUrl, setAccessKey, hasCachedManagedSession, rememberManagedSession, type XtreamCreds, type XtreamLiveStream } from '@/lib/xtream';
 import { Loader2 } from 'lucide-react';
 import { requestJson, HttpError, RequestTimeout } from '@/lib/request';
 import { readRecentChannels, rememberChannel } from '@/lib/watchHistory';
@@ -23,7 +23,7 @@ const MANAGED_CREDS: XtreamCreds = { server: 'managed', username: 'managed', pas
 export default function App() {
   const { locale } = useLocale();
   const copy = appStrings[locale];
-  const [creds, setCreds] = useState<XtreamCreds | null>(() => loadStoredCreds());
+  const [creds, setCreds] = useState<XtreamCreds | null>(() => loadStoredCreds() || (hasCachedManagedSession() ? MANAGED_CREDS : null));
   const [channel, setChannel] = useState<XtreamLiveStream | null>(null);
   // The list the user was browsing when they hit play, so Next/Prev in the
   // player follows the same order (and the same search/category filter).
@@ -47,6 +47,7 @@ export default function App() {
       .then((cfg) => {
         if (controller.signal.aborted) return;
         if (typeof cfg?.managed !== 'boolean') throw new Error('Invalid server configuration response');
+        rememberManagedSession(cfg.managed);
         if (cfg.managed) setCreds(MANAGED_CREDS);
         setManagedChecked(true);
       })
@@ -81,6 +82,7 @@ export default function App() {
   }
 
   function handleLogout() {
+    rememberManagedSession(false);
     clearStoredCreds();
     setChannel(null);
     setCreds(null);

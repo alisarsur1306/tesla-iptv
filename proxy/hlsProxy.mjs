@@ -33,8 +33,10 @@ import path from 'node:path';
 // in closeClientIfUnused when an HTTP/2 CDN connection closes after streaming.
 import { fetch as undiciFetch, ProxyAgent } from 'undici';
 import { gzip } from 'node:zlib';
-import { SavedStreams, accountScope, sidecarSource, snapshotFromCatalogue, MAX_SNAPSHOT_BYTES } from './savedStreams.mjs';
+import { SavedStreams, accountScope, sidecarSource, snapshotFromCatalogue } from './savedStreams.mjs';
 import { resolvingProxy } from './resolvingProxy.mjs';
+import { validCatalogue } from './incrementalSync.mjs';
+import { readConditionalSnapshot, readPrivateJson, writePrivateJson } from './privateSnapshot.mjs';
 
 // Connect timeout for a streaming request: it covers the handshake only and is
 // cleared once the headers arrive, because a live channel's body never ends.
@@ -736,35 +738,47 @@ function savedStreamStore() {
 
 let savedRefresh;
 let savedRefreshAt = 0;
+const backupEtags = new Map();
+let savedCatalogue;
+let catalogueLoaded;
+const catalogueFile = () => path.join(listCacheDir(), `catalogue-${accountScope(getXtreamCreds())}.json`);
+async function loadSavedCatalogue() {
+  catalogueLoaded ||= (async () => {
+    try {
+      const snapshot = await readPrivateJson(catalogueFile());
+      if (validCatalogue(snapshot, accountScope(getXtreamCreds()))) savedCatalogue = snapshot;
+    } catch { /* A missing or corrupt local backup does not replace working data. */ }
+  })();
+  await catalogueLoaded;
+  return savedCatalogue;
+}
 export async function primeSavedStreams() {
   const store = savedStreamStore();
   if (!store) return;
-  await store.load();
+  await Promise.all([store.load(), loadSavedCatalogue()]);
   const source = sidecarSource();
   if (!source || Date.now() - savedRefreshAt < 15 * 60 * 1000) return savedRefresh;
   savedRefreshAt = Date.now();
-  savedRefresh = (async () => {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 8000);
-    let reader;
+  savedRefresh = Promise.all(['resolved-streams.json', 'catalogue-snapshot.json'].map(async fileName => {
+    const backup = sidecarSource(process.env, fileName);
     try {
-      const response = await globalThis.fetch(source.url, { headers: source.headers, signal: controller.signal, redirect: 'error' });
-      if (!response.ok) { await response.body?.cancel(); return; }
-      reader = response.body.getReader();
-      const chunks = [];
-      let size = 0;
-      while (true) {
-        const chunk = await waitForAbort(reader.read(), controller.signal);
-        if (chunk.done) break;
-        size += chunk.value.byteLength;
-        if (size > MAX_SNAPSHOT_BYTES) throw new Error('Saved address snapshot too large');
-        chunks.push(chunk.value);
+      const result = await readConditionalSnapshot(backup, backupEtags.get(backup.url));
+      if (result.unchanged) return;
+      if (fileName === 'catalogue-snapshot.json') {
+        if (!validCatalogue(result.snapshot, store.scope)) throw new Error('Invalid catalogue backup');
+        if (!savedCatalogue || result.snapshot.updatedAt > savedCatalogue.updatedAt) {
+          await writePrivateJson(catalogueFile(), result.snapshot);
+          savedCatalogue = result.snapshot;
+          console.log(`[saved-catalogue] imported=${savedCatalogue.channels.length}`);
+        }
+      } else {
+        if (result.snapshot?.version !== 1 || result.snapshot.scope !== store.scope || !Array.isArray(result.snapshot.entries)) throw new Error('Invalid address backup');
+        const accepted = await store.merge(result.snapshot);
+        console.log(`[saved-streams] imported=${accepted}`);
       }
-      const accepted = await store.merge(JSON.parse(Buffer.concat(chunks, size).toString('utf8')));
-      console.log(`[saved-streams] imported=${accepted}`);
-    } catch { console.log('[saved-streams] refresh_unavailable; keeping existing addresses'); }
-    finally { clearTimeout(timer); controller.abort(); if (reader) void reader.cancel().catch(() => {}); }
-  })();
+      backupEtags.set(backup.url, result.etag);
+    } catch { console.log(`[${fileName === 'catalogue-snapshot.json' ? 'saved-catalogue' : 'saved-streams'}] refresh_unavailable; keeping existing data`); }
+  }));
   return savedRefresh;
 }
 const listCacheFile = (action) =>
@@ -919,6 +933,40 @@ export async function handleXtreamApi(req, res) {
 
   const source = getSourceType();
   if (!source) return sendError(res, 503, 'Server has no IPTV source configured');
+
+  // Private synchronized lists are independent of home connectivity. Refresh
+  // them in the background; loading a page does not trigger a provider scan.
+  if (source === 'xtream' && ['get_live_streams', 'get_live_categories'].includes(action)) {
+    let backup = await loadSavedCatalogue();
+    if (!backup) {
+      // Render's first start has no local disk cache. Give the bounded private
+      // restore a chance before attempting the home/provider route.
+      await primeSavedStreams();
+      backup = await loadSavedCatalogue();
+    } else void primeSavedStreams();
+    if (backup) {
+      if (action === 'get_live_streams') liveListSource = 'xtream';
+      res.setHeader('X-Catalogue-Source', 'saved');
+      res.setHeader('X-Catalogue-Updated-At', new Date(backup.updatedAt).toISOString());
+      if (action === 'get_live_streams' && url.searchParams.has('limit')) {
+        const rawLimit = url.searchParams.get('limit');
+        const rawOffset = url.searchParams.get('offset') || '0';
+        const limit = Number(rawLimit);
+        const offset = Number(rawOffset);
+        if (!/^\d+$/.test(rawLimit) || !/^\d+$/.test(rawOffset) || limit < 1 || limit > 1000 || offset > 10000) return sendError(res, 400, 'Invalid catalogue page');
+        const revision = String(backup.updatedAt);
+        if (url.searchParams.has('revision') && url.searchParams.get('revision') !== revision) return sendError(res, 409, 'Catalogue changed; restart pagination');
+        res.setHeader('X-Catalogue-Revision', revision);
+        res.setHeader('X-Catalogue-Total', String(backup.channels.length));
+        if (offset === 0 && url.searchParams.get('if_revision') === revision) {
+          res.setHeader('X-Catalogue-Unchanged', 'true');
+          return sendJsonBody(res, []);
+        }
+        return sendJsonBody(res, backup.channels.slice(offset, offset + limit));
+      }
+      return sendJsonBody(res, action === 'get_live_streams' ? backup.channels : backup.categories);
+    }
+  }
 
   if (source === 'm3u') {
     try {

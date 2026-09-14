@@ -413,24 +413,88 @@ On a computer that can reach the provider, with Node 24 and GitHub CLI signed in
 an account that can write the **private** backup repository:
 
 ```sh
-node scripts/sync-streams.mjs --config /path/to/private/config.json --repository owner/private-backup
+node scripts/sync-streams.mjs --config /path/to/private/config.json --repository owner/private-backup --resolve-limit 20
 ```
 
 The ignored config contains the same `server`, `username` and `password` as Render.
 Alternatively set `XTREAM_SERVER`, `XTREAM_USERNAME` and `XTREAM_PASSWORD` for the
 command. The command reads `direct_source` addresses already supplied in the
-catalogue; it does not open thousands of simultaneous streams. It writes a private
-local snapshot and refuses to upload to a public repository. Use `--path` if the
+catalogue, then briefly resolves up to 20 missing/expiring addresses sequentially.
+Discovery stops after three minutes and checkpoints progress; later runs skip
+recent failures and valid unchanged addresses. `--resolve-limit 0` checks metadata
+and supplied addresses without opening any live channel. Larger explicit limits
+remain sequential and subject to the three-minute budget. Avoid discovery while
+watching a subscription limited to one concurrent connection.
+
+It writes private local snapshots and refuses to upload to a public repository. Use `--path` if the
 M3U is in a subdirectory, keeping `resolved-streams.json` beside it. `--catalogue`
-can use a previously downloaded private catalogue if the provider is temporarily
-unavailable. These files contain access URLs and must stay out of `public/` and
+can use a previously downloaded private catalogue; `--categories` supplies its
+category JSON. Reusing an old catalogue file does not give its URLs a fresh
+observation time. These files contain access URLs and must stay out of `public/` and
 the public application repository.
 
-Render imports the sidecar in the background at startup and checks for updates
-at most every 15 minutes during stream activity, using the existing `M3U_AUTH`.
+Render imports `resolved-streams.json` and `catalogue-snapshot.json` in the
+background at startup and checks for updates at most every 15 minutes during
+browsing/playback, using the existing `M3U_AUTH`. Conditional ETags avoid downloading
+unchanged files. The full saved catalogue and categories are served without a
+provider request, even when the Mac is offline; playback can still need the Mac
+for channels without a usable public address.
 The private remote file survives deployments; addresses learned only in Render's
 temporary directory may not. An idle/sleeping Render instance is not a scheduler
 for the local computer. Run the local sync again when a refresh is needed.
+
+### Incremental updates and failure recovery
+
+The provider API used here returns the complete channel/category lists. We compare
+those responses by stable channel ID locally; this is not a provider delta API.
+Only new/changed metadata and new/changed/near-expiry addresses alter snapshots.
+Already learned public redirects survive unchanged catalogue rows. Identical runs
+do not rewrite local snapshots or create GitHub commits. GitHub Contents updates
+still send a complete changed file, protected by its SHA, not a wire-format patch.
+The revision read at sync start must still match before upload, so competing Macs
+and PCs cannot silently overwrite a newer backup.
+
+Empty, malformed, duplicated-ID or failed catalogue responses abort synchronization.
+Rows absent from a later response are retained rather than deleted automatically;
+this deliberately prefers an old channel entry to losing channels after a partial
+provider response. Use the sync summary's `retained` count to identify these cases.
+Local writes are atomic and same-account concurrent runs are blocked by a PID lock.
+Recent failed address discovery is retried after an hour; provider-only streams
+after a day. A changed source fingerprint makes an earlier failure eligible again.
+
+On the Mac, use the same Node/GitHub CLI command above with its private config.
+It runs once and exits. This repository change does not install a scheduler on a
+different computer or remove the working provider fallback.
+
+### Fast browser startup and catalogue pages
+
+After one successful visit, a service worker caches the public HTML and its
+versioned JS/CSS assets. A repeat navigation displays that shell immediately and
+refreshes it in the background. New HTML is cached only after its referenced
+assets have been fetched, so a failed deployment download keeps the old shell.
+No account/config APIs, stream URLs, manifests or live video enter this shell cache.
+Browsers without service-worker/Cache Storage support retain normal online behavior.
+
+The last complete channel list is stored in browser localStorage, scoped to the
+access key. A remembered managed session can show it without waiting for the
+server's configuration request. Failed refreshes and storage quota errors preserve
+the previous list. Only complete paginated results replace the persistent cache.
+
+Cold clients fetch `/api/xt?action=get_live_streams&limit=200&offset=0`; the first
+200 channels render while further pages load in the background. Response headers
+carry `X-Catalogue-Total` and `X-Catalogue-Revision`; subsequent pages send `revision`
+to avoid mixing two versions. A revision mismatch returns 409 and the client
+restarts once. A cached client sends `if_revision`; unchanged data returns an empty
+body array with `X-Catalogue-Unchanged: true` and reuses the full browser cache.
+Requests without pagination remain compatible with older clients.
+
+This speeds up browsing, not an unbounded live feed: first-ever visits, deleted
+browser storage, free-tier server wakeup and the upstream video source can still
+add delay. Live video requires network access and cannot be cached ahead forever.
+
+References: [GitHub conditional requests](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api#use-conditional-requests-if-appropriate),
+[Contents media types and limits](https://docs.github.com/en/rest/repos/contents#get-repository-content),
+[Service worker lifecycle and fallback](https://developer.mozilla.org/en-US/docs/Web/API/Service_Worker_API/Using_Service_Workers).
 
 Saved URLs are candidates, not downloaded live video or guaranteed working
 channels. Known `expires`, `exp` and `expiry` timestamps are honored; other

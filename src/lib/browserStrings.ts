@@ -1,4 +1,5 @@
 const en = {
+  loadingMore: 'Loading the remaining channels…', refreshFailed: 'Update did not finish. You can keep using the current list.',
   loading: 'Loading channels…', seconds: 's', coldStart: 'The full channel list can take up to a minute on a cold start.',
   stillWaiting: 'The TV source is taking longer than usual. You can retry if loading does not finish.',
   failed: 'Could not load channels.', retry: 'Try again', logout: 'Log out', backToLogin: 'Back to login',
@@ -14,6 +15,7 @@ const en = {
 export const browserStrings: Record<'en' | 'he' | 'ar', typeof en> = {
   en,
   he: {
+    loadingMore: 'טוען את שאר הערוצים…', refreshFailed: 'העדכון לא הסתיים. אפשר להמשיך להשתמש ברשימה הקיימת.',
     loading: 'טוען ערוצים…', seconds: 'ש׳', coldStart: 'טעינת רשימת הערוצים המלאה עשויה להימשך עד דקה בהפעלה ראשונית.',
     stillWaiting: 'מקור השידור מגיב לאט מהרגיל. אפשר לנסות שוב אם הטעינה לא מסתיימת.',
     failed: 'לא ניתן לטעון את הערוצים.', retry: 'נסה שוב', logout: 'התנתקות', backToLogin: 'חזרה להתחברות',
@@ -26,6 +28,7 @@ export const browserStrings: Record<'en' | 'he' | 'ar', typeof en> = {
     groupTitle: 'קבוצות ערוצים', groupDescription: 'בחר קבוצה כדי לצפות בערוצים שלה.', close: 'סגירה', language: 'שפה',
   },
   ar: {
+    loadingMore: 'جارٍ تحميل بقية القنوات…', refreshFailed: 'لم يكتمل التحديث. يمكنك متابعة استخدام القائمة الحالية.',
     loading: 'جارٍ تحميل القنوات…', seconds: 'ث', coldStart: 'قد يستغرق تحميل قائمة القنوات الكاملة دقيقة عند بدء التشغيل.',
     stillWaiting: 'مصدر البث أبطأ من المعتاد. يمكنك المحاولة مجددًا إذا لم يكتمل التحميل.',
     failed: 'تعذّر تحميل القنوات.', retry: 'حاول مجددًا', logout: 'تسجيل الخروج', backToLogin: 'العودة لتسجيل الدخول',
