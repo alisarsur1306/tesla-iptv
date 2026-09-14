@@ -53,6 +53,74 @@ function finiteTs() {
   return new Uint8Array([...packet, ...packet]);
 }
 
+async function presentation(t) {
+  let now = 1000;
+  let output;
+  const drawn = [];
+  class Decoder {
+    state = 'unconfigured';
+    decodeQueueSize = 0;
+    constructor(callbacks) { output = callbacks.output; }
+    configure() { this.state = 'configured'; }
+    close() { this.state = 'closed'; }
+    decode() {}
+  }
+  const x = setup(t, async () => new Response(new ReadableStream({
+    start(controller) { controller.enqueue(finiteTs()); },
+  })), {
+    VideoDecoder: Decoder,
+    EncodedVideoChunk: class { constructor(value) { Object.assign(this, value); } },
+    performance: { timeOrigin: 0, now: () => now },
+  });
+  x.send({ t: 'init', canvas: { width: 320, height: 180, getContext: () => ({ drawImage(frame) { drawn.push(frame.timestamp / 1000); } }) } });
+  x.send({ t: 'play', url: '/stream', sessionId: 1 });
+  const step = async ms => { now += ms; t.mock.timers.tick(ms); await flush(); };
+  for (let i = 0; i < 5; i++) await step(20);
+  assert.equal(typeof output, 'function');
+  return { ...x, drawn, step,
+    anchor: (mediaMs = 0, lead = 0) => x.send({ t: 'anchor', mediaMs, epochMs: now + lead, sessionId: 1 }),
+    frame: pts => output({ timestamp: pts * 1000, displayWidth: 320, displayHeight: 180, close() {} }),
+  };
+}
+
+test('startup buffering preserves the audio prebuffer instead of showing video ahead of sound', async t => {
+  const x = await presentation(t);
+  x.anchor(0, 1500);
+  x.frame(0);
+  await x.step(500);
+  assert.deepEqual(x.drawn, [], 'video waits for the same 1.5-second lead as audio');
+  await x.step(1000);
+  assert.deepEqual(x.drawn, [0]);
+  x.send({ t: 'stop' });
+});
+
+test('video catches up to the unchanged audio clock after starvation and a late frame', async t => {
+  const x = await presentation(t);
+  x.anchor();
+  x.frame(0);
+  await x.step(40);
+  assert.deepEqual(x.drawn, [0]);
+  x.anchor();
+  await x.step(1000);
+  x.frame(500);
+  await x.step(40);
+  x.frame(1040);
+  await x.step(40);
+  assert.ok(x.drawn.includes(1040), 'a late video frame must not move the speaker clock backwards');
+  x.send({ t: 'stop' });
+});
+
+test('a future video frame cannot fast-forward the audio master clock', async t => {
+  const x = await presentation(t);
+  x.anchor();
+  x.frame(10000);
+  await x.step(6000);
+  assert.deepEqual(x.drawn, [], 'the stall guard must not silently replace the audio timeline');
+  await x.step(4000);
+  assert.deepEqual(x.drawn, [10000]);
+  x.send({ t: 'stop' });
+});
+
 for (const mode of ['TS', 'HLS ENDLIST']) {
   test(`${mode} delivered in one burst drains its first and final frames before reconnecting`, async (t) => {
     let draws = 0;

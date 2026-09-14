@@ -810,12 +810,10 @@ function presentTick() {
     if ((enough && queue.length > 0) || (timedOut && queue.length > 0)) {
       buffering = false;
       lastRebufferAt = nowEpochMs();
-      // Wall time advanced during the pause. Drop the stale clocks so both video
-      // and audio re-anchor from where they actually resume — otherwise every
-      // buffered frame reads as hugely late and gets dropped. Audio re-anchors
-      // itself via its own underrun path and re-publishes the master anchor.
-      clockCalibrated = false;
-      audioAnchorMediaMs = null;
+      // Scheduled audio continues during a video stall. Keep its speaker clock
+      // and let late video catch up. Only the audio engine can move that clock
+      // when its own playhead underruns; clearing it here creates lasting drift.
+      if (audioAnchorMediaMs === null) clockCalibrated = false;
       post({ t: 'buffering', active: false });
     } else {
       presentTimer = setTimeout(presentTick, 40); // keep waiting for the cushion
@@ -833,7 +831,7 @@ function presentTick() {
   // get stuck showing a spinner while the adaptive cushion grows out of reach.
   // Decode-bound is left to present-newest: frames are shown as they arrive.
   const networkStarved = encodedBytes < NETWORK_STARVE_BYTES;
-  if (!presented && queue.length === 0 && lastPresentAt !== 0 && !buffering && networkStarved) {
+  if (!presented && queue.length === 0 && frameCount > 0 && !buffering && networkStarved) {
     // Smooth for a while → forget past rebuffers, resume near-live next time.
     if (nowEpochMs() - lastRebufferAt > REBUFFER_DECAY_MS) rebufferCount = 0;
     rebufferCount++;
@@ -891,19 +889,16 @@ function tryPresentOne(): boolean {
   // so wedge detection is based on how long we have gone without drawing.
   if (diff > 60) {
     const stalledMs = nowEpochMs() - lastPresentAt;
-    if (stalledMs < PRESENT_STALL_MS) {
-      return false; // healthy: still presenting, this frame is simply early
+    if (audioAnchorMediaMs !== null || stalledMs < PRESENT_STALL_MS) {
+      // An early video frame cannot move the audio actually reaching speakers.
+      // The shared playback watchdog still bounds a genuinely stalled stream.
+      return false;
     }
     // Nothing drawn for PRESENT_STALL_MS while frames sit in the future → the
-    // clock is wrong (audio/video PTS bases differ). Re-anchor onto this frame.
-    if (audioAnchorMediaMs !== null) {
-      audioAnchorEpochMs = nowEpochMs();
-      audioAnchorMediaMs = f.pts;
-    } else {
-      clockCalibrated = true;
-      wallStart = performance.now();
-      ptsStart = f.pts;
-    }
+    // video-only clock is wrong. Re-anchor that local clock onto this frame.
+    clockCalibrated = true;
+    wallStart = performance.now();
+    ptsStart = f.pts;
     log(`presentation stalled ${Math.round(stalledMs)}ms — clock re-anchored`, 'warn');
   }
   if (diff < -250) {
@@ -920,13 +915,9 @@ function tryPresentOne(): boolean {
       }
       return tryPresentOne();
     }
-    // Persistently behind: re-anchor the clock onto this frame so audio realigns
-    // to what the decoder can actually deliver, instead of drifting further ahead
-    // and dropping every frame forever.
-    if (audioAnchorMediaMs !== null) {
-      audioAnchorEpochMs = nowEpochMs();
-      audioAnchorMediaMs = f.pts;
-    } else {
+    // Show the newest available frame, while retaining the real speaker clock
+    // so subsequent frames can catch up. A video-only stream may re-anchor.
+    if (audioAnchorMediaMs === null) {
       clockCalibrated = true;
       wallStart = performance.now();
       ptsStart = f.pts;
