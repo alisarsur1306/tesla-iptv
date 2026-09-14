@@ -90,7 +90,7 @@ test('ids from a fallback list stream from the M3U, not as Xtream ids', async ()
   assert.equal(await res.text(), 'BYTES:/ch1.ts');
 });
 
-test('player_api responses are cached, so a second list costs no upstream call', async () => {
+test('a recovered provider takes back over, and its list is then cached', async () => {
   playerApiOk = true;
   playerApiHits.length = 0;
 
@@ -106,9 +106,13 @@ test('player_api responses are cached, so a second list costs no upstream call',
   assert.deepEqual(first, XT_STREAMS, 'the successful background probe restores the Xtream list');
   assert.equal(playerApiHits.length, 1);
 
+  const fresh = await (await fetch(`${origin}/api/xt?action=get_live_streams`)).json();
+  assert.deepEqual(fresh, XT_STREAMS, 'once the probe succeeds, the provider list wins again');
+
+  const hits = playerApiHits.length;
   const second = await (await fetch(`${origin}/api/xt?action=get_live_streams`)).json();
   assert.deepEqual(second, XT_STREAMS);
-  assert.equal(playerApiHits.length, 1, 'the cached list must not re-hit player_api');
+  assert.equal(playerApiHits.length, hits, 'the cached list must not re-hit player_api');
 });
 
 test('parallel cold requests for one action share a single upstream download', async () => {

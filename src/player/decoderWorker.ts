@@ -10,7 +10,8 @@
 // can share this clock.
 
 import { TsDemuxer } from '../lib/tsDemux';
-import { openStream } from './streamRequest';
+import { openStream, StreamResponseError } from './streamRequest';
+import { STREAM_START_TIMEOUT_MS } from './timing';
 import { parsePlaylist, parseMediaPlaylist, diffNewSegments, type MediaPlaylist } from '../lib/hlsPlaylist';
 import { splitNALs, toAVCC, nalType, avccDescription, codecString, isValidSps, NAL_SPS, NAL_PPS, NAL_IDR, NAL_NON_IDR } from '../lib/h264';
 import { hevcNalType, isHevcKeySlice, isHevcSlice, looksLikeHevc, toAnnexB, HEVC_VPS, HEVC_SPS, HEVC_PPS, HEVC_MAIN_CODEC, HEVC_MAIN10_CODEC } from '../lib/hevc';
@@ -64,7 +65,7 @@ const MAX_BUFFERING_MS = 4000;
 const NETWORK_STARVE_BYTES = 128 * 1024;
 /** No decoded frame within this long after the decoder configured → it's
  *  silently failing (typical of iOS Safari WebCodecs). Report, don't hang. */
-const FIRST_FRAME_TIMEOUT_MS = 10_000;
+const FIRST_FRAME_TIMEOUT_MS = STREAM_START_TIMEOUT_MS;
 /** Smooth playback for this long resets the adaptive cushion back toward near-live. */
 const REBUFFER_DECAY_MS = 20_000;
 /**
@@ -245,7 +246,7 @@ async function play(streamUrl: string, id: number) {
     if (!session.signal.aborted) throw new Error('STREAM_ENDED');
   } catch (e) {
     if (!session.signal.aborted && abort === session) {
-      post({ t: 'error', msg: (e as Error)?.message || 'STREAM_FAILED' });
+      post({ t: 'error', msg: (e as Error)?.message || 'STREAM_FAILED', fatal: e instanceof StreamResponseError && !e.retryable });
       stop();
     }
   }
@@ -352,6 +353,7 @@ async function runHlsSegments(playlistUrl: string, signal: AbortSignal) {
         segmentFailures = 0;
       } catch (e) {
         if (signal.aborted) return;
+        if (e instanceof StreamResponseError && !e.retryable) throw e;
         if (++segmentFailures >= 3) throw e;
         log(`segment failed: ${(e as Error).message}`, 'warn');
       }
@@ -370,6 +372,7 @@ async function runHlsSegments(playlistUrl: string, signal: AbortSignal) {
       media = next;
     } catch (e) {
       if (signal.aborted) return;
+      if (e instanceof StreamResponseError && !e.retryable) throw e;
       if ((e as Error)?.message === 'playlist stopped updating') throw e;
       if (++playlistFailures >= 3) throw e;
       /* transient playlist error — retry next poll */

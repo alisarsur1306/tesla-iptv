@@ -15,8 +15,9 @@ test('late worker messages cannot revive a paused or replaced channel', (t) => {
   Object.defineProperty(globalThis, 'Worker', { configurable: true, value: FakeWorker });
   t.after(() => { if (original) Object.defineProperty(globalThis, 'Worker', original); else delete globalThis.Worker; });
   const events = [];
+  let fatal;
   const player = new CanvasPlayer({ transferControlToOffscreen: () => ({}) }, {
-    onError: (message) => events.push(message),
+    onError: (message, settled) => { fatal = settled; events.push(message); },
     onStats: () => events.push('frame'),
   });
   player.play('/first');
@@ -30,6 +31,9 @@ test('late worker messages cannot revive a paused or replaced channel', (t) => {
   assert.deepEqual(events, []);
   worker.onmessage({ data: { t: 'stats', sessionId: second, frames: 16 } });
   assert.deepEqual(events, ['frame']);
+  worker.onmessage({ data: { t: 'error', sessionId: second, msg: 'STREAM_REJECTED', fatal: true } });
+  assert.equal(fatal, true);
+  assert.equal(events.at(-1), 'STREAM_REJECTED');
   player.destroy();
   assert.equal(worker.terminated, true);
   assert.equal(worker.onmessage, null);

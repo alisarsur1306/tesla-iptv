@@ -7,6 +7,7 @@ import { AudioEngine } from '@/player/audioEngine';
 import { PlaybackRecovery, type RecoveryState } from '@/player/recovery';
 import { playerStrings } from '@/player/playerStrings';
 import { readVolume, saveVolume } from '@/player/preferences';
+import { frameDeadlineExpired, FRAME_IDLE_TIMEOUT_MS } from '@/player/timing';
 import { ArrowLeft, TriangleAlert, Volume2, VolumeX, Volume1, Play, Pause, SkipBack, SkipForward, Loader2, RotateCw } from 'lucide-react';
 
 interface PlayerOverlayProps {
@@ -52,14 +53,16 @@ function PlayerSession({ creds, channel, playlist = [], onSelect, onBack }: Play
     canvas.className = 'h-full w-full object-contain';
     container.appendChild(canvas);
     let destroyed = false;
-    let lastFrameAt = Date.now();
+    let startedAt = Date.now();
+    let lastFrameAt: number | null = null;
     const audio = new AudioEngine({
       onAnchor: (mediaMs, epochMs) => player.setAudioAnchor(mediaMs, epochMs),
       onUnsupported: (codec) => { if (!destroyed) setAudioUnsupported(codec); },
     });
     const recovery = new PlaybackRecovery({
       restart: () => {
-        lastFrameAt = Date.now();
+        startedAt = Date.now();
+        lastFrameAt = null;
         setControlsRequested(true);
         setFirstFrame(false);
         setVideoStalled(false);
@@ -89,7 +92,7 @@ function PlayerSession({ creds, channel, playlist = [], onSelect, onBack }: Play
         recovery.setStalled(active);
         if (active) setControlsRequested(true);
       },
-      onError: (msg) => recovery.error(msg),
+      onError: (msg, fatal) => recovery.error(msg, fatal),
     });
     audioRef.current = audio;
     recoveryRef.current = recovery;
@@ -99,7 +102,7 @@ function PlayerSession({ creds, channel, playlist = [], onSelect, onBack }: Play
     const recoverConnection = () => {
       if (!navigator.onLine) return;
       // Returning to a healthy stream must not create another provider session.
-      if (Date.now() - lastFrameAt > 20_000) recovery.setStalled(true);
+      if (lastFrameAt !== null && Date.now() - lastFrameAt >= FRAME_IDLE_TIMEOUT_MS) recovery.setStalled(true);
       recovery.recover();
     };
     const online = () => { setOffline(false); recoverConnection(); };
@@ -112,7 +115,7 @@ function PlayerSession({ creds, channel, playlist = [], onSelect, onBack }: Play
     recovery.play();
     // Covers a decoder that accepted data but stops producing frames later on.
     const watchdog = window.setInterval(() => {
-      if (document.visibilityState === 'visible' && Date.now() - lastFrameAt > 30_000) recovery.error('STREAM_TIMEOUT');
+      if (document.visibilityState === 'visible' && frameDeadlineExpired(startedAt, lastFrameAt, Date.now())) recovery.error('STREAM_TIMEOUT');
     }, 5000);
 
     return () => {
@@ -190,6 +193,11 @@ function PlayerSession({ creds, channel, playlist = [], onSelect, onBack }: Play
   const error = unsupportedBrowser ? t.unsupportedBrowser
     : offline ? t.offline
     : playback.error === 'STREAM_TIMEOUT' ? t.timeout
+    : playback.error === 'STREAM_REJECTED' ? t.forbidden
+    : playback.error === 'STREAM_NOT_CONFIGURED' ? t.notConfigured
+    : playback.error === 'STREAM_INVALID_RESPONSE' ? t.invalidResponse
+    : playback.error === 'STREAM_UNAVAILABLE' ? t.unavailable
+    : playback.error === 'STREAM_PROXY_UNAVAILABLE' || playback.error === 'STREAM_ABORTED' ? t.connection
     : /HTTP_40[13]/.test(playback.error ?? '') ? t.forbidden
     : /HTTP_404|HTTP_410/.test(playback.error ?? '') ? t.unavailable
     : /HTTP_50[234]|fetch/i.test(playback.error ?? '') ? t.connection : t.failed;

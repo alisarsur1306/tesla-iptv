@@ -25,11 +25,23 @@ test('worker reports a silent header timeout and aborts that session', async (t)
     return new Promise(() => {});
   });
   x.send({ t: 'play', url: '/stream', sessionId: 1 });
-  t.mock.timers.tick(20_000);
+  t.mock.timers.tick(74_999);
+  await flush();
+  assert.equal(signal.aborted, false);
+  t.mock.timers.tick(1);
   await flush();
   assert.equal(signal.aborted, true);
   assert.equal(x.messages.find((message) => message.t === 'error')?.msg, 'STREAM_TIMEOUT');
   assert.equal(x.messages.find((message) => message.t === 'error')?.sessionId, 1);
+});
+
+test('worker preserves settled refusal codes and the fatal flag', async (t) => {
+  const x = setup(t, async () => Response.json({ code: 'STREAM_REJECTED', retryable: false, error: 'Sensitive upstream URL must not be forwarded' }, { status: 502 }));
+  x.send({ t: 'play', url: '/stream', sessionId: 1 });
+  await flush();
+  const error = x.messages.find((message) => message.t === 'error');
+  assert.equal(error?.msg, 'STREAM_REJECTED');
+  assert.equal(error?.fatal, true);
 });
 
 // Two complete video PES packets. A mock decoder delays output until flush(),

@@ -13,6 +13,7 @@ export class PlaybackRecovery {
   private healthySince: number | undefined;
   private lastProgress: number | undefined;
   private stalled = false;
+  private permanentFailure = false;
 
   constructor(callbacks: PlaybackRecovery['callbacks']) {
     this.callbacks = callbacks;
@@ -34,16 +35,18 @@ export class PlaybackRecovery {
     if (this.phase === 'destroyed') return;
     this.cancel();
     this.attempt = 0;
+    this.permanentFailure = false;
     this.stalled = false;
     this.change('starting');
     this.callbacks.restart();
   }
 
-  error(error: string) {
+  error(error: string, fatal = false) {
     if (['paused', 'destroyed', 'retrying', 'failed'].includes(this.phase)) return;
     this.cancel();
     this.callbacks.stop();
-    if (this.attempt >= 3) {
+    this.permanentFailure = fatal;
+    if (fatal || this.attempt >= 3) {
       this.change('failed', error);
       return;
     }
@@ -75,7 +78,7 @@ export class PlaybackRecovery {
 
   /** Called only on online/visible transitions. Healthy playback is untouched. */
   recover() {
-    if (this.phase === 'failed' || this.phase === 'retrying' || (this.stalled && this.phase === 'playing')) this.play();
+    if ((this.phase === 'failed' && !this.permanentFailure) || this.phase === 'retrying' || (this.stalled && this.phase === 'playing')) this.play();
   }
 
   pause() {

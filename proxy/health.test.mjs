@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { useIsolatedCacheDir } from './testCacheDir.mjs';
+
+useIsolatedCacheDir();
 
 let imports = 0;
 const provider = 'http://health-provider.example:8080';

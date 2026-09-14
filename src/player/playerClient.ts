@@ -10,7 +10,8 @@ export interface PlayerStatus {
 
 export interface PlayerCallbacks {
   onReady?: () => void;
-  onError?: (msg: string) => void;
+  /** A settled service refusal should be shown without automatic retries. */
+  onError?: (msg: string, fatal?: boolean) => void;
   onStats?: (s: { frames: number; buffer: number }) => void;
   onLog?: (msg: string, level: string) => void;
   /** Fired with the first PTS so an audio engine can share the clock (later phase). */
@@ -89,6 +90,7 @@ export class CanvasPlayer {
     height?: number;
     active?: boolean;
     sessionId?: number;
+    fatal?: boolean;
   }) {
     if (!this.active || m.sessionId !== this.sessionId) return;
     switch (m.t) {
@@ -96,7 +98,7 @@ export class CanvasPlayer {
         this.cb.onReady?.();
         break;
       case 'error':
-        this.cb.onError?.(m.msg || 'unknown error');
+        this.cb.onError?.(m.msg || 'STREAM_FAILED', Boolean(m.fatal));
         break;
       case 'stats':
         this.cb.onStats?.({ frames: m.frames || 0, buffer: m.buffer || 0 });

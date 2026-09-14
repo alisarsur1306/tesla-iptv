@@ -10,6 +10,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { useIsolatedCacheDir } from './testCacheDir.mjs';
 
 const XT = 'http://mhd.snapmediatoghater.site:8080';
 
@@ -36,6 +37,7 @@ const worker = http.createServer((req, res) => {
 });
 await new Promise((r) => worker.listen(0, '127.0.0.1', r));
 
+useIsolatedCacheDir();
 process.env.XTREAM_PROXY_URL = `http://127.0.0.1:${worker.address().port}/worker`;
 process.env.XTREAM_PROXY_TOKEN = 'tok-abc';
 delete process.env.ACCESS_KEY;

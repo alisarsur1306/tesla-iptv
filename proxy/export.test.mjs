@@ -8,6 +8,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { useIsolatedCacheDir } from './testCacheDir.mjs';
 
 const XT_HOST = 'mhd.snapmediatoghater.site:8080';
 
@@ -23,6 +24,7 @@ const upstream = http.createServer((req, res) => {
   res.end(JSON.stringify(action === 'get_live_categories' ? CATEGORIES : STREAMS));
 });
 await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
+useIsolatedCacheDir();
 process.env.UPSTREAM_PROXY = `127.0.0.1:${upstream.address().port}`;
 process.env.XTREAM_SERVER = `http://${XT_HOST}`;
 process.env.XTREAM_USERNAME = 'u';

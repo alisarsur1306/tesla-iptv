@@ -37,6 +37,95 @@ import { gzip } from 'node:zlib';
 // Connect timeout for a streaming request: it covers the handshake only and is
 // cleared once the headers arrive, because a live channel's body never ends.
 const TIMEOUT_MS = 25_000;
+// The browser allows 75s for a stream to start. All server-side discovery,
+// candidates, and first bytes/complete manifest share this smaller budget.
+const STREAM_START_TIMEOUT_MS = 60_000;
+const STREAM_IDLE_TIMEOUT_MS = 20_000;
+const MAX_PLAYLIST_BYTES = 2 * 1024 * 1024;
+
+function streamTimeout() {
+  const error = new Error('The stream did not respond in time.');
+  error.name = 'TimeoutError';
+  error.code = 'STREAM_TIMEOUT';
+  return error;
+}
+
+function waitForAbort(promise, signal) {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    Promise.resolve(promise).then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+  });
+}
+
+async function withinDeadline(run, controller, ms) {
+  if (ms <= 0) controller.abort(streamTimeout());
+  controller.signal.throwIfAborted();
+  const timer = setTimeout(() => controller.abort(streamTimeout()), ms);
+  try {
+    return await waitForAbort(run(), controller.signal);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function streamContext(req, res) {
+  if (req.streamContext) return req.streamContext;
+  const controller = new AbortController();
+  const deadlineAt = Date.now() + STREAM_START_TIMEOUT_MS;
+  const timer = setTimeout(() => controller.abort(streamTimeout()), STREAM_START_TIMEOUT_MS);
+  const onClose = () => controller.abort(new DOMException('Client disconnected', 'AbortError'));
+  res.once('close', onClose);
+  const context = {
+    controller,
+    remaining: () => Math.max(0, deadlineAt - Date.now()),
+    started: () => clearTimeout(timer),
+    dispose() {
+      clearTimeout(timer);
+      res.removeListener('close', onClose);
+      controller.abort();
+    },
+  };
+  if (res.destroyed) onClose();
+  req.streamContext = context;
+  return context;
+}
+
+async function readNonempty(reader, signal) {
+  while (true) {
+    signal.throwIfAborted();
+    const chunk = await waitForAbort(reader.read(), signal);
+    if (chunk.done || chunk.value.byteLength) return chunk;
+  }
+}
+
+async function waitForDrain(res, signal) {
+  if (!res.writableNeedDrain) return;
+  let onDrain;
+  const drained = new Promise((resolve) => { onDrain = resolve; res.once('drain', onDrain); });
+  try {
+    await waitForAbort(drained, signal);
+  } finally {
+    res.removeListener('drain', onDrain);
+  }
+}
+
+async function readManifest(reader, first, controller) {
+  const chunks = first.done ? [] : [first.value];
+  let bytes = first.value?.byteLength || 0;
+  while (!first.done) {
+    if (bytes > MAX_PLAYLIST_BYTES) throw Object.assign(new Error('Invalid playlist response.'), { code: 'STREAM_INVALID_RESPONSE' });
+    const chunk = await withinDeadline(() => readNonempty(reader, controller.signal), controller, STREAM_IDLE_TIMEOUT_MS);
+    if (chunk.done) break;
+    bytes += chunk.value.byteLength;
+    chunks.push(chunk.value);
+  }
+  if (bytes > MAX_PLAYLIST_BYTES) throw Object.assign(new Error('Invalid playlist response.'), { code: 'STREAM_INVALID_RESPONSE' });
+  const text = Buffer.concat(chunks, bytes).toString('utf8');
+  if (!text.trimStart().startsWith('#EXTM3U')) throw Object.assign(new Error('Invalid playlist response.'), { code: 'STREAM_INVALID_RESPONSE' });
+  return text;
+}
 // Whole-response timeout for a bulk list download (the Xtream player_api channel
 // lists and the M3U playlist). Those are megabytes of JSON pulled through the
 // upstream proxy in one shot, so the streaming budget was routinely too short and
@@ -205,13 +294,13 @@ function setCors(res) {
   res.setHeader('Access-Control-Expose-Headers', 'Content-Type, Content-Length');
 }
 
-function sendError(res, status, message) {
+function sendError(res, status, message, extra) {
   setCors(res);
   if (res.headersSent) {
     res.end();
     return;
   }
-  const body = JSON.stringify({ error: message, status });
+  const body = JSON.stringify({ error: message, status, ...extra });
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(body);
 }
@@ -365,7 +454,7 @@ export function parseM3u(text) {
 }
 
 /** Fetch + parse the configured M3U (cached). Null when no M3U source is set. */
-async function getM3uChannels() {
+async function getM3uChannels(options = {}) {
   const src = getM3uSource();
   if (!src) return null;
   if (m3uCache && Date.now() - m3uCacheAt < M3U_TTL_MS) return m3uCache;
@@ -376,7 +465,7 @@ async function getM3uChannels() {
     const resp = await upstreamFetch(new URL(src.value), {
       redirect: 'follow',
       headers: m3uHeaders(),
-      signal: AbortSignal.timeout(LIST_TIMEOUT_MS),
+      signal: options.signal || AbortSignal.timeout(LIST_TIMEOUT_MS),
     });
     if (!resp.ok) {
       // 401/404 on a private host almost always means the token, not the file: GitHub returns
@@ -799,11 +888,24 @@ export async function handleXtreamApi(req, res) {
         .finally(() => { xtreamProbe = null; });
     }
     const cached = xtreamCache.get(action) || null;
-    if (cached) return sendJsonBody(res, cached.data);
+    if (cached) {
+      // This is the provider's own list, so the ids in it are Xtream ids — and NOT recording
+      // that left /api/stream resolving them in the backup's id space instead. Everything
+      // listed, nothing playable, which is the same symptom as an outage and none of the cause.
+      if (action === 'get_live_streams') liveListSource = 'xtream';
+      return sendJsonBody(res, cached.data);
+    }
     const fromDisk = await loadPersistedList(action);
     if (fromDisk) {
       if (action === 'get_live_streams') liveListSource = 'xtream';
       return sendJsonBody(res, fromDisk);
+    }
+    // The probe above can finish while the disk is being read. Its list is the real one, so
+    // prefer it over the backup rather than staying pessimistic for the rest of the cooldown.
+    const probed = xtreamCache.get(action);
+    if (probed) {
+      if (action === 'get_live_streams') liveListSource = 'xtream';
+      return sendJsonBody(res, probed.data);
     }
     // Both routes are down, so BOTH reasons have to reach the caller. Reporting only the
     // Xtream error sent people to look at the exit node when the actual problem was the
@@ -935,6 +1037,133 @@ async function probe(name, run, creds) {
 }
 
 /**
+ * A channel id to probe playback with, from whatever list this server already holds: the live
+ * cache, the copy on disk, or — on a container that has neither — the list the full diagnostic
+ * has just downloaded anyway. Never fetches a list of its own; the probe is meant to be cheap.
+ */
+async function firstKnownStreamId(justDownloaded) {
+  const fromCache = xtreamCache.get('get_live_streams')?.data;
+  const list = Array.isArray(fromCache) ? fromCache : await loadPersistedList('get_live_streams');
+  const first = Array.isArray(list) ? list.find((c) => Number.isFinite(Number(c?.stream_id))) : null;
+  if (first) return String(first.stream_id);
+  return /"stream_id"\s*:\s*"?(\d+)/.exec(justDownloaded || '')?.[1] || '';
+}
+
+/**
+ * Can this deployment obtain the initial bytes of one candidate stream?
+ *
+ * Every other check here is a list check — a different URL shape, a different id
+ * space, and a JSON body — which is why a deployment whose channels all refused
+ * to play could still report a clean diagnosis. This fetches the first bytes of a
+ * real stream and stops, and reports the three things that tell the causes apart:
+ * the status, which host actually served it (the provider itself, or the CDN it
+ * redirects to), and whether those bytes are MPEG-TS, a playlist, or a block page.
+ */
+async function probeStream(id, creds, budgetMs = 15_000) {
+  const name = `live stream ${id}`;
+  const started = Date.now();
+  const targets = streamTargets(id);
+  if (!targets.length) return { name, ok: false, error: 'this server has no IPTV source configured' };
+  const target = targets[0];
+  // The diagnostic deadline starts before resolving a cold backup, not after
+  // an unbounded playlist wait. It is a first-bytes probe, not a playback test.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(streamTimeout()), budgetMs);
+  let url;
+  try {
+    const raw = await targetUrl(target, Math.min(FAST_FAIL_MS, budgetMs), controller.signal);
+    if (!raw) throw new Error('No stream URL resolves for this channel');
+    url = new URL(raw);
+  } catch (err) {
+    clearTimeout(timer);
+    controller.abort();
+    return {
+      name,
+      ok: false,
+      idSpace: target.source,
+      error: redact(String(err && err.message ? err.message : err), creds),
+    };
+  }
+  try {
+    const resp = await waitForAbort(upstreamFetch(url, {
+      redirect: 'follow',
+      headers: { 'User-Agent': USER_AGENT, Accept: '*/*' },
+      signal: controller.signal,
+    }), controller.signal);
+    // One chunk is enough to identify the body, and a live stream never ends, so
+    // the rest is cancelled rather than downloaded.
+    let head = new Uint8Array();
+    const reader = resp.body?.getReader();
+    if (reader) {
+      try {
+        const { value } = await readNonempty(reader, controller.signal);
+        if (value) head = value.subarray(0, 512);
+      } finally {
+        controller.abort();
+        void reader.cancel().catch(() => {});
+      }
+    }
+    const text = Buffer.from(head).toString('latin1');
+    const looksLike =
+      head[0] === 0x47
+        ? 'mpeg-ts'
+        : text.startsWith('#EXTM3U')
+          ? 'hls playlist'
+          : /^\s*</.test(text)
+            ? 'html'
+            : head.length
+              ? 'other'
+              : 'empty';
+    let servedBy = null;
+    try {
+      servedBy = new URL(resp.realUrl || resp.url).host;
+    } catch {
+      /* leave it unreported rather than guess */
+    }
+    return {
+      name,
+      ok: resp.ok && (looksLike === 'mpeg-ts' || looksLike === 'hls playlist'),
+      status: resp.status,
+      ms: Date.now() - started,
+      idSpace: target.source,
+      transport: transportFor(url.hostname),
+      requestedHost: url.host,
+      servedByHost: servedBy,
+      contentType: resp.headers.get('content-type'),
+      bytes: head.length,
+      looksLike,
+      preview: redact(text.replace(/[^\x20-\x7e]/g, '.').slice(0, 120), creds),
+      hint:
+        resp.status === 403
+          ? 'The provider refused this channel. Either it is not on this line, or the request did ' +
+            'not leave through the exit node — compare egressIp in ?quick=1.'
+          : looksLike === 'html'
+            ? 'An HTML body means something upstream answered instead of the provider (a block page or a portal).'
+            : resp.ok && looksLike === 'mpeg-ts'
+              ? servedBy && servedBy !== url.host
+                ? `Received initial stream bytes from ${servedBy}; decoded playback has not been verified.`
+                : 'Received initial stream bytes from the provider; decoded playback has not been verified.'
+              : resp.ok && looksLike === 'hls playlist'
+                ? 'The provider returns a playlist for this channel; the player switches to segment mode.'
+                : null,
+    };
+  } catch (err) {
+    return {
+      name,
+      ok: false,
+      ms: Date.now() - started,
+      idSpace: target.source,
+      transport: transportFor(url.hostname),
+      requestedHost: url.host,
+      error: redact(String(err && err.message ? err.message : err), creds),
+    };
+  } finally {
+    clearTimeout(timer);
+    controller.abort();
+  }
+}
+
+/**
  * GET /api/diag?key=... — what the server sees when it talks upstream, right now.
  *
  * Exists because every failure so far has looked identical from the browser
@@ -968,6 +1197,7 @@ export async function handleDiag(req, res) {
 
   const creds = getXtreamCreds();
   const m3u = getM3uSource();
+  let listProbeBody = '';
   const out = {
     source: getSourceType(),
     env: {
@@ -995,6 +1225,13 @@ export async function handleDiag(req, res) {
   // LIST_TIMEOUT_MS each against an unresponsive provider — long enough that the diagnostic
   // itself times out in most clients, exactly when it is most needed.
   const quick = url.searchParams.get('quick') === '1';
+  const quickDeadlineAt = Date.now() + 30_000;
+  const quickBudget = (ms) => Math.max(0, Math.min(ms, quickDeadlineAt - Date.now()));
+  const quickSignal = (ms) => {
+    const budget = quickBudget(ms);
+    if (!budget) throw streamTimeout();
+    return AbortSignal.timeout(budget);
+  };
 
   if (creds) {
     out.xtreamHost = new URL(creds.server).host;
@@ -1011,10 +1248,25 @@ export async function handleDiag(req, res) {
     if (!quick) {
       out.checks.push(await probe('player_api login', () => hit('', TIMEOUT_MS), creds));
       out.checks.push(
-        await probe('player_api get_live_streams', () => hit('&action=get_live_streams', LIST_TIMEOUT_MS), creds),
+        await probe(
+          'player_api get_live_streams',
+          async () => {
+            const r = await hit('&action=get_live_streams', LIST_TIMEOUT_MS);
+            listProbeBody = r.body; // a channel id for the playback probe below, at no extra cost
+            return r;
+          },
+          creds,
+        ),
       );
     }
   }
+  // Playback is its own failure domain, so it gets its own check in BOTH modes:
+  // ?quick=1 is the mode people actually reach for, and this probe is one short
+  // request rather than a list download.
+  const probeId = url.searchParams.get('stream') || (await firstKnownStreamId(listProbeBody));
+  if (probeId && /^\d+$/.test(probeId)) out.checks.push(await probeStream(probeId, creds, quick ? quickBudget(15_000) : 15_000));
+  else out.streamProbe = 'No channel id available to test playback with — retry as /api/diag?stream=<id>.';
+
   if (quick) {
     out.quick = true;
     // Observe an IP-check service through the provider's selected transport.
@@ -1026,14 +1278,14 @@ export async function handleDiag(req, res) {
       if (out.egressTransport === 'blocked') throw new Error('No provider transport is configured');
       const ipRes = await upstreamFetch(new URL('https://api.ipify.org?format=json'), {
         headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' },
-        signal: AbortSignal.timeout(10000),
+        signal: quickSignal(10000),
         diagnosticTransport: out.egressTransport,
       });
       if (!ipRes.ok) {
         await ipRes.body?.cancel();
         throw new Error(`Egress check returned HTTP ${ipRes.status} through ${out.egressTransport}`);
       }
-      const j = await ipRes.json().catch(() => ({}));
+      const j = await ipRes.json();
       out.egressIp = typeof j.ip === 'string' ? j.ip : null;
     } catch (e) {
       out.egressIp = null;
@@ -1062,9 +1314,9 @@ export async function handleDiag(req, res) {
         try {
           const who = await upstreamFetch(new URL('https://api.github.com/user'), {
             headers: m3uHeaders(),
-            signal: AbortSignal.timeout(15000),
+            signal: quickSignal(15000),
           });
-          const body = await who.json().catch(() => ({}));
+          const body = await who.json();
           out.m3uAuthIdentity = who.ok
             ? { login: body.login, status: who.status }
             : { status: who.status, message: body.message || null };
@@ -1076,7 +1328,7 @@ export async function handleDiag(req, res) {
         const r = await upstreamFetch(new URL(process.env.M3U_URL), {
           redirect: 'follow',
           headers: m3uHeaders(),
-          signal: AbortSignal.timeout(20000),
+          signal: quickSignal(20000),
         });
         const head = (await r.text()).slice(0, 120);
         out.m3uCheck = {
@@ -1207,6 +1459,154 @@ export function buildM3u(channels) {
   return lines.join('\n') + '\n';
 }
 
+/** The backup playlist's URL for channel `id`, or null when it has no such channel. */
+async function m3uTargetUrl(id, options) {
+  const wanted = Number(id);
+  const channels = await getM3uChannels(options);
+  // Match the id carried in the URL first; fall back to the array position for playlists whose
+  // URLs have no id. Resolving by id means a stream request works whichever list the client
+  // happens to be holding.
+  const chan =
+    channels?.find((c) => streamIdFromUrl(c.url) === wanted) ??
+    (Number.isInteger(wanted) && wanted >= 0 && wanted < (channels?.length ?? 0)
+      ? channels[wanted]
+      : null);
+  if (!chan) return null;
+  // The player decodes one continuous MPEG-TS response; it is not an HLS client. An Xtream
+  // panel serves the same channel either way, so a playlist written with .m3u8 URLs would
+  // otherwise hand the decoder a manifest and stall until the connect timeout. Normalise the
+  // Xtream stream shape to .ts and leave every other URL exactly as the playlist gave it.
+  return String(chan.url).replace(
+    /^(https?:\/\/[^/]+\/(?:[^/?#]+\/){2}\d+)\.m3u8(\?|$)/i,
+    '$1.ts$2',
+  );
+}
+
+/**
+ * The upstream targets that could serve channel `id`, likeliest first.
+ *
+ * There are two id spaces — an Xtream stream_id, and the id carried in the backup playlist's
+ * URLs — and the client can be holding a list from either: its localStorage copy outlives a
+ * server restart, and the server switches source whenever the provider stalls. `liveListSource`
+ * records which list this server served last, which is a good guess and not a guarantee — and a
+ * guess that was only ever tried once is exactly what "the channels are all listed but none of
+ * them play" looked like. So both are offered, and the caller falls through to the second when
+ * the first is refused.
+ *
+ * The Xtream target is a plain string: building it costs nothing. The backup's is a THUNK,
+ * because resolving it means downloading the playlist, which on a cold container takes as long
+ * as the list timeout allows. Resolving both up front made every single channel tap wait on the
+ * backup before the provider was even asked — a spinner that outlasts anyone's patience. It is
+ * therefore resolved only when it is the source the client is actually holding, or when the
+ * provider has already refused.
+ */
+function streamTargets(id) {
+  const creds = getXtreamCreds();
+  const xtream = creds
+    ? {
+        source: 'xtream',
+        url: `${creds.server}/live/${encodeURIComponent(creds.username)}/${encodeURIComponent(creds.password)}/${id}.ts`,
+      }
+    : null;
+  const backup = getM3uSource() ? { source: 'm3u', resolve: (options) => m3uTargetUrl(id, options) } : null;
+  const preferBackup = getSourceType() === 'm3u' || liveListSource === 'm3u';
+  return (preferBackup ? [backup, xtream] : [xtream, backup]).filter(Boolean);
+}
+
+/**
+ * A target's URL, resolving the backup's thunk if that is what it is.
+ *
+ * `budgetMs` bounds that resolution: falling back to the backup must not turn an instant
+ * refusal into a minute of silence, so a playlist that is slow to arrive is simply reported as
+ * one more thing that did not answer.
+ */
+async function targetUrl(target, budgetMs, signal) {
+  signal?.throwIfAborted();
+  if (target.url) return target.url;
+  const controller = new AbortController();
+  const onAbort = () => controller.abort(signal.reason);
+  signal?.addEventListener('abort', onAbort, { once: true });
+  try {
+    return await withinDeadline(() => target.resolve({ signal: controller.signal }), controller, budgetMs);
+  } finally {
+    signal?.removeEventListener('abort', onAbort);
+    controller.abort();
+  }
+}
+
+/**
+ * Is this 403 really the provider saying "not on this line", rather than a
+ * transport failure wearing the same status code? Consumes the body either way.
+ *
+ * The record is permanent and shared by every viewer, so a Cloudflare
+ * interstitial — also a 403, and meaning the tunnel is not carrying the request
+ * — must never be written down: that would erase the catalogue one tap at a
+ * time, and the channels it hid would be working ones.
+ */
+async function isGenuineRefusal(resp, controller) {
+  const reader = resp.body?.getReader();
+  if (!reader) return true;
+  try {
+    return await withinDeadline(async () => {
+      const chunks = [];
+      let bytes = 0;
+      while (bytes < 512) {
+        const chunk = await readNonempty(reader, controller.signal);
+        if (chunk.done) break;
+        const part = chunk.value.subarray(0, 512 - bytes);
+        bytes += part.byteLength;
+        chunks.push(part);
+      }
+      const text = Buffer.concat(chunks, bytes).toString('utf8');
+      return !/<html|<!doctype|cloudflare|attention required|access denied/i.test(text);
+    }, controller, 3000);
+  } catch {
+    return false;
+  } finally {
+    // Cancelling resp.body while reader/text owns its lock does not work.
+    controller.abort();
+    void reader.cancel().catch(() => {});
+  }
+}
+
+/**
+ * One sentence a viewer can act on, from what each candidate actually answered.
+ *
+ * This text reaches the browser, and a transport error message can quote the URL it failed on —
+ * which for a stream carries the account. Every free-form part is redacted, as the diagnostics
+ * already do with upstream previews.
+ */
+function streamFailure(attempts) {
+  if (attempts.some((a) => a.timeout)) return {
+    status: 504, code: 'STREAM_TIMEOUT', retryable: true,
+    error: 'The stream did not respond in time. Try again or check the connection.',
+  };
+  if (attempts.some((a) => a.blocked)) return {
+    status: 503, code: 'STREAM_NOT_CONFIGURED', retryable: false,
+    error: 'The provider connection is not configured.',
+  };
+  if (attempts.some((a) => a.invalid)) return {
+    status: 502, code: 'STREAM_INVALID_RESPONSE', retryable: true,
+    error: 'The provider did not return a usable stream.',
+  };
+  if (attempts.some((a) => a.network && ['tunnel', 'worker'].includes(a.transport))) return {
+    status: 502, code: 'STREAM_PROXY_UNAVAILABLE', retryable: true,
+    error: 'The connection to the provider is unavailable. Check the configured connection.',
+  };
+  const retryable = !attempts.length || attempts.some((a) => a.network || a.status >= 500 ||
+    a.status === 429 || (a.status === 403 && !a.genuine) || (a.status === undefined && !a.missing));
+  if (!retryable && attempts.some((a) => a.status === 401 || a.status === 403)) return {
+    status: 502, code: 'STREAM_REJECTED', retryable: false,
+    error: 'The upstream service refused this channel. Check account access and connection settings.',
+  };
+  return { status: 502, code: 'STREAM_UNAVAILABLE', retryable, error: 'This channel is currently unavailable.' };
+}
+
+function sendStreamFailure(res, attempts) {
+  const failure = streamFailure(attempts);
+  sendError(res, failure.status, failure.error, { code: failure.code, retryable: failure.retryable });
+}
+
 /**
  * GET /api/stream?id=N  — stream live channel N. The credentialed upstream URL
  * is built here and handed to the existing proxy pipeline, so the browser only
@@ -1220,51 +1620,39 @@ export async function handleStream(req, res) {
   const id = url.searchParams.get('id') || '';
   if (!/^\d+$/.test(id)) return sendError(res, 400, 'Invalid channel id');
 
-  const source = getSourceType();
-  if (!source) return sendError(res, 503, 'Server has no IPTV source configured');
-
-  req.streamId = id;
-  let upstreamUrl;
-  // The M3U path also covers an Xtream deployment whose last channel list came
-  // from the fallback: those ids are M3U indexes, not Xtream stream ids.
-  if (source === 'm3u' || liveListSource === 'm3u') {
-    // The id is the channel's index in the parsed M3U; look up its stream URL.
-    let channels;
+  if (!getSourceType()) return sendStreamFailure(res, [{ blocked: true }]);
+  const context = streamContext(req, res);
+  try {
+    const targets = streamTargets(id);
+    if (!targets.length) return sendStreamFailure(res, [{ blocked: true }]);
+    const firstBudget = Math.min(context.remaining(), targets.length > 1 ? FAST_FAIL_MS : STREAM_START_TIMEOUT_MS);
+    let firstUrl;
     try {
-      channels = await getM3uChannels();
-    } catch (err) {
-      return sendError(res, 502, `Playlist load failed: ${String(err && err.message ? err.message : err)}`);
+      firstUrl = await targetUrl(targets[0], firstBudget, context.controller.signal);
+    } catch (error) {
+      if (res.destroyed) return;
+      if (targets.length === 1 || context.controller.signal.aborted) {
+        return sendStreamFailure(res, [{ timeout: error?.name === 'TimeoutError', network: true }]);
+      }
+      firstUrl = null;
     }
-    // Match the id carried in the URL first; fall back to the array position for playlists
-    // whose URLs have no id. Resolving by id means a stream request works whichever list the
-    // client happens to be holding, so a mid-session switch between sources is no longer a
-    // session-wide breakage.
-    const wanted = Number(id);
-    const chan =
-      channels?.find((c) => streamIdFromUrl(c.url) === wanted) ??
-      (Number.isInteger(wanted) && wanted >= 0 && wanted < (channels?.length ?? 0)
-        ? channels[wanted]
-        : null);
-    if (!chan) return sendError(res, 404, 'Unknown channel');
-    // The player decodes one continuous MPEG-TS response; it is not an HLS client. An Xtream
-    // panel serves the same channel either way, so a playlist written with .m3u8 URLs would
-    // otherwise hand the decoder a manifest and stall until the connect timeout. Normalise the
-    // Xtream stream shape to .ts and leave every other URL exactly as the playlist gave it.
-    upstreamUrl = String(chan.url).replace(
-      /^(https?:\/\/[^/]+\/(?:[^/?#]+\/){2}\d+)\.m3u8(\?|$)/i,
-      '$1.ts$2',
-    );
-  } else {
-    const creds = getXtreamCreds();
-    upstreamUrl = `${creds.server}/live/${encodeURIComponent(creds.username)}/${encodeURIComponent(creds.password)}/${id}.ts`;
+    if (!firstUrl) {
+      targets.shift();
+      firstUrl = targets[0]?.url;
+      if (!firstUrl) return sendError(res, 404, 'Unknown channel', { code: 'STREAM_UNAVAILABLE', retryable: false });
+    }
+    context.controller.signal.throwIfAborted();
+    targets[0] = { source: targets[0].source, url: firstUrl };
+    req.streamId = id;
+    req.streamTargets = targets;
+    const key = url.searchParams.get('key') || '';
+    req.url = `/api/proxy?u=${encodeURIComponent(firstUrl)}${key ? `&key=${encodeURIComponent(key)}` : ''}`;
+    return await handleProxy(req, res);
+  } catch (error) {
+    if (!res.destroyed) sendStreamFailure(res, [{ timeout: error?.name === 'TimeoutError', network: true }]);
+  } finally {
+    context.dispose();
   }
-
-  // Delegate to the existing proxy by rewriting the request to its internal form.
-  // The stream URL (which may embed the account) lives only here, on the server —
-  // the client's request was /api/stream?id=N and its response is the bytes.
-  const key = url.searchParams.get('key') || '';
-  req.url = `/api/proxy?u=${encodeURIComponent(upstreamUrl)}${key ? `&key=${encodeURIComponent(key)}` : ''}`;
-  return handleProxy(req, res);
 }
 
 export async function handleProxy(req, res) {
@@ -1321,83 +1709,127 @@ export async function handleProxy(req, res) {
   const headers = { 'User-Agent': USER_AGENT, Accept: '*/*' };
   if (req.headers.range) headers.Range = req.headers.range;
 
-  // The timeout must cover CONNECTING only, not the response body. A live
-  // channel is one continuous MPEG-TS response that never ends, so a whole-
-  // request timeout would tear playback down every TIMEOUT_MS. The timer is
-  // therefore cleared as soon as the headers arrive.
-  // The controller is also aborted when the client goes away, so an abandoned
-  // stream releases the upstream connection immediately — this matters on
-  // accounts limited to a single concurrent connection.
-  const controller = new AbortController();
-  const connectTimer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-  res.on('close', () => controller.abort());
+  // A stream request carries the other id space with it (see streamTargets),
+  // so a refusal on the first candidate is a reason to ask the second rather than
+  // to hand the decoder a 403 page. Every other proxied request — a logo, a
+  // playlist — keeps exactly one candidate and passes its status through untouched.
+  const streamId = req.streamId || '';
+  const candidates =
+    streamId && Array.isArray(req.streamTargets) && req.streamTargets.length
+      ? req.streamTargets
+      : [{ source: null, url: target.toString() }];
 
-  let upstream;
+  // One start deadline spans all candidates. After the first bytes, only a
+  // pending network read has an idle deadline; downstream backpressure does not.
+  const context = streamContext(req, res);
+  const attempts = [];
+  let refused = false;
   try {
-    upstream = await upstreamFetch(target, {
-      redirect: 'follow',
-      headers,
-      signal: controller.signal,
-    });
-  } catch (err) {
-    clearTimeout(connectTimer);
-    const isTimeout = err && (err.name === 'TimeoutError' || err.name === 'AbortError');
-    sendError(res, isTimeout ? 504 : 502, `Upstream fetch failed: ${String(err && err.message ? err.message : err)}`);
-    return;
-  }
-  clearTimeout(connectTimer); // headers are in; the body may now stream forever
-
-  const upstreamType = upstream.headers.get('content-type') || '';
-  const finalUrl = upstream.realUrl || upstream.url || target.toString();
-  const isPlaylist =
-    /\.m3u8($|\?)/i.test(finalUrl) ||
-    /\.m3u8($|\?)/i.test(target.toString()) ||
-    /mpegurl/i.test(upstreamType);
-
-  try {
-    if (isPlaylist) {
-      const text = await upstream.text();
-      const rewritten = rewritePlaylist(text, finalUrl, keyParam);
-      const body = Buffer.from(rewritten, 'utf-8');
-      res.writeHead(upstream.status, {
-        'Content-Type': 'application/vnd.apple.mpegurl',
-        'Content-Length': body.length,
-        'Cache-Control': 'no-store',
-      });
-      res.end(body);
-      return;
+    for (const candidate of candidates) {
+      if (res.destroyed) return;
+      if (context.controller.signal.aborted) {
+        attempts.push({ timeout: context.controller.signal.reason?.name === 'TimeoutError' });
+        break;
+      }
+      let candidateUrl;
+      try {
+        const raw = await targetUrl(candidate, Math.min(FAST_FAIL_MS, context.remaining()), context.controller.signal);
+        if (!raw) { attempts.push({ missing: true }); continue; }
+        candidateUrl = new URL(raw);
+        if (!['http:', 'https:'].includes(candidateUrl.protocol) || isForbiddenHostname(candidateUrl.hostname)) {
+          attempts.push({ invalid: true });
+          continue;
+        }
+      } catch (error) {
+        attempts.push({ timeout: error?.name === 'TimeoutError', network: true });
+        continue;
+      }
+      const transport = transportFor(candidateUrl.hostname);
+      if (transport === 'blocked') { attempts.push({ blocked: true }); continue; }
+      const controller = new AbortController();
+      const onAbort = () => controller.abort(context.controller.signal.reason);
+      context.controller.signal.addEventListener('abort', onAbort, { once: true });
+      if (context.controller.signal.aborted) onAbort();
+      let reader;
+      let response;
+      try {
+        response = await withinDeadline(() => upstreamFetch(candidateUrl, {
+          redirect: 'follow', headers, signal: controller.signal,
+        }), controller, Math.min(TIMEOUT_MS, context.remaining()));
+        if (!response.ok && streamId) {
+          const genuine = response.status === 403 ? await isGenuineRefusal(response, controller) : false;
+          refused = genuine || refused;
+          attempts.push({ status: response.status, genuine, transport });
+          continue;
+        }
+        const finalUrl = response.realUrl || response.url || candidateUrl.toString();
+        const upstreamType = response.headers.get('content-type') || '';
+        const playlistType = /\.m3u8($|\?)/i.test(finalUrl) || /mpegurl/i.test(upstreamType);
+        if (streamId && /text\/html|application\/json/i.test(upstreamType)) {
+          attempts.push({ invalid: true });
+          continue;
+        }
+        reader = response.body?.getReader();
+        const first = reader ? await readNonempty(reader, controller.signal) : { done: true };
+        if (first.done && streamId) { attempts.push({ invalid: true }); continue; }
+        const playlist = playlistType || (!first.done && Buffer.from(first.value.subarray(0, 16)).toString().startsWith('#EXTM3U'));
+        if (playlist) {
+          const text = await readManifest(reader, first, controller);
+          context.controller.signal.throwIfAborted();
+          const body = Buffer.from(rewritePlaylist(text, finalUrl, keyParam), 'utf8');
+          context.started();
+          res.writeHead(response.status, {
+            'Content-Type': 'application/vnd.apple.mpegurl', 'Content-Length': body.length, 'Cache-Control': 'no-store',
+          });
+          res.end(body);
+          return;
+        }
+        context.controller.signal.throwIfAborted();
+        const responseType = upstreamType || (/\.ts($|\?)/i.test(finalUrl) ? 'video/mp2t' : 'application/octet-stream');
+        const responseHeaders = {
+          'Content-Type': responseType,
+          'Cache-Control': /^image\//i.test(responseType) ? 'public, max-age=604800, immutable' : 'no-store',
+        };
+        for (const name of ['content-length', 'content-range', 'accept-ranges']) {
+          const value = response.headers.get(name);
+          if (value) responseHeaders[name] = value;
+        }
+        context.started();
+        res.writeHead(response.status, responseHeaders);
+        if (first.done) { res.end(); return; }
+        async function* body() {
+          yield first.value;
+          while (true) {
+            await waitForDrain(res, controller.signal);
+            const chunk = await withinDeadline(() => readNonempty(reader, controller.signal), controller, STREAM_IDLE_TIMEOUT_MS);
+            if (chunk.done) return;
+            yield chunk.value;
+          }
+        }
+        try {
+          await pipeline(Readable.from(body(), { objectMode: false }), res);
+        } catch {
+          res.destroy(); // An incomplete stream must end, not contain JSON after headers.
+        }
+        return;
+      } catch (error) {
+        if (res.destroyed) return;
+        attempts.push({
+          transport, timeout: error?.name === 'TimeoutError',
+          invalid: error?.code === 'STREAM_INVALID_RESPONSE', network: true,
+        });
+      } finally {
+        context.controller.signal.removeEventListener('abort', onAbort);
+        // Release every unsuccessful candidate before its fallback is opened.
+        controller.abort();
+        if (reader) void reader.cancel().catch(() => {});
+        else if (response?.body) void response.body.cancel().catch(() => {});
+      }
     }
-
-    // Binary passthrough (.ts segments, icons, ...) — stream it.
-    const responseType = upstreamType || (finalUrl.endsWith('.ts') ? 'video/mp2t' : 'application/octet-stream');
-    // Channel logos never change, so let the browser cache them — otherwise the
-    // grid re-downloads every icon on each visit and scroll (costly on the
-    // phone/car). Video and everything else stays uncacheable.
-    const isImage = /^image\//i.test(responseType);
-    const responseHeaders = {
-      'Content-Type': responseType,
-      'Cache-Control': isImage ? 'public, max-age=604800, immutable' : 'no-store',
-    };
-    const contentLength = upstream.headers.get('content-length');
-    if (contentLength) responseHeaders['Content-Length'] = contentLength;
-    const contentRange = upstream.headers.get('content-range');
-    if (contentRange) responseHeaders['Content-Range'] = contentRange;
-    const acceptRanges = upstream.headers.get('accept-ranges');
-    if (acceptRanges) responseHeaders['Accept-Ranges'] = acceptRanges;
-
-    res.writeHead(upstream.status, responseHeaders);
-    if (!upstream.body) {
-      res.end();
-      return;
-    }
-    // pipeline (unlike pipe) propagates errors in BOTH directions and rejects
-    // instead of leaving an unhandled 'error' event to crash the process.
-    try {
-      await pipeline(Readable.fromWeb(upstream.body), res);
-    } catch {
-      res.destroy();
-    }
-  } catch (err) {
-    sendError(res, 502, `Proxy error: ${String(err && err.message ? err.message : err)}`);
+    if (res.destroyed) return;
+    if (refused && !streamFailure(attempts).retryable) noteUnavailable(streamId);
+    sendStreamFailure(res, attempts);
+  } finally {
+    context.dispose();
   }
 }

@@ -13,6 +13,8 @@ export const playerStrings = {
     forbidden: 'The service refused playback. Check your access link and provider account.',
     unavailable: 'This channel is currently unavailable. Try again or choose another channel.',
     connection: 'The stream connection failed. Check the home connection and try again.',
+    notConfigured: 'The stream connection is not configured. Check the service connection settings.',
+    invalidResponse: 'The source returned an invalid video stream. Try again or choose another channel.',
     failed: 'Playback stopped. Try again to reconnect to the live stream.',
   },
   he: {
@@ -29,6 +31,8 @@ export const playerStrings = {
     forbidden: 'השירות סירב לנגן. בדוק את קישור הגישה ואת החשבון אצל הספק.',
     unavailable: 'הערוץ אינו זמין כרגע. אפשר לנסות שוב או לבחור ערוץ אחר.',
     connection: 'החיבור לשידור נכשל. בדוק את החיבור הביתי ונסה שוב.',
+    notConfigured: 'החיבור לשידור אינו מוגדר. יש לבדוק את הגדרות החיבור של השירות.',
+    invalidResponse: 'המקור החזיר שידור לא תקין. אפשר לנסות שוב או לבחור ערוץ אחר.',
     failed: 'הניגון נעצר. נסה שוב כדי להתחבר לשידור החי.',
   },
   ar: {
@@ -45,6 +49,8 @@ export const playerStrings = {
     forbidden: 'رفضت الخدمة تشغيل البث. تحقق من رابط الوصول وحسابك لدى المزوّد.',
     unavailable: 'هذه القناة غير متاحة حاليًا. حاول مجددًا أو اختر قناة أخرى.',
     connection: 'فشل الاتصال بالبث. تحقق من الاتصال المنزلي وحاول مجددًا.',
+    notConfigured: 'اتصال البث غير مُعدّ. تحقق من إعدادات اتصال الخدمة.',
+    invalidResponse: 'أعاد المصدر بثًا غير صالح. حاول مجددًا أو اختر قناة أخرى.',
     failed: 'توقف التشغيل. حاول مجددًا للاتصال بالبث المباشر.',
   },
 };

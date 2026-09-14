@@ -99,3 +99,15 @@ test('sustained frames after a brief rebuffer restore the retry budget', (t) => 
   assert.equal(x.events.at(-1).attempt, 1);
   x.recovery.destroy();
 });
+
+test('a settled refusal skips automatic retries but still permits manual retry', (t) => {
+  const x = setup(t);
+  x.recovery.error('STREAM_REJECTED', true);
+  t.mock.timers.tick(100_000);
+  x.recovery.recover();
+  assert.equal(x.starts(), 1);
+  assert.equal(x.events.at(-1).phase, 'failed');
+  x.recovery.play();
+  assert.equal(x.starts(), 2);
+  x.recovery.destroy();
+});
