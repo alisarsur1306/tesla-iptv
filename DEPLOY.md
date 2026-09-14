@@ -399,6 +399,61 @@ fails. To fall straight to the backup instead, clear `XTREAM_SERVER`.
 
 ## Using it in the Tesla
 
+### Saved video addresses and a one-time local refresh
+
+The server first tries a saved public video address for the requested channel.
+It learns addresses from refreshed catalogues and successful direct playback, and can import a private
+`resolved-streams.json` file beside a GitHub-hosted `M3U_URL`. This file is bound
+to the exact provider account; changing its server, username or password prevents
+reuse across accounts. A bad saved token falls back to the provider without
+marking the channel permanently refused. Its startup attempt is limited to eight
+seconds within the existing overall deadline.
+
+On a computer that can reach the provider, with Node 24 and GitHub CLI signed into
+an account that can write the **private** backup repository:
+
+```sh
+node scripts/sync-streams.mjs --config /path/to/private/config.json --repository owner/private-backup
+```
+
+The ignored config contains the same `server`, `username` and `password` as Render.
+Alternatively set `XTREAM_SERVER`, `XTREAM_USERNAME` and `XTREAM_PASSWORD` for the
+command. The command reads `direct_source` addresses already supplied in the
+catalogue; it does not open thousands of simultaneous streams. It writes a private
+local snapshot and refuses to upload to a public repository. Use `--path` if the
+M3U is in a subdirectory, keeping `resolved-streams.json` beside it. `--catalogue`
+can use a previously downloaded private catalogue if the provider is temporarily
+unavailable. These files contain access URLs and must stay out of `public/` and
+the public application repository.
+
+Render imports the sidecar in the background at startup and checks for updates
+at most every 15 minutes during stream activity, using the existing `M3U_AUTH`.
+The private remote file survives deployments; addresses learned only in Render's
+temporary directory may not. An idle/sleeping Render instance is not a scheduler
+for the local computer. Run the local sync again when a refresh is needed.
+
+Saved URLs are candidates, not downloaded live video or guaranteed working
+channels. Known `expires`, `exp` and `expiry` timestamps are honored; other
+addresses have a seven-day application retention limit and are tested when
+opened. The provider may reject or expire them sooner. Channels without a usable
+saved address still need provider access. Logs contain only import counts/status,
+and successful stream responses identify `X-Stream-Source: saved` or `provider`.
+
+### Provider DNS while using the Mac exit node
+
+`render-start.sh` enables `UPSTREAM_PROXY_LOCAL_DNS=1` for its local Tailscale
+proxy. The application resolves provider names to public IPv4 addresses on
+Render, sends a numeric HTTP CONNECT through Tailscale, and preserves the
+original HTTP Host and HTTPS server name. Provider traffic still exits through
+the Mac; it no longer needs the Mac's PeerAPI DNS resolver. DNS replies pointing
+at private/local addresses are rejected. Set the flag to `0` to restore proxy-side
+DNS for troubleshooting. Other proxy configurations keep their previous behavior
+unless this option is explicitly enabled.
+
+The startup `peer_dns` probe still tests the Mac's resolver, so it can report 500
+while the application's provider health check succeeds using local DNS. Use
+`/api/health` and actual playback to assess the application after this change.
+
 - Open `https://<your-app>.onrender.com/?key=<ACCESS_KEY>` **once** in the
   Tesla browser. The key is stored in the browser's localStorage and the
   address bar is cleaned; after that, plain `https://<your-app>.onrender.com`

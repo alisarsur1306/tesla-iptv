@@ -23,15 +23,18 @@ function start(handler, res, url = '/api/stream?id=7') {
 function mockedBody(t, type, initial) {
   let writer;
   let signal;
+  let ready;
+  const started = new Promise(resolve => { ready = resolve; });
   t.mock.method(globalThis, 'fetch', async (_url, options) => {
     signal = options.signal;
     return new Response(new ReadableStream({ start(controller) {
       writer = controller;
+      ready();
       signal.addEventListener('abort', () => controller.error(signal.reason), { once: true });
       if (initial) controller.enqueue(initial);
     } }), { headers: { 'content-type': type } });
   });
-  return { write: (chunk) => writer.enqueue(chunk), signal: () => signal, end: () => writer.close() };
+  return { started, write: (chunk) => writer.enqueue(chunk), signal: () => signal, end: () => writer.close() };
 }
 
 test.beforeEach(() => {
@@ -47,6 +50,7 @@ test('headers without stream bytes reach the shared 60s start deadline', async (
   const { handleStream } = await handlers();
   const res = response();
   const pending = start(handleStream, res);
+  await body.started;
   await flush();
   t.mock.timers.tick(59_999);
   await flush();
@@ -65,6 +69,7 @@ test('a manifest with progress still has a total startup deadline', async (t) =>
   const { handleStream } = await handlers();
   const res = response();
   const pending = start(handleStream, res);
+  await body.started;
   await flush();
   for (let i = 0; i < 5; i++) {
     t.mock.timers.tick(10_000);
@@ -84,6 +89,7 @@ test('active streams outlive the startup budget but stop after 20s without data'
   const { handleStream } = await handlers();
   const res = response();
   const pending = start(handleStream, res);
+  await body.started;
   await flush();
   for (let i = 0; i < 7; i++) {
     t.mock.timers.tick(10_000);
@@ -122,8 +128,11 @@ test('every refused candidate is aborted before the next source is opened', asyn
 test('a stalled refusal body is cancelled without permanently marking the channel', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1000 });
   let signal;
+  let ready;
+  const started = new Promise(resolve => { ready = resolve; });
   t.mock.method(globalThis, 'fetch', async (_url, options) => {
     signal = options.signal;
+    ready();
     return new Response(new ReadableStream({ start(controller) {
       signal.addEventListener('abort', () => controller.error(signal.reason), { once: true });
     } }), { status: 403 });
@@ -131,6 +140,7 @@ test('a stalled refusal body is cancelled without permanently marking the channe
   const { handleStream } = await handlers();
   const res = response();
   const pending = start(handleStream, res);
+  await started;
   await flush();
   t.mock.timers.tick(3000);
   await pending;
@@ -192,6 +202,7 @@ test('downstream backpressure does not consume the network inactivity budget', a
   let release;
   res._write = (_chunk, _encoding, done) => { release = done; };
   const pending = start(handleStream, res);
+  await body.started;
   await flush();
   try {
     assert.equal(res.writableNeedDrain, true);

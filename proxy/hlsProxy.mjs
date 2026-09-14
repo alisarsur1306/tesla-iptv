@@ -33,6 +33,8 @@ import path from 'node:path';
 // in closeClientIfUnused when an HTTP/2 CDN connection closes after streaming.
 import { fetch as undiciFetch, ProxyAgent } from 'undici';
 import { gzip } from 'node:zlib';
+import { SavedStreams, accountScope, sidecarSource, snapshotFromCatalogue, MAX_SNAPSHOT_BYTES } from './savedStreams.mjs';
+import { resolvingProxy } from './resolvingProxy.mjs';
 
 // Connect timeout for a streaming request: it covers the handshake only and is
 // cleared once the headers arrive, because a live channel's body never ends.
@@ -203,9 +205,12 @@ let cachedAgent = null;
 let cachedAgentFor = '';
 function proxyAgent() {
   const spec = getUpstreamProxy();
-  if (cachedAgentFor !== spec) {
-    cachedAgent = new ProxyAgent(spec.includes('://') ? spec : `http://${spec}`);
-    cachedAgentFor = spec;
+  const localDns = process.env.UPSTREAM_PROXY_LOCAL_DNS === '1';
+  const identity = `${spec}|${localDns}`;
+  if (cachedAgentFor !== identity) {
+    const uri = spec.includes('://') ? spec : `http://${spec}`;
+    cachedAgent = localDns ? resolvingProxy(uri) : new ProxyAgent(uri);
+    cachedAgentFor = identity;
   }
   return cachedAgent;
 }
@@ -721,6 +726,47 @@ const xtreamCache = new Map(); // action -> { at, data }
 // Read at call time, not at import: a value captured once cannot be changed by a test and
 // silently ignores an env var set after the module loads.
 const listCacheDir = () => process.env.CACHE_DIR || path.join(os.tmpdir(), 'tesla-iptv-lists');
+let savedStreams;
+function savedStreamStore() {
+  const scope = accountScope(getXtreamCreds());
+  if (!scope) return null;
+  savedStreams ||= new SavedStreams({ directory: listCacheDir(), scope });
+  return savedStreams;
+}
+
+let savedRefresh;
+let savedRefreshAt = 0;
+export async function primeSavedStreams() {
+  const store = savedStreamStore();
+  if (!store) return;
+  await store.load();
+  const source = sidecarSource();
+  if (!source || Date.now() - savedRefreshAt < 15 * 60 * 1000) return savedRefresh;
+  savedRefreshAt = Date.now();
+  savedRefresh = (async () => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    let reader;
+    try {
+      const response = await globalThis.fetch(source.url, { headers: source.headers, signal: controller.signal, redirect: 'error' });
+      if (!response.ok) { await response.body?.cancel(); return; }
+      reader = response.body.getReader();
+      const chunks = [];
+      let size = 0;
+      while (true) {
+        const chunk = await waitForAbort(reader.read(), controller.signal);
+        if (chunk.done) break;
+        size += chunk.value.byteLength;
+        if (size > MAX_SNAPSHOT_BYTES) throw new Error('Saved address snapshot too large');
+        chunks.push(chunk.value);
+      }
+      const accepted = await store.merge(JSON.parse(Buffer.concat(chunks, size).toString('utf8')));
+      console.log(`[saved-streams] imported=${accepted}`);
+    } catch { console.log('[saved-streams] refresh_unavailable; keeping existing addresses'); }
+    finally { clearTimeout(timer); controller.abort(); if (reader) void reader.cancel().catch(() => {}); }
+  })();
+  return savedRefresh;
+}
 const listCacheFile = (action) =>
   path.join(listCacheDir(), `xt-${(action || 'login').replace(/[^a-z0-9_-]/gi, '_')}.json`);
 
@@ -770,6 +816,9 @@ async function xtreamApi(creds, action, budgetMs) {
     });
     if (!resp.ok) throw new Error(`upstream ${resp.status}`);
     const data = await resp.json();
+    if (action === 'get_live_streams' && Array.isArray(data)) {
+      void savedStreamStore()?.merge(snapshotFromCatalogue(data, creds));
+    }
     xtreamCache.set(action, { at: Date.now(), data });
     persistList(action, data);
     noteXtreamSuccess();
@@ -827,7 +876,14 @@ async function loadUnavailable() {
 // it by an order of magnitude. Compression is async so a multi-megabyte list does not block
 // the event loop for every other request, and any failure just sends the plain body.
 function sendJsonBody(res, data) {
-  const body = Buffer.from(JSON.stringify(data), 'utf8');
+  // Direct-source addresses can contain access tokens. Keep them server-side.
+  const visible = Array.isArray(data) ? data.map(row => {
+    if (!row || typeof row !== 'object' || !Object.hasOwn(row, 'direct_source')) return row;
+    const metadata = { ...row };
+    delete metadata.direct_source;
+    return metadata;
+  }) : data;
+  const body = Buffer.from(JSON.stringify(visible), 'utf8');
   const accepts = String(res.req?.headers?.['accept-encoding'] || '');
   const plain = () => {
     res.writeHead(200, {
@@ -1623,7 +1679,11 @@ export async function handleStream(req, res) {
   if (!getSourceType()) return sendStreamFailure(res, [{ blocked: true }]);
   const context = streamContext(req, res);
   try {
-    const targets = streamTargets(id);
+    // Disk reads are local; a private sidecar refresh never holds up playback.
+    void primeSavedStreams();
+    const stored = await savedStreamStore()?.get(id);
+    const saved = stored && transportFor(new URL(stored.url).hostname) === 'direct' ? stored : null;
+    const targets = [...(saved ? [{ source: 'saved', url: saved.url }] : []), ...streamTargets(id)];
     if (!targets.length) return sendStreamFailure(res, [{ blocked: true }]);
     const firstBudget = Math.min(context.remaining(), targets.length > 1 ? FAST_FAIL_MS : STREAM_START_TIMEOUT_MS);
     let firstUrl;
@@ -1752,12 +1812,16 @@ export async function handleProxy(req, res) {
       if (context.controller.signal.aborted) onAbort();
       let reader;
       let response;
+      const cachedCandidate = candidate.source === 'saved';
+      // Include the first bytes/complete manifest in the saved-address budget.
+      const cachedTimer = cachedCandidate ? setTimeout(() => controller.abort(streamTimeout()), FAST_FAIL_MS) : null;
       try {
         response = await withinDeadline(() => upstreamFetch(candidateUrl, {
           redirect: 'follow', headers, signal: controller.signal,
         }), controller, Math.min(TIMEOUT_MS, context.remaining()));
         if (!response.ok && streamId) {
-          const genuine = response.status === 403 ? await isGenuineRefusal(response, controller) : false;
+          const genuine = !cachedCandidate && response.status === 403 ? await isGenuineRefusal(response, controller) : false;
+          if (cachedCandidate && [401, 403, 404, 410].includes(response.status)) await savedStreamStore()?.invalidate(streamId, candidateUrl.href);
           refused = genuine || refused;
           attempts.push({ status: response.status, genuine, transport });
           continue;
@@ -1766,6 +1830,7 @@ export async function handleProxy(req, res) {
         const upstreamType = response.headers.get('content-type') || '';
         const playlistType = /\.m3u8($|\?)/i.test(finalUrl) || /mpegurl/i.test(upstreamType);
         if (streamId && /text\/html|application\/json/i.test(upstreamType)) {
+          if (cachedCandidate) await savedStreamStore()?.invalidate(streamId, candidateUrl.href);
           attempts.push({ invalid: true });
           continue;
         }
@@ -1776,19 +1841,27 @@ export async function handleProxy(req, res) {
         if (playlist) {
           const text = await readManifest(reader, first, controller);
           context.controller.signal.throwIfAborted();
+          clearTimeout(cachedTimer);
+          if (streamId && transportFor(new URL(finalUrl).hostname) === 'direct') await savedStreamStore()?.remember(streamId, finalUrl);
           const body = Buffer.from(rewritePlaylist(text, finalUrl, keyParam), 'utf8');
           context.started();
           res.writeHead(response.status, {
             'Content-Type': 'application/vnd.apple.mpegurl', 'Content-Length': body.length, 'Cache-Control': 'no-store',
+            ...(streamId ? { 'X-Stream-Source': cachedCandidate ? 'saved' : 'provider' } : {}),
           });
           res.end(body);
           return;
         }
         context.controller.signal.throwIfAborted();
+        clearTimeout(cachedTimer);
+        if (streamId && !first.done && first.value.byteLength >= 188 && first.value[0] === 0x47 && transportFor(new URL(finalUrl).hostname) === 'direct') {
+          await savedStreamStore()?.remember(streamId, finalUrl);
+        }
         const responseType = upstreamType || (/\.ts($|\?)/i.test(finalUrl) ? 'video/mp2t' : 'application/octet-stream');
         const responseHeaders = {
           'Content-Type': responseType,
           'Cache-Control': /^image\//i.test(responseType) ? 'public, max-age=604800, immutable' : 'no-store',
+          ...(streamId ? { 'X-Stream-Source': cachedCandidate ? 'saved' : 'provider' } : {}),
         };
         for (const name of ['content-length', 'content-range', 'accept-ranges']) {
           const value = response.headers.get(name);
@@ -1819,6 +1892,7 @@ export async function handleProxy(req, res) {
           invalid: error?.code === 'STREAM_INVALID_RESPONSE', network: true,
         });
       } finally {
+        clearTimeout(cachedTimer);
         context.controller.signal.removeEventListener('abort', onAbort);
         // Release every unsuccessful candidate before its fallback is opened.
         controller.abort();
