@@ -75,6 +75,8 @@ const REBUFFER_DECAY_MS = 20_000;
  * wedge intake forever (the re-anchor in tryPresentOne is the real guard).
  */
 const MAX_BACKPRESSURE_MS = 30_000;
+/** Do not discard buffered media at EOF, but never wait forever for a decoder. */
+const MAX_DRAIN_MS = 30_000;
 
 let canvas: OffscreenCanvas | null = null;
 let ctx: OffscreenCanvasRenderingContext2D | null = null;
@@ -90,6 +92,7 @@ let sessionId = 0;
 // freezing the picture — decoded frames hold GPU memory, encoded bytes are ~free.
 let encodedChunks: Uint8Array[] = [];
 let encodedBytes = 0;
+let feeding = false;
 
 // demux + decode state
 let demux: TsDemuxer | null = null;
@@ -212,6 +215,7 @@ function reset() {
   lastRebufferAt = 0;
   encodedChunks = [];
   encodedBytes = 0;
+  feeding = false;
   demux = new TsDemuxer(onPes);
 }
 
@@ -237,6 +241,7 @@ async function play(streamUrl: string, id: number) {
   }); // each session owns its own cancellable feeder
   try {
     await streamOnce(streamUrl, session.signal);
+    await drainAtEnd(session.signal);
     if (!session.signal.aborted) throw new Error('STREAM_ENDED');
   } catch (e) {
     if (!session.signal.aborted && abort === session) {
@@ -244,6 +249,24 @@ async function play(streamUrl: string, id: number) {
       stop();
     }
   }
+}
+
+/** A burst response may end before the feeder even wakes for the first time. */
+async function drainAtEnd(signal: AbortSignal) {
+  const until = nowEpochMs() + MAX_DRAIN_MS;
+  const active = () => !signal.aborted && nowEpochMs() < until;
+  while (active() && (encodedChunks.length > 0 || feeding)) await sleep(20);
+  if (!active()) return;
+
+  // The final PES has no following PES to trigger demux emission. WebCodecs can
+  // also retain reordered frames until flush, even when decodeQueueSize is zero.
+  demux?.flush();
+  if (dec?.state === 'configured') {
+    let flushed = false;
+    void dec.flush().catch(() => {}).finally(() => { flushed = true; });
+    while (active() && !flushed) await sleep(20);
+  }
+  while (active() && queue.length > 0) await sleep(20);
 }
 
 function stop() {
@@ -449,14 +472,20 @@ async function feedLoop(signal: AbortSignal): Promise<void> {
     if (wantMore && encodedChunks.length) {
       const chunk = encodedChunks.shift()!;
       encodedBytes -= chunk.length;
-      // Split a large chunk so a single push never blocks the loop for long.
-      if (chunk.length > CH) {
-        for (let p = 0; p < chunk.length && !signal.aborted; p += CH) {
-          demux!.push(chunk.subarray(p, Math.min(chunk.length, p + CH)));
-          await sleep(0);
+      feeding = true;
+      try {
+        // Split a large chunk so a single push never blocks the loop for long.
+        if (chunk.length > CH) {
+          for (let p = 0; p < chunk.length && !signal.aborted; p += CH) {
+            demux!.push(chunk.subarray(p, Math.min(chunk.length, p + CH)));
+            await sleep(0);
+          }
+        } else {
+          demux!.push(chunk);
         }
-      } else {
-        demux!.push(chunk);
+      } finally {
+        // A cancelled old feeder must not change the new session's state.
+        if (!signal.aborted) feeding = false;
       }
     } else {
       // Either the decoder is satisfied or the reserve is empty (network stall).
