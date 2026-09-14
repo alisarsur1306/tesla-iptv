@@ -7,7 +7,9 @@
 # Render keeps serving the old instance. 30MB per build is worth avoiding that.
 set -euo pipefail
 
-VER="${TS_VERSION:-1.98.9}"
+# 1.102.1+ fixes userspace dials to dual-stack names through IPv4-only exit nodes.
+# Keep a stable pin; TS_VERSION can select another release during rollback.
+VER="${TS_VERSION:-1.102.4}"
 TARBALL="tailscale_${VER}_amd64.tgz"
 
 curl -fsSL "https://pkgs.tailscale.com/stable/${TARBALL}" -o "/tmp/${TARBALL}"
