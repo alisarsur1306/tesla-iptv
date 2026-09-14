@@ -227,6 +227,9 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
 
   function selectCategory(id: string) {
     setSelectedCategory(id);
+    // Selecting a group starts browsing that group; a previous search must not
+    // silently hide all of its channels.
+    setSearch('');
     setVisibleCount(PAGE_SIZE);
     scrollTop.current = 0;
     gridRef.current?.scrollTo({ top: 0 });
@@ -368,8 +371,8 @@ export default function ChannelBrowser({ creds, onPlay, onLogout, onNeedKey, ret
         )}
         {visible.length === 0 ? (
           <div className="mt-24 flex flex-col items-center gap-6 text-center">
-            <p className="text-pretty text-2xl text-zinc-500">
-              {search.trim() ? t.noSearch : activeCategory === FAVORITES_ID
+            <p role={refreshing && !catalogueReady ? 'status' : undefined} className="text-pretty text-2xl text-zinc-500">
+              {refreshing && !catalogueReady ? t.loadingMore : search.trim() ? t.noSearch : activeCategory === FAVORITES_ID
                 ? t.noFavorites : activeCategory === RECENT_ID ? t.noRecent : t.noChannels}
             </p>
             {search.trim() && (
