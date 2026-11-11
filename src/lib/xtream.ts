@@ -267,7 +267,7 @@ export async function getLiveCatalogue(_creds: XtreamCreds, options: {
         const currentRevision = headers.get('x-catalogue-revision');
         if (!currentRevision) return { streams: page }; // Older servers return the full list.
         const currentTotal = Number(headers.get('x-catalogue-total'));
-        if (!Number.isInteger(currentTotal) || currentTotal < 1 || currentTotal > 10000 || (revision && (currentRevision !== revision || total !== currentTotal))) throw new CatalogueChangedError('Catalogue changed during loading');
+        if (!Number.isInteger(currentTotal) || currentTotal < 1 || currentTotal > 20000 || (revision && (currentRevision !== revision || total !== currentTotal))) throw new CatalogueChangedError('Catalogue changed during loading');
         revision = currentRevision;
         total = currentTotal;
         streams.push(...page);

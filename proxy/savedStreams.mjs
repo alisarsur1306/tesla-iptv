@@ -44,13 +44,13 @@ function knownExpiry(url) {
 }
 
 export class SavedStreams {
-  constructor({ directory, scope, now = Date.now, ttlMs = WEEK, maxEntries = 10000 }) {
+  constructor({ directory, scope, now = Date.now, ttlMs = WEEK, maxEntries = 20000 }) {
     if (!/^[a-f0-9]{64}$/.test(scope || '')) throw new Error('Invalid cache account');
     this.scope = scope;
     this.file = path.join(directory, `stream-addresses-${scope}.json`);
     this.now = now;
     this.ttlMs = Math.min(30 * 24 * 60 * 60 * 1000, Math.max(1000, ttlMs));
-    this.maxEntries = Math.min(10000, Math.max(1, maxEntries));
+    this.maxEntries = Math.min(20000, Math.max(1, maxEntries));
     this.entries = new Map();
     this.pending = Promise.resolve();
   }
@@ -66,7 +66,7 @@ export class SavedStreams {
   }
 
   accept(snapshot) {
-    if (snapshot?.version !== 1 || snapshot.scope !== this.scope || !Array.isArray(snapshot.entries) || snapshot.entries.length > 10000) return 0;
+    if (snapshot?.version !== 1 || snapshot.scope !== this.scope || !Array.isArray(snapshot.entries) || snapshot.entries.length > 20000) return 0;
     let accepted = 0;
     for (const input of snapshot.entries) {
       const row = this.normalize(input);

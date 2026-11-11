@@ -9,10 +9,10 @@ const sorted = rows => [...rows].sort((a, b) => String(a.stream_id ?? a.category
 export function validCatalogue(snapshot, scope) {
   return snapshot?.version === 1 && snapshot.scope === scope && Number.isFinite(snapshot.updatedAt) &&
     snapshot.updatedAt > 0 && snapshot.updatedAt <= Date.now() + 60000 &&
-    Array.isArray(snapshot.channels) && snapshot.channels.length > 0 && snapshot.channels.length <= 10000 &&
+    Array.isArray(snapshot.channels) && snapshot.channels.length > 0 && snapshot.channels.length <= 20000 &&
     snapshot.channels.every(c => c && idValid(c.stream_id) && typeof c.name === 'string' && typeof c.category_id === 'string') &&
     new Set(snapshot.channels.map(c => String(c.stream_id))).size === snapshot.channels.length &&
-    Array.isArray(snapshot.categories) && snapshot.categories.length <= 10000 &&
+    Array.isArray(snapshot.categories) && snapshot.categories.length <= 20000 &&
     snapshot.categories.every(c => c && typeof c.category_id === 'string' && typeof c.category_name === 'string');
 }
 
@@ -21,8 +21,8 @@ export function validCatalogue(snapshot, scope) {
 export function mergeCatalogue(previous, channels, categories, creds, now = Date.now()) {
   const scope = accountScope(creds);
   if (previous && (!validCatalogue(previous, scope) || previous.scope !== scope)) throw new Error('Invalid previous catalogue/account');
-  if (!scope || !Array.isArray(channels) || !channels.length || channels.length > 10000 ||
-      !Array.isArray(categories) || !categories.length || categories.length > 10000) throw new Error('Invalid provider catalogue');
+  if (!scope || !Array.isArray(channels) || !channels.length || channels.length > 20000 ||
+      !Array.isArray(categories) || !categories.length || categories.length > 20000) throw new Error('Invalid provider catalogue');
   const rows = new Map((previous?.channels || []).map(c => [String(c.stream_id), c]));
   const groups = new Map((previous?.categories || []).map(c => [c.category_id, c]));
   const sourceHashes = { ...previous?.sourceHashes };
@@ -47,7 +47,7 @@ export function mergeCatalogue(previous, channels, categories, creds, now = Date
     sourceHashes[id] = hash;
   }
   stats.retained = [...rows.keys()].filter(id => !seen.has(id)).length;
-  if (rows.size > 10000) throw new Error('Catalogue capacity exceeded');
+  if (rows.size > 20000) throw new Error('Catalogue capacity exceeded');
   const snapshot = { version: 1, scope, updatedAt: now, channels: [...rows.values()], categories: [...groups.values()], sourceHashes };
   if (previous && !stats.added && !stats.updated && JSON.stringify(sorted(previous.categories)) === JSON.stringify(sorted(snapshot.categories))) return { snapshot: previous, stats };
   return { snapshot, stats };
