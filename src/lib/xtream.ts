@@ -274,7 +274,7 @@ export async function getLiveCatalogue(_creds: XtreamCreds, options: {
     let total: number | undefined;
     try {
       do {
-        const params = new URLSearchParams({ offset: String(streams.length), limit: '200' });
+        const params = new URLSearchParams({ offset: String(streams.length), limit: '1000' });
         if (revision) params.set('revision', revision);
         else if (options.cached?.revision) params.set('if_revision', options.cached.revision);
         let headers = new Headers();

@@ -99,7 +99,7 @@ test('catalogue pagination exposes the first page before fetching the rest, then
   t.mock.method(globalThis, 'fetch', async url => {
     calls++;
     const params = new URL(url, 'https://app.example').searchParams;
-    assert.equal(params.get('limit'), '200');
+    assert.equal(params.get('limit'), '1000');
     if (params.has('if_revision')) return Response.json([], { headers: { 'X-Catalogue-Revision': 'v1', 'X-Catalogue-Total': '230', 'X-Catalogue-Unchanged': 'true' } });
     const offset = Number(params.get('offset'));
     if (offset > 0) { assert.equal(firstVisible, true); assert.equal(params.get('revision'), 'v1'); }

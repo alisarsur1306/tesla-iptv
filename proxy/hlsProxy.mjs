@@ -953,7 +953,7 @@ export async function handleXtreamApi(req, res) {
         const rawOffset = url.searchParams.get('offset') || '0';
         const limit = Number(rawLimit);
         const offset = Number(rawOffset);
-        if (!/^\d+$/.test(rawLimit) || !/^\d+$/.test(rawOffset) || limit < 1 || limit > 1000 || offset > 10000) return sendError(res, 400, 'Invalid catalogue page');
+        if (!/^\d+$/.test(rawLimit) || !/^\d+$/.test(rawOffset) || limit < 1 || limit > 1000 || offset > 20000) return sendError(res, 400, 'Invalid catalogue page');
         const revision = String(backup.updatedAt);
         if (url.searchParams.has('revision') && url.searchParams.get('revision') !== revision) return sendError(res, 409, 'Catalogue changed; restart pagination');
         res.setHeader('X-Catalogue-Revision', revision);
