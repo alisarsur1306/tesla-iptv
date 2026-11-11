@@ -227,6 +227,23 @@ export function liveStreamUrl(_creds: XtreamCreds, streamId: number): string {
   return withKey(`/api/stream?id=${streamId}`);
 }
 
+/**
+ * Ask the server to look up a fresh address for this channel before playing it. The lookup is
+ * made from THIS browser (the server redirects us to a Worker) because the provider only
+ * accepts home or mobile callers. Best effort: any failure falls through to normal playback.
+ */
+export async function prepareStream(streamId: number, timeoutMs = 5000): Promise<void> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    await fetch(withKey(`/api/resolve?id=${streamId}`), { signal: controller.signal, cache: 'no-store' });
+  } catch {
+    /* best effort */
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Browser-side channel list cache.
 //

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
-import { liveStreamUrl, type XtreamCreds, type XtreamLiveStream } from '@/lib/xtream';
+import { liveStreamUrl, prepareStream, type XtreamCreds, type XtreamLiveStream } from '@/lib/xtream';
 import { useLocale } from '@/lib/locale';
 import { CanvasPlayer } from '@/player/playerClient';
 import { AudioEngine } from '@/player/audioEngine';
@@ -53,6 +53,7 @@ function PlayerSession({ creds, channel, playlist = [], onSelect, onBack }: Play
     canvas.className = 'h-full w-full object-contain';
     container.appendChild(canvas);
     let destroyed = false;
+    let playRun = 0;
     let startedAt = Date.now();
     let lastFrameAt: number | null = null;
     const audio = new AudioEngine({
@@ -70,9 +71,11 @@ function PlayerSession({ creds, channel, playlist = [], onSelect, onBack }: Play
         setBuffering(false);
         setAudioUnsupported(null);
         audio.reset();
-        player.play(source);
+        // Look up a fresh address first; a stop or newer restart in the meantime cancels this start.
+        const run = ++playRun;
+        void prepareStream(channel.stream_id).then(() => { if (!destroyed && run === playRun) player.play(source); });
       },
-      stop: () => { player.stop(); audio.reset(); },
+      stop: () => { playRun++; player.stop(); audio.reset(); },
       changed: (state) => { if (!destroyed) setPlayback(state); },
     });
     const player = new CanvasPlayer(canvas, {

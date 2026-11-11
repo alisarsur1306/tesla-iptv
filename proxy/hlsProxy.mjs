@@ -1763,6 +1763,39 @@ export async function handleStream(req, res) {
   }
 }
 
+/**
+ * Browser-assisted address lookup. The provider's Cloudflare rules refuse this server (and a
+ * Worker called by it) but accept a Worker called from a home or mobile connection. So the
+ * browser is redirected to the Worker, which looks the address up and posts it to
+ * /api/learn; the browser itself only learns whether that worked.
+ * STREAM_RESOLVER_URL is the Worker URL including its token, e.g. https://x.workers.dev/?t=...
+ */
+export async function handleResolve(req, res) {
+  const url = new URL(req.url || '/', 'http://localhost');
+  setCors(res);
+  if (!keyGate(req, res, url)) return;
+  const id = url.searchParams.get('id') || '';
+  if (!/^\d+$/.test(id)) return sendError(res, 400, 'Invalid channel id');
+  const resolver = process.env.STREAM_RESOLVER_URL;
+  // A usable saved address needs no lookup, and a lookup must not replace a public one.
+  if (!resolver || await savedStreamStore()?.get(id)) return void res.writeHead(204).end();
+  const target = new URL(resolver);
+  target.searchParams.set('resolve', id);
+  res.writeHead(302, { Location: target.href, 'Cache-Control': 'no-store' }).end();
+}
+
+/** The Worker reports a looked-up address here; it is validated like any saved address. */
+export async function handleLearn(req, res) {
+  const url = new URL(req.url || '/', 'http://localhost');
+  setCors(res);
+  if (!keyGate(req, res, url)) return;
+  const id = url.searchParams.get('id') || '';
+  if (!/^\d+$/.test(id)) return sendError(res, 400, 'Invalid channel id');
+  const saved = await savedStreamStore()?.remember(id, url.searchParams.get('u') || '');
+  if (!saved) return sendError(res, 400, 'Address not accepted');
+  res.writeHead(204).end();
+}
+
 export async function handleProxy(req, res) {
   // A client abort / edge RST emits 'error' on res; with no listener that is an
   // uncaughtException and kills the whole process mid-stream.
